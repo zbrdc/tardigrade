@@ -63,16 +63,19 @@ state. Process stdin is served by one process-wide reader shared by vm.stdin
 and serve() commands: input a run does not read is kept for the next run,
 and when several consumers read at once the first one receives the chunks.
 Isolation is per isolate within the process: hitting the heap cap ends only
-that run (exit 137), while other V8 fatal errors end the whole process and
-every guest in it. --memory counts the JS heap and ArrayBuffer memory
-together, judged on what survives a collection: at event-loop checkpoints
-(a collection is forced first when the raw figure is over), at V8's
-maximal collections, when V8's own raised limit is reached (the transient
-working set has hit three times the cap), and from a watch thread for
-ArrayBuffer bytes. Until a memory-hog guest is stopped, the process may
-commit several times the cap (measured: 3-6x for growth shapes, about 2-3x
-for garbage-heavy-but-small guests awaiting a collection; retained
-ArrayBuffers are stopped at the cap itself).
+that run (exit 137 for the JS heap, a catchable RangeError for
+ArrayBuffers), while other V8 fatal errors end the whole process and
+every guest in it. --memory is one budget shared by the JS heap and
+ArrayBuffer memory: a GC epilogue stops a run whose post-collection live
+set passes the cap, the counting allocator refuses the ArrayBuffer
+allocation that would cross what remains of the budget (V8 reports the
+refusal to the guest as a catchable RangeError), and V8's own heap limit
+is raised to three times the cap so genuinely over-cap growth is stopped
+cleanly instead of dying inside V8's allocation retry. Until a memory-hog
+guest is stopped, the process may commit several times the cap (measured:
+3-6x for growth shapes, about 2-3x for garbage-heavy-but-small guests
+awaiting a collection; retained ArrayBuffers are refused at the budget
+line itself).
 
 ## Event loop
 
@@ -132,23 +135,30 @@ tsc-rs at this boundary to let agents write TypeScript.
   omission of host APIs, per isolate inside one ordinary process. A V8
   fatal error ends the whole process and every guest in it. For hostile
   code, run v8vm itself under a container/seccomp profile.
-- The heap cap terminates the guest, not the process: --memory counts the
-  JS heap and ArrayBuffer memory together and is judged on what survives a
-  collection (event-loop checkpoints force one when the raw figure is over;
-  V8's maximal collections are judged directly; a guest whose transient
-  working set reaches V8's raised limit, three times the cap, is stopped
-  there with the limit raised so the termination is observed in
-  JavaScript; ArrayBuffer bytes are watched by a thread). A run over the
-  cap exits 137 with a one-line report on stderr. Peak RSS is typically
-  3-6x the cap for growth shapes, about 2-3x for garbage-heavy guests
-  under the cap, and near the cap for retained ArrayBuffers. The smallest
-  supported cap is 8 MB; growth that hits V8's structural limits (Map
-  size, array length) or string limits fails as an ordinary uncaught
-  RangeError (exit 1), as Node does.
+- The heap cap terminates the guest, not the process. --memory is one
+  budget shared by the JS heap and ArrayBuffer memory (including
+  resizable ArrayBuffers and growable SharedArrayBuffers: their
+  maxByteLength reservation and every resize or grow route through the
+  same counting allocator). The JS heap is judged by a GC epilogue on the
+  post-collection live set; ArrayBuffer allocations that would cross the
+  remaining budget are refused and surface in the guest as a catchable
+  RangeError; a guest whose transient working set reaches V8's raised
+  limit (three times the cap) is stopped with the limit raised so the
+  termination is observed in JavaScript. Heap over-cap exits 137 with a
+  one-line report on stderr. Peak RSS is typically 3-6x the cap for
+  growth shapes, about 2-3x for garbage-heavy guests under the cap, and
+  near the budget line for buffers. The smallest supported cap is 8 MB;
+  growth that hits V8's structural limits (Map size, array length) or
+  string limits fails as an ordinary uncaught RangeError (exit 1), as
+  Node does.
 - Guest-reachable process aborts remain (V8 fatal error, observed as
   SIGTRAP, exit 133): a single allocation too large for V8's raised limit
   (`new Array(1e9)`, and `new Array(1e8).fill(0)` at any cap), string
   splitting past V8's maximum string size
-  (`'ab'.repeat(2e8).split('')`), and long native builtins that ignore
-  termination (`a.length = 2**32 - 1; a.fill(0, 0, 2e8)` at small caps).
+  (`'ab'.repeat(2e8).split('')`), long native builtins that ignore
+  termination (`a.length = 2**32 - 1; a.fill(0, 0, 2e8)` at small caps),
+  and tight loops allocating arrays with multi-kilobyte backing stores
+  (`const a = []; for (;;) a.push(new Array(1000).fill(1))` at any cap):
+  V8 runs its allocation retry there without any interrupt checkpoint,
+  so not even the wall-clock timeout is observed.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

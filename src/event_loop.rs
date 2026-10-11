@@ -4,7 +4,6 @@
 use std::time::{Duration, Instant};
 
 use crate::diag::{rejection_text, report};
-use crate::heap;
 use crate::stdin;
 use crate::world::{world_mut, NetMsg, World};
 use v8::HandleScope;
@@ -21,7 +20,7 @@ fn stop_code(world: &mut World, oc: Outcome) -> Option<i32> {
     match oc {
         Outcome::Ok => None,
         Outcome::Terminated => Some(world.take_terminated_exit()),
-        Outcome::Exception => Some(1),
+        Outcome::Exception => Some(world.exception_exit()),
     }
 }
 
@@ -52,7 +51,9 @@ fn call_fn(scope: &mut HandleScope, g: &v8::Global<v8::Function>) -> Outcome {
         tc.cancel_terminate_execution();
         return Outcome::Terminated;
     }
-    report(&mut tc);
+    if world_mut(&mut tc).exception_decides() {
+        report(&mut tc);
+    }
     Outcome::Exception
 }
 
@@ -85,7 +86,9 @@ fn run_net(scope: &mut HandleScope) -> Option<i32> {
             tc.cancel_terminate_execution();
             Outcome::Terminated
         } else {
-            report(&mut tc);
+            if world_mut(&mut tc).exception_decides() {
+                report(&mut tc);
+            }
             Outcome::Exception
         };
         drop(tc);
@@ -231,7 +234,6 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
 
 pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     loop {
-        heap::host_checkpoint(scope);
         if let Some(c) = stopped(scope) {
             return c;
         }
@@ -268,7 +270,6 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     // still count, and a termination that landed as the loop wound down
     // (idle runs notice the watchdog only through the reason flag) ends
     // the run instead of falling through to a clean exit.
-    heap::host_checkpoint(scope);
     scope.perform_microtask_checkpoint();
     if let Some(c) = stopped(scope).or_else(|| check_unhandled(scope)) {
         return c;

@@ -108,12 +108,12 @@ pub(crate) fn serve_loop(scope: &mut v8::HandleScope, replies: &ReplySink) -> i3
                 }
             }
             None => {
-                if tc.is_execution_terminating() {
-                    tc.cancel_terminate_execution();
-                    return world_mut(&mut tc).take_terminated_exit();
+                let decides = world_mut(&mut tc).exception_decides();
+                let code = world_mut(&mut tc).exception_exit();
+                if decides {
+                    report(&mut tc);
                 }
-                report(&mut tc);
-                return 1;
+                return code;
             }
         }
         drop(tc);

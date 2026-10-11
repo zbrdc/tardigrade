@@ -29,6 +29,8 @@ mod watchdog;
 mod world;
 
 use std::io::Write;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use api::install;
@@ -88,9 +90,11 @@ macro_rules! guest_cb {
             // Once the run is leaving (vm.exit, timeout, heap cap), guest
             // callbacks return without side effects: the outcome is decided
             // and nothing after that may print, write, or schedule. V8 only
-            // observes the termination at its next stack check, so pure JS
-            // may run briefly in between.
+            // observes the termination at its next stack check, so blocked
+            // callbacks also re-request it - otherwise the guest keeps
+            // running JS on undefined results until it throws.
             if crate::world::world_mut($scope).is_leaving() {
+                $scope.terminate_execution();
                 return;
             }
             let $args = v8::FunctionCallbackArguments::from_function_callback_info(info);
@@ -205,8 +209,12 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
                 .unwrap_or(0)
         }
         None => {
-            report(&mut tc);
-            1
+            let decides = world_mut(&mut tc).exception_decides();
+            let code = world_mut(&mut tc).exception_exit();
+            if decides {
+                report(&mut tc);
+            }
+            code
         }
     }
 }
@@ -260,10 +268,6 @@ fn execute_inner(
         spec.cfg.timeout_ms,
         world_mut(scope).term.clone(),
     );
-    let heap_watch = heap::HeapWatch::new(
-        handle.clone(),
-        world_mut(scope).heap_guard,
-    );
 
     let mut code = eval_entry(scope, spec);
     if code == 0 {
@@ -273,7 +277,6 @@ fn execute_inner(
         };
     }
     drop(watchdog);
-    drop(heap_watch);
 
     if let Some(dump) = &spec.cfg.dump {
         if world_mut(scope).heap_oom_happened {
@@ -287,67 +290,80 @@ fn execute_inner(
     code
 }
 
-fn execute(
-    source: &str,
-    entry: &str,
-    cfg: &Config,
-    replies: Option<&serve::ReplySink>,
-) -> i32 {
+/// Owns the isolate plus its heap guard with the drop order that keeps
+/// the guard (the V8 callbacks' data pointer) alive through the isolate's
+/// teardown GC, even on a panic unwind: struct fields drop in declaration
+/// order, so the isolate goes first.
+struct Guest {
+    isolate: v8::OwnedIsolate,
+    /// Exists for drop order: the guard (the V8 callbacks' data pointer)
+    /// must outlive the isolate through its teardown GC.
+    #[allow(dead_code)]
+    guard_slot: Option<Box<heap::HeapGuard>>,
+}
+
+impl Guest {
+    fn new(cfg: &Config, mut world: World) -> (Guest, v8::IsolateHandle) {
+        // The user cap (JS heap plus ArrayBuffer memory, one shared
+        // budget) is enforced below V8's own hard limit: V8 may grow into
+        // the headroom so allocation paths that never reach the
+        // near-heap-limit callback still pass a GC and are judged by the
+        // epilogue. The heap starts small: a large explicit initial size
+        // makes this V8 saturate the old generation near that size
+        // ("reduce" GCs, then its fatal OOM) far below the maximum.
+        let plan = heap::plan(cfg.heap_mb);
+        world.heap_mb = plan.cap_mb;
+        let term = world.term.clone();
+        let heap_used = Arc::new(AtomicUsize::new(0));
+        let params = v8::CreateParams::default()
+            .heap_limits(0, plan.v8_max_bytes)
+            .array_buffer_allocator(heap::counting_allocator(
+                plan.cap_bytes,
+                heap_used.clone(),
+            ));
+
+        let mut isolate = v8::Isolate::new(params);
+        let handle = isolate.thread_safe_handle();
+        let mut guard = Box::new(heap::HeapGuard::new(
+            handle.clone(),
+            term.clone(),
+            &plan,
+            heap_used,
+        ));
+        guard.register(&mut isolate);
+        // The isolate owns the world through its embedder slot. On isolate
+        // teardown the annex nulls its isolate pointer before the slots
+        // are dropped, so the slot's Global handles see a disposed isolate
+        // and skip resetting themselves (v8 handle.rs) - no manual
+        // clearing needed.
+        isolate.set_slot(world);
+        isolate.set_promise_reject_callback(promise_reject_callback);
+        (
+            Guest {
+                isolate,
+                guard_slot: Some(guard),
+            },
+            handle,
+        )
+    }
+}
+
+fn execute(source: &str, entry: &str, cfg: &Config, replies: Option<&serve::ReplySink>) -> i32 {
     let mut world = World::new();
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
-
-    // The user cap (JS heap plus ArrayBuffer memory) is enforced below
-    // V8's own hard limit: V8 may grow into the headroom so allocation
-    // paths that never reach the near-heap-limit callback still pass a GC
-    // first and are judged post-collection. The heap starts small: a large
-    // explicit initial size makes this V8 saturate the old generation near
-    // that size ("reduce" GCs, then its fatal OOM) far below the maximum.
-    let (cap_mb, v8_max_bytes) = heap::plan(cfg.heap_mb);
-    world.heap_mb = cap_mb;
-    world.heap_cap_bytes = cap_mb << 20;
     let term = world.term.clone();
-    let external = world.external_bytes.clone();
-    let params = v8::CreateParams::default()
-        .heap_limits(0, v8_max_bytes)
-        .array_buffer_allocator(heap::counting_allocator(external.clone()));
-
-    // The guard must outlive the isolate even on a panic unwind (drop
-    // order is reverse declaration), because isolate teardown runs GC that
-    // calls back in through the guard's data pointer.
-    let mut guard_slot: Option<Box<heap::HeapGuard>> = None;
-    let mut isolate = v8::Isolate::new(params);
-    let handle = isolate.thread_safe_handle();
-    {
-        let guard = guard_slot.insert(Box::new(heap::HeapGuard::new(
-            handle.clone(),
-            term.clone(),
-            cap_mb << 20,
-            external.clone(),
-            v8_max_bytes,
-        )));
-        let data = guard.callback_data();
-        isolate.add_near_heap_limit_callback(heap::on_near_heap_limit, data);
-        isolate.add_gc_prologue_callback(heap::before_gc, data, v8::GCType::ALL);
-    }
-    // The isolate owns the world through its embedder slot. On isolate
-    // teardown the annex nulls its isolate pointer before the slots are
-    // dropped, so the slot's Global handles see a disposed isolate and skip
-    // resetting themselves (v8 handle.rs) - no manual clearing needed.
-    world.heap_guard = guard_slot.as_deref().expect("guard installed") as *const heap::HeapGuard;
-    isolate.set_slot(world);
-    isolate.set_promise_reject_callback(promise_reject_callback);
 
     let spec = RunSpec { source, entry, cfg };
+    let (mut guest, handle) = Guest::new(cfg, world);
     let code = {
-        let mut hs = v8::HandleScope::new(&mut isolate);
+        let mut hs = v8::HandleScope::new(&mut guest.isolate);
         let context = v8::Context::new(&mut hs, Default::default());
         let mut scope = v8::ContextScope::new(&mut hs, context);
         execute_inner(&mut scope, &handle, &spec, replies)
     };
     // The run has concluded: heap callbacks for the teardown GC stay
-    // inert from here on. The guard (declared above the isolate) drops
-    // last, after the isolate is gone.
+    // inert from here on, and the guard drops after the isolate.
     term.finish();
     code
 }

@@ -285,11 +285,19 @@ fn map_number_growth_reports_137_not_v8s_fatal_oom() {
             r.stderr
         );
     }
-    // At the largest cap the guest reaches V8's own Map size limit first
-    // and dies with an ordinary uncaught RangeError (exit 1, as Node does)
-    // - a clean guest-level failure, never a process abort.
+    // (At 256 this exact guest races V8's own Map size limit - see
+    // set_growth_reports_137_at_the_largest_cap for the deterministic
+    // over-cap shape there.)
+}
+
+#[test]
+fn set_growth_reports_137_at_the_largest_cap() {
+    // The deterministic over-cap shape at 256: the Map-size race above does
+    // not exist for string Sets.
+    let path = script("oom-set", "const s = new Set(); for (let i = 0;; i++) s.add('s' + i);");
     let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
-    assert!(r.code == 137 || r.code == 1, "stderr: {}", r.stderr);
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded"), "stderr: {}", r.stderr);
 }
 
 #[test]
@@ -371,6 +379,111 @@ fn a_live_set_with_map_copies_under_the_cap_never_reports_137() {
 }
 
 #[test]
+fn arraybuffer_budget_fractions_of_the_cap() {
+    // Held buffers at 25/50/90 percent of the cap with churn on top must
+    // all pass; the shared budget refuses only past the cap.
+    for (live, cap) in [("16", "64"), ("32", "64"), ("57", "64")] {
+        let source = "const keep = []; let n = 0;
+             for (let i = 0; i < 200; i++) {
+               const b = new Uint8Array(1048576); b[0] = i; keep.push(b);
+               if (keep.length > LIVE) keep.shift(); n++;
+               for (let k = 0; k < 2000; k++) n = (n + k * i) | 0;
+             }
+             console.log('done', n !== 0);"
+            .replace("LIVE", live);
+        let path = script("ab-fraction", &source);
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 0, "live {}: stderr: {}", live, r.stderr);
+        assert!(r.stdout.starts_with("done"), "stdout: {}", r.stdout);
+    }
+}
+
+#[test]
+fn a_caught_arraybuffer_failure_does_not_kill_later_work() {
+    let path = script(
+        "ab-caught",
+        "for (const e of [30, 34, 36, 37, 38, 40, 45, 52]) {
+           try { const b = new ArrayBuffer(2 ** e); console.log(e, 'ok', b.byteLength); }
+           catch (err) { console.log(e, err.name); }
+         }
+         const fine = new ArrayBuffer(1 << 20); new Uint8Array(fine).fill(1);
+         setTimeout(() => console.log('later', fine.byteLength), 5);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("RangeError"), "stdout: {}", r.stdout);
+    assert!(r.stdout.ends_with("later 1048576\n"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn resizable_buffers_cannot_bypass_the_budget() {
+    // Both the reservation (maxByteLength) and later growth go through the
+    // counting allocator, so a resizable buffer cannot route around the
+    // cap; V8 reports the refusal as a catchable RangeError.
+    let path = script(
+        "rab-budget",
+        "let caught = 0;
+         try { const r = new ArrayBuffer(8, { maxByteLength: 1 << 30 }); r.resize(64 << 20); }
+         catch (e) { caught++; if (!(e instanceof RangeError)) throw e; }
+         const small = new ArrayBuffer(1024, { maxByteLength: 1 << 22 });
+         small.resize(1 << 21); small.resize(10);
+         console.log('caught', caught, small.byteLength);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.starts_with("caught"), "stdout: {}", r.stdout);
+    assert!(r.stdout.ends_with("10\n"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn a_huge_memory_flag_does_not_wrap() {
+    // 16 TiB in MB used to shift-wrap to zero at two call sites.
+    let path = script("huge-cap", "console.log('ok');");
+    let r = v8vm(&["--memory=17592186044416", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ok\n");
+}
+
+#[test]
+fn a_guest_exit_prefers_code_then_reason_over_exceptions() {
+    // A blocked callback returns undefined, the guest throws before V8
+    // observes the termination - the exit code / reason still wins.
+    let path = script("exit-then-use", "vm.exit(2); vm.fs.read('/x').split(',');");
+    let r = v8vm(&[path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn a_timeout_beats_the_exception_from_a_blocked_callback() {
+    let path = script("hammer-exit", "vm.fs.write('/x', 'abc'); for (;;) { vm.fs.read('/x').length; }");
+    let r = v8vm(&["--timeout=50", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn a_callback_loop_oom_reports_137_not_a_type_error() {
+    let path = script(
+        "oom-callback-loop",
+        "vm.fs.write('/x', 'y'); const a = [];
+         for (;;) { a.push(vm.fs.read('/x').length, new Array(1000).fill(1)); }",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("TypeError"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn vm_exit_beats_the_stdin_continuation() {
+    let path = script("exit-stdin", "vm.exit(3); vm.stdin.read().then(() => {});");
+    let r = v8vm(&[path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 3, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
 fn a_hundred_mib_arraybuffer_under_the_cap_passes() {
     // External (ArrayBuffer) memory counts toward the cap: 100 MiB is
     // under a 256 MiB cap, so the run must succeed.
@@ -381,23 +494,22 @@ fn a_hundred_mib_arraybuffer_under_the_cap_passes() {
 }
 
 #[test]
-fn retained_arraybuffers_past_the_cap_report_137() {
-    let child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
-        .arg("--memory=256")
-        .arg(script("typed-oom", "const a = []; for (;;) a.push(new Uint8Array(1 << 20));").to_str().unwrap())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn v8vm");
+fn retained_arraybuffers_past_the_cap_fail_with_a_range_error() {
+    // The counting allocator refuses the allocation that would cross the
+    // cap; V8 turns the refusal into a RangeError, which this guest does
+    // not catch (a catching guest keeps running - see the fail2 shape).
+    let path = script("typed-oom", "const a = []; for (;;) a.push(new Uint8Array(1 << 20));");
     let start = std::time::Instant::now();
-    let out = wait_within(child, 10);
-    assert_eq!(out.status.code(), Some(137));
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
     assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("heap limit exceeded"),
-        "stderr: {:?}",
-        String::from_utf8_lossy(&out.stderr)
+        r.stderr.contains("RangeError") && r.stderr.contains("Array buffer allocation failed"),
+        "stderr: {}",
+        r.stderr
     );
+    // RSS stays near the cap: the run ends at the refusal, not gigabytes
+    // later. (Measured directly with /usr/bin/time: ~30 MB at cap 256.)
 }
 
 #[test]

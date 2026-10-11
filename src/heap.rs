@@ -1,94 +1,197 @@
-//! Heap-cap enforcement. The user cap (JS heap plus ArrayBuffer/external
-//! memory together) is judged where the figure is meaningful.
+//! Heap-cap enforcement, in three cooperating pieces.
 //!
-//! A maximal collection (`COLLECT_ALL_AVAILABLE_GARBAGE`, the
-//! external-memory pressure path) is judged and terminated right there.
-//! At host checkpoints (event-loop turns) the raw figure still contains
-//! garbage accumulated since the last collection, so a maximal collection
-//! is forced first and only the surviving live set is judged. The
-//! near-heap-limit callback fires only after collections failed to keep
-//! the heap under V8's own (raised) limit, meaning the guest's transient
-//! working set (live data plus the allocation being satisfied) has
-//! reached that limit, three times the cap: the run is ended there, and
-//! the limit is still raised so the pending allocation succeeds and
-//! JavaScript resumes into the termination instead of dying inside V8's
-//! allocation retry, which never returns to JavaScript and ignores
-//! termination. Finally, a watch thread polls the ArrayBuffer byte count,
-//! because external growth alone never triggers a V8 collection in this
-//! build: it asks for a collecting interrupt when the count passes the
-//! cap and terminates after sustained over-cap polls.
+//! A garbage-collection epilogue judges the JS heap: after a major
+//! collection the used-heap figure is the live set, so a guest is stopped
+//! (exit 137) exactly when its live data passes the cap, while a
+//! garbage-heavy guest whose collections succeed keeps running. The
+//! epilogue is registered through the engine's own (mangled) symbol: the
+//! v8 crate binds only the prologue variant.
 //!
-//! Judging the raw pre-GC figure at an ordinary collection (an earlier
-//! design) terminates garbage-heavy guests whose live set never approaches
-//! the cap; an interrupt request queued from inside a GC callback
-//! (`IsolateHandle::request_interrupt`, also tried) is never delivered for
-//! tight allocation loops. Neither is used.
+//! The near-heap-limit callback is the second line: V8 invokes it only
+//! after collections failed to keep the heap under its own (raised)
+//! limit, and it still raises the limit so the pending allocation
+//! succeeds and JavaScript resumes into the termination instead of dying
+//! inside V8's allocation retry, which never returns to JavaScript and
+//! ignores termination.
 //!
-//! Judging the raw pre-GC figure at an ordinary collection (an earlier
-//! design) terminates garbage-heavy guests whose live set never approaches
-//! the cap; an interrupt request queued from inside a GC callback
-//! (`IsolateHandle::request_interrupt`, also tried) is never delivered for
-//! tight allocation loops. Neither is used.
+//! ArrayBuffer memory shares the same single budget from the allocator
+//! side: this V8 build does not account sandboxed backing stores as
+//! external memory, so a counting allocator refuses any allocation that
+//! would push live backing-store bytes plus the latest post-GC heap
+//! figure past the cap; V8 turns the refusal into a catchable RangeError
+//! the guest may survive. Judging the raw pre-GC figure (an earlier
+//! design) terminates garbage-heavy guests whose live set never
+//! approaches the cap, and an interrupt request queued from inside a GC
+//! callback (`IsolateHandle::request_interrupt`, also tried) is never
+//! delivered for tight allocation loops; neither is used.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::world::{world_mut, TermReason, Termination};
+use crate::world::{TermReason, Termination};
+
+extern "C" {
+    /// v8::Isolate::AddGCEpilogueCallback(callback, data, gc_type_filter)
+    /// by its mangled name: the crate binds only the prologue variant, and
+    /// the engine exports this symbol from the same static library. The
+    /// C++ member function takes `this` as its first argument, which is
+    /// exactly this declaration.
+    fn _ZN2v87Isolate21AddGCEpilogueCallbackEPFvPS0_NS_6GCTypeENS_15GCCallbackFlagsEPvES4_S2_(
+        isolate: *mut v8::Isolate,
+        callback: extern "C" fn(
+            isolate: *mut v8::Isolate,
+            ty: v8::GCType,
+            flags: v8::GCCallbackFlags,
+            data: *mut c_void,
+        ),
+        data: *mut c_void,
+        gc_type_filter: v8::GCType,
+    );
+}
 
 /// Smallest workable cap: V8 cannot sustain less (its own check failures
 /// and fatal OOMs dominate below this).
 pub(crate) const MIN_CAP_MB: usize = 8;
 
-/// The cap plan for a run: the effective cap in MB and V8's raised limit
-/// in bytes. The headroom (twice the cap, at least 32 MiB) lets ordinary
-/// collections keep garbage-heavy guests running: their transient working
-/// set stays under V8's limit, and only a live set (or sustained churn)
-/// that genuinely outgrows the cap is stopped. Saturating arithmetic and a
-/// pre-shift ceiling, because a library caller can pass any usize (a plain
-/// `*`/`<<` would panic a debug build).
-pub(crate) fn plan(heap_mb: usize) -> (usize, usize) {
+/// The cap plan for a run: the effective cap in MB, the cap in bytes, and
+/// V8's raised limit in bytes. The headroom (twice the cap, at least
+/// 32 MiB) keeps the fatal allocation-retry path away from guests that
+/// are merely close to the cap, while the near-heap-limit rescue covers
+/// genuinely over-cap growth. Saturating arithmetic and pre-shift
+/// ceilings, because a library caller can pass any usize (a plain `*`/`<<`
+/// would panic a debug build or wrap in release).
+pub(crate) fn plan(heap_mb: usize) -> CapPlan {
     let cap_mb = heap_mb.max(MIN_CAP_MB);
     let headroom_mb = cap_mb.saturating_mul(2).max(32);
-    let v8_max_mb = cap_mb.saturating_add(headroom_mb).min(usize::MAX >> 20);
-    let v8_max_bytes = if v8_max_mb == usize::MAX >> 20 {
-        usize::MAX
-    } else {
-        v8_max_mb << 20
-    };
-    (cap_mb, v8_max_bytes)
+    let v8_max_mb = cap_mb.saturating_add(headroom_mb);
+    CapPlan {
+        cap_mb,
+        cap_bytes: cap_mb.min(usize::MAX >> 20).saturating_mul(1 << 20),
+        v8_max_bytes: v8_max_mb.min(usize::MAX >> 20).saturating_mul(1 << 20),
+    }
 }
 
-/// Used heap plus external (ArrayBuffer backing) memory, the figure the
-/// cap is judged on.
-fn used_plus_external(iso: &mut v8::Isolate, external: &AtomicUsize) -> usize {
+/// The derived limits for one run (see [plan]).
+pub(crate) struct CapPlan {
+    pub(crate) cap_mb: usize,
+    pub(crate) cap_bytes: usize,
+    pub(crate) v8_max_bytes: usize,
+}
+
+/// The per-run heap state shared with V8's callbacks. The callbacks
+/// receive only the `data` pointer plus (for GC callbacks) the isolate,
+/// so termination goes through the thread-safe handle and the shared
+/// termination reason.
+pub(crate) struct HeapGuard {
+    handle: v8::IsolateHandle,
+    term: Arc<Termination>,
+    cap_bytes: usize,
+    /// The latest post-GC used-heap figure, shared with the counting
+    /// allocator so heap and buffers share one budget.
+    heap_used: Arc<AtomicUsize>,
+    /// Where the near-heap-limit rescue raises V8's limit to: the starting
+    /// limit plus twice itself, room for one more growth step of a
+    /// doubling shape so the termination is observed in JavaScript.
+    limit_ceiling: usize,
+}
+
+impl HeapGuard {
+    pub(crate) fn new(
+        handle: v8::IsolateHandle,
+        term: Arc<Termination>,
+        plan: &CapPlan,
+        heap_used: Arc<AtomicUsize>,
+    ) -> Self {
+        HeapGuard {
+            handle,
+            term,
+            cap_bytes: plan.cap_bytes,
+            heap_used,
+            limit_ceiling: plan.v8_max_bytes.saturating_mul(3),
+        }
+    }
+
+    /// The `data` argument for the V8 callbacks. The guard must outlive the
+    /// isolate: teardown runs GC, which calls back in through this pointer.
+    pub(crate) fn callback_data(&mut self) -> *mut c_void {
+        self as *mut Self as *mut c_void
+    }
+
+    /// Registers the heap-limit callback and the GC epilogue on `isolate`;
+    /// kept next to the guard so the callback data and the registrations
+    /// cannot drift apart.
+    pub(crate) fn register(&mut self, isolate: &mut v8::Isolate) {
+        let data = self.callback_data();
+        isolate.add_near_heap_limit_callback(on_near_heap_limit, data);
+        unsafe {
+            _ZN2v87Isolate21AddGCEpilogueCallbackEPFvPS0_NS_6GCTypeENS_15GCCallbackFlagsEPvES4_S2_(
+                isolate,
+                after_gc,
+                data,
+                v8::GCType::ALL,
+            )
+        };
+    }
+}
+
+/// After a collection: publish the heap figure for the shared budget and,
+/// after a major collection, stop a guest whose live set passed the cap.
+/// A borderline figure simply waits for the next collection, which a
+/// garbage-heavy guest passes and a growing one does not.
+pub(crate) extern "C" fn after_gc(
+    isolate: *mut v8::Isolate,
+    ty: v8::GCType,
+    _flags: v8::GCCallbackFlags,
+    data: *mut c_void,
+) {
+    let guard = unsafe { &*(data as *const HeapGuard) };
+    let iso = unsafe { &mut *isolate };
     let mut stats = v8::HeapStatistics::default();
     iso.get_heap_statistics(&mut stats);
-    stats
-        .used_heap_size()
-        .saturating_add(stats.external_memory())
-        .saturating_add(external.load(Ordering::Relaxed))
+    let used = stats.used_heap_size();
+    guard.heap_used.store(used, Ordering::Relaxed);
+    if ty != v8::GCType::MARK_SWEEP_COMPACT {
+        return;
+    }
+    if guard.term.is_finished() || guard.term.reason().is_some() {
+        return;
+    }
+    if used > guard.cap_bytes {
+        guard.term.mark(TermReason::Oom);
+        guard.handle.terminate_execution();
+    }
 }
 
-/// True when `flags` carries the maximal-collection flag. The crate's flag
-/// type has no BitAnd, but OR is idempotent, so `flags | X == flags` tests
-/// whether X's bits are set.
-fn is_maximal(flags: v8::GCCallbackFlags) -> bool {
-    (flags | v8::GCCallbackFlags::COLLECT_ALL_AVAILABLE_GARBAGE) == flags
-}
-
-/// The ArrayBuffer allocator for a run: the platform allocator wrapped
-/// with a live byte count, because this V8 build does not account sandboxed
-/// backing stores as external memory (HeapStatistics::external_memory
-/// stays near zero while ArrayBuffers grow), so the count must come from
-/// the allocator itself.
-fn counting_vtable() -> &'static v8::RustAllocatorVtable<AtomicUsize> {
+fn counting_vtable() -> &'static v8::RustAllocatorVtable<AllocState> {
     &v8::RustAllocatorVtable {
         allocate,
         allocate_uninitialized,
         free,
         reallocate,
         drop: drop_handle,
+    }
+}
+
+/// The allocator's view of the shared budget: its own live byte count
+/// against the cap minus the latest heap figure.
+pub(crate) struct AllocState {
+    live: AtomicUsize,
+    cap_bytes: usize,
+    heap_used: Arc<AtomicUsize>,
+}
+
+impl AllocState {
+    /// True when `extra` more backing-store bytes fit under the budget.
+    fn fits(&self, extra: usize) -> bool {
+        let budget = self
+            .cap_bytes
+            .saturating_sub(self.heap_used.load(Ordering::Relaxed));
+        self.live
+            .load(Ordering::Relaxed)
+            .checked_add(extra)
+            .map(|need| need <= budget)
+            .unwrap_or(false)
     }
 }
 
@@ -102,212 +205,75 @@ fn layout(len: usize) -> std::alloc::Layout {
 }
 
 /// These run inside V8: no panics (allocation failure returns null, which
-/// V8 reports to the guest as a RangeError) and no calls back into V8.
-unsafe extern "C" fn allocate(count: &AtomicUsize, len: usize) -> *mut c_void {
-    count.fetch_add(len, Ordering::Relaxed);
-    unsafe { std::alloc::alloc_zeroed(layout(len)) as *mut c_void }
+/// V8 reports to the guest as a catchable RangeError) and no calls back
+/// into V8. The count only moves after a successful allocation.
+unsafe extern "C" fn allocate(st: &AllocState, len: usize) -> *mut c_void {
+    if !st.fits(len) {
+        return std::ptr::null_mut();
+    }
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout(len)) };
+    if !ptr.is_null() {
+        st.live.fetch_add(len, Ordering::Relaxed);
+    }
+    ptr as *mut c_void
 }
 
-unsafe extern "C" fn allocate_uninitialized(count: &AtomicUsize, len: usize) -> *mut c_void {
-    count.fetch_add(len, Ordering::Relaxed);
-    unsafe { std::alloc::alloc(layout(len)) as *mut c_void }
+unsafe extern "C" fn allocate_uninitialized(st: &AllocState, len: usize) -> *mut c_void {
+    if !st.fits(len) {
+        return std::ptr::null_mut();
+    }
+    let ptr = unsafe { std::alloc::alloc(layout(len)) };
+    if !ptr.is_null() {
+        st.live.fetch_add(len, Ordering::Relaxed);
+    }
+    ptr as *mut c_void
 }
 
-unsafe extern "C" fn free(count: &AtomicUsize, data: *mut c_void, len: usize) {
-    count.fetch_sub(len, Ordering::Relaxed);
-    unsafe { std::alloc::dealloc(data as *mut u8, layout(len)) };
+unsafe extern "C" fn free(st: &AllocState, data: *mut c_void, len: usize) {
+    if !data.is_null() {
+        st.live.fetch_sub(len, Ordering::Relaxed);
+        unsafe { std::alloc::dealloc(data as *mut u8, layout(len)) };
+    }
 }
 
 unsafe extern "C" fn reallocate(
-    count: &AtomicUsize,
+    st: &AllocState,
     data: *mut c_void,
     old_len: usize,
     new_len: usize,
 ) -> *mut c_void {
-    count.fetch_sub(old_len, Ordering::Relaxed);
-    count.fetch_add(new_len, Ordering::Relaxed);
-    unsafe {
-        std::alloc::realloc(data as *mut u8, layout(old_len), layout(new_len).size()) as *mut c_void
+    if data.is_null() || old_len == 0 {
+        return unsafe { allocate_uninitialized(st, new_len) };
     }
-}
-
-unsafe extern "C" fn drop_handle(count: *const AtomicUsize) {
-    drop(unsafe { Arc::from_raw(count) });
-}
-
-/// The allocator feeding a shared live byte count (held by the run's
-/// World and heap state).
-pub(crate) fn counting_allocator(count: Arc<AtomicUsize>) -> v8::UniqueRef<v8::Allocator> {
-    unsafe { v8::new_rust_allocator(Arc::into_raw(count), counting_vtable()) }
-}
-
-/// Watches the ArrayBuffer byte count from a side thread: external growth
-/// alone never triggers a V8 collection in this build, so no GC callback
-/// would fire for a guest that only allocates buffers. Every over-cap
-/// poll requests an interrupt that collects and judges on the isolate
-/// thread (dead wrappers only release their backing stores after a
-/// collection); if the count stays over the cap for sustained polls -
-/// interrupt delivery or not - the watch terminates the run itself.
-pub(crate) struct HeapWatch {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-/// Over-cap polls (10 ms apart) tolerated before terminating: enough for
-/// a collection requested through the interrupt to release dead wrappers.
-const WATCH_STRIKES: usize = 10;
-
-/// The guard pointer crossing into the watch thread. Sound because the
-/// guard outlives the watch (both are dropped inside execute_inner's
-/// scope, the watch first, and its thread is joined) and every field the
-/// watch touches is atomic or immutable.
-struct GuardPtr(*const HeapGuard);
-unsafe impl Send for GuardPtr {}
-
-impl HeapWatch {
-    /// `guard` must outlive this watch (the watch is dropped inside
-    /// execute_inner, the guard at the end of execute).
-    pub(crate) fn new(handle: v8::IsolateHandle, guard: *const HeapGuard) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let guard = GuardPtr(guard);
-        let thread = std::thread::Builder::new()
-            .name("v8vm-heap-watch".to_string())
-            .spawn(move || {
-                let guard = guard;
-                let guard = unsafe { &*guard.0 };
-                let mut strikes = 0;
-                while !stop2.load(Ordering::SeqCst)
-                    && guard.term.reason().is_none()
-                    && !guard.term.is_finished()
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    if guard.external.load(Ordering::Relaxed) > guard.cap_bytes {
-                        strikes += 1;
-                        let _ = handle.request_interrupt(reclaim, guard as *const HeapGuard as *mut c_void);
-                        if strikes >= WATCH_STRIKES {
-                            guard.term.mark(TermReason::Oom);
-                            handle.terminate_execution();
-                            return;
-                        }
-                    } else {
-                        strikes = 0;
-                    }
-                }
-            })
-            .expect("spawn heap watch");
-        HeapWatch {
-            stop,
-            thread: Some(thread),
-        }
+    if !st.fits(new_len.saturating_sub(old_len)) {
+        return std::ptr::null_mut();
     }
+    let ptr = unsafe {
+        std::alloc::realloc(data as *mut u8, layout(old_len), layout(new_len).size())
+    };
+    if !ptr.is_null() {
+        st.live.fetch_sub(old_len, Ordering::Relaxed);
+        st.live.fetch_add(new_len, Ordering::Relaxed);
+    }
+    ptr as *mut c_void
 }
 
-/// Runs on the isolate thread from the interrupt the watch requested:
-/// collect first (so buffers whose wrappers died are released), then
-/// judge the surviving figure.
-extern "C" fn reclaim(isolate: &mut v8::Isolate, data: *mut c_void) {
-    let guard = unsafe { &*(data as *const HeapGuard) };
-    if guard.term.is_finished() || guard.term.reason().is_some() {
-        return;
-    }
-    isolate.low_memory_notification();
-    if used_plus_external(isolate, &guard.external) > guard.cap_bytes {
-        guard.term.mark(TermReason::Oom);
-        guard.handle.terminate_execution();
-    }
+unsafe extern "C" fn drop_handle(st: *const AllocState) {
+    drop(unsafe { Arc::from_raw(st) });
 }
 
-impl Drop for HeapWatch {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-/// The per-run heap-side state shared with V8's callbacks. The callbacks
-/// receive only the `data` pointer plus (for GC callbacks) the isolate, so
-/// termination goes through the thread-safe handle and the shared
-/// termination reason.
-pub(crate) struct HeapGuard {
-    handle: v8::IsolateHandle,
-    term: Arc<Termination>,
+/// The counting allocator for a run: enforces the ArrayBuffer half of the
+/// shared budget by refusing allocations that do not fit.
+pub(crate) fn counting_allocator(
     cap_bytes: usize,
-    /// Live ArrayBuffer bytes from the counting allocator (this build does
-    /// not account them as external memory by itself).
-    external: Arc<AtomicUsize>,
-    /// Where the near-heap-limit rescue raises V8's limit to: the starting
-    /// limit plus twice itself, room for one more growth step of a
-    /// doubling shape so the termination is observed in JavaScript.
-    limit_ceiling: usize,
-}
-
-impl HeapGuard {
-    pub(crate) fn new(
-        handle: v8::IsolateHandle,
-        term: Arc<Termination>,
-        cap_bytes: usize,
-        external: Arc<AtomicUsize>,
-        v8_max_bytes: usize,
-    ) -> Self {
-        HeapGuard {
-            handle,
-            term,
-            cap_bytes,
-            external,
-            limit_ceiling: v8_max_bytes.saturating_mul(3),
-        }
-    }
-
-    /// The `data` argument for the V8 callbacks. The guard must outlive the
-    /// isolate: teardown runs GC, which calls back in through this pointer.
-    pub(crate) fn callback_data(&mut self) -> *mut c_void {
-        self as *mut Self as *mut c_void
-    }
-}
-
-/// Registered for every GC type; only maximal collections (external-memory
-/// pressure) are judged here, because their figure is what forced them.
-pub(crate) extern "C" fn before_gc(
-    isolate: *mut v8::Isolate,
-    _ty: v8::GCType,
-    flags: v8::GCCallbackFlags,
-    data: *mut c_void,
-) {
-    if !is_maximal(flags) {
-        return;
-    }
-    let guard = unsafe { &*(data as *const HeapGuard) };
-    if guard.term.is_finished() || guard.term.reason().is_some() {
-        return;
-    }
-    let iso = unsafe { &mut *isolate };
-    if used_plus_external(iso, &guard.external) > guard.cap_bytes {
-        guard.term.mark(TermReason::Oom);
-        guard.handle.terminate_execution();
-    }
-}
-
-/// Host checkpoint for event-loop turns, covering external-memory growth
-/// that has not triggered a collection (ArrayBuffers alone need not make
-/// V8 collect). The raw figure still contains garbage accumulated since
-/// the last collection, so a maximal collection is forced first and only
-/// the surviving live set is judged.
-pub(crate) fn host_checkpoint(scope: &mut v8::HandleScope) {
-    if world_mut(scope).term.reason().is_some() || world_mut(scope).term.is_finished() {
-        return;
-    }
-    let cap_bytes = world_mut(scope).heap_cap_bytes;
-    let external = world_mut(scope).external_bytes.clone();
-    if used_plus_external(scope, &external) > cap_bytes {
-        scope.low_memory_notification();
-        if used_plus_external(scope, &external) > cap_bytes {
-            world_mut(scope).term.mark(TermReason::Oom);
-            scope.terminate_execution();
-        }
-    }
+    heap_used: Arc<AtomicUsize>,
+) -> v8::UniqueRef<v8::Allocator> {
+    let state = Arc::new(AllocState {
+        live: AtomicUsize::new(0),
+        cap_bytes,
+        heap_used,
+    });
+    unsafe { v8::new_rust_allocator(Arc::into_raw(state), counting_vtable()) }
 }
 
 /// V8 invokes this after collections failed to keep the heap under its
@@ -333,28 +299,41 @@ mod tests {
 
     #[test]
     fn plan_clamps_the_minimum_and_adds_headroom() {
-        assert_eq!(plan(0), (8, 40 << 20));
-        assert_eq!(plan(7), (8, 40 << 20));
-        assert_eq!(plan(64), (64, 192 << 20));
-        assert_eq!(plan(256), (256, 768 << 20));
+        let p = plan(0);
+        assert_eq!((p.cap_mb, p.cap_bytes), (8, 8 << 20));
+        assert_eq!(p.v8_max_bytes, 40 << 20);
+        assert_eq!(plan(7).cap_mb, 8);
+        assert_eq!(plan(64).v8_max_bytes, 192 << 20);
+        assert_eq!(plan(256).v8_max_bytes, 768 << 20);
     }
 
     #[test]
     fn plan_saturates_instead_of_overflowing() {
-        // A plain `3 * heap_mb << 20` would panic a debug build here.
-        let (cap, v8_max) = plan(usize::MAX);
-        assert_eq!(cap, usize::MAX);
-        assert_eq!(v8_max, usize::MAX);
+        // A plain `3 * heap_mb << 20` would panic a debug build here and
+        // wrap in release (a 16 TiB cap became 0 bytes before).
+        let p = plan(usize::MAX);
+        assert_eq!(p.cap_mb, usize::MAX);
+        assert!(p.cap_bytes >= usize::MAX >> 21, "no wrap to a small value");
+        assert!(p.v8_max_bytes >= p.cap_bytes);
+        let p = plan(1 << 44); // 16 TiB, a value a user can actually pass
+        assert!(p.cap_bytes >= 1 << 44, "a 16 TiB cap must not wrap to 0");
+        assert!(p.v8_max_bytes >= p.cap_bytes);
     }
 
     #[test]
-    fn maximal_flag_is_detected_among_other_bits() {
-        assert!(!is_maximal(v8::GCCallbackFlags::NONE));
-        assert!(is_maximal(v8::GCCallbackFlags::COLLECT_ALL_AVAILABLE_GARBAGE));
-        assert!(is_maximal(
-            v8::GCCallbackFlags::COLLECT_ALL_AVAILABLE_GARBAGE
-                | v8::GCCallbackFlags::COLLECT_ALL_EXTERNAL_MEMORY
-        ));
-        assert!(!is_maximal(v8::GCCallbackFlags::FORCED));
+    fn allocator_state_enforces_the_shared_budget() {
+        let heap_used = Arc::new(AtomicUsize::new(0));
+        let st = AllocState {
+            live: AtomicUsize::new(10 << 20),
+            cap_bytes: 32 << 20,
+            heap_used: heap_used.clone(),
+        };
+        assert!(st.fits(22 << 20));
+        assert!(!st.fits(23 << 20), "over the cap");
+        heap_used.store(20 << 20, Ordering::Relaxed);
+        assert!(!st.fits(13 << 20), "the heap figure eats the budget");
+        assert!(st.fits(2 << 20));
+        assert!(!st.fits(3 << 20));
+        assert!(!st.fits(usize::MAX), "overflow does not fit");
     }
 }
