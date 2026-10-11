@@ -192,6 +192,72 @@ fn fs_quota_zero_disables_the_limit_and_bad_values_exit_2() {
 }
 
 #[test]
+fn snapshot_reports_version_2_with_text_and_b64_entries() {
+    let r = run_js(
+        "snap-shape",
+        "vm.fs.write('/t.txt', 'plain');
+         vm.fs.write('/b.bin', new Uint8Array([255, 254]));
+         const snap = JSON.parse(vm.snapshot());
+         console.log(snap.version, snap.dirs.join(','), snap.files['/t.txt'].text, snap.files['/b.bin'].b64);",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "2 / plain //4=\n");
+}
+
+#[test]
+fn dump_preload_roundtrips_binary_files_and_dirs() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bin-roundtrip.json");
+    let writer = script(
+        "bin-writer",
+        "vm.fs.write('/img.bin', new Uint8Array([0, 255, 254, 1, 254, 255, 0]));
+         vm.fs.mkdir('/cfg', {recursive: true});
+         vm.fs.write('/cfg/x', 't');",
+    );
+    let w = v8vm(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
+    assert_eq!(w.code, 0, "stderr: {}", w.stderr);
+    let reader = script(
+        "bin-reader",
+        "const b = vm.fs.readBytes('/img.bin');
+         console.log(Array.from(b).join(','), vm.fs.stat('/img.bin').size, vm.fs.exists('/cfg'), vm.fs.read('/cfg/x'), vm.fs.stat('/cfg').type);",
+    );
+    let r = v8vm(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "0,255,254,1,254,255,0 7 true t dir\n");
+}
+
+#[test]
+fn preload_accepts_the_legacy_snapshot_fixture() {
+    let fixture =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/legacy-snapshot.json");
+    let path = script(
+        "legacy-reader",
+        "console.log(vm.fs.read('/greeting.txt'), vm.fs.exists('/lib'), vm.fs.list('/').join(','));
+         vm.run('/lib/util.js');
+         console.log(globalThis.seven);",
+    );
+    let r = v8vm(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "hello from the old format true /greeting.txt,/lib/util.js\n7\n");
+}
+
+#[test]
+fn restore_in_the_guest_accepts_both_formats_and_reports_bad_ones() {
+    let r = run_js(
+        "restore-formats",
+        "vm.fs.write('/now', 'x');
+         vm.restore('{\"/old\":\"legacy\"}');
+         console.log(vm.fs.read('/old'), vm.fs.exists('/now'));
+         const snap = vm.snapshot();
+         vm.fs.remove('/old', {recursive: true});
+         vm.restore(snap);
+         console.log(vm.fs.read('/old'));
+         try { vm.restore('[]'); } catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "legacy true\nlegacy\ninvalid snapshot: expected an object\n");
+}
+
+#[test]
 fn dump_then_preload_restores_the_filesystem() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.json");
     let writer = script("dump-writer", "vm.fs.write('/k', 'v\\u00e9');");

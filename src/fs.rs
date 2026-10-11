@@ -28,6 +28,73 @@ fn file_cost(len: usize) -> u64 {
     ENTRY_OVERHEAD + len as u64
 }
 
+/// Full recount: content bytes plus overhead per entry, root excluded.
+fn usage(files: &BTreeMap<String, Vec<u8>>, dirs: &BTreeSet<String>) -> u64 {
+    files.values().map(|d| file_cost(d.len())).sum::<u64>()
+        + ENTRY_OVERHEAD * (dirs.len() as u64 - 1)
+}
+
+/// Parsed snapshot payload: explicit directories plus file contents.
+type Snapshot = (BTreeSet<String>, Vec<(String, Vec<u8>)>);
+
+fn parse_snapshot(json: &str) -> FsResult<Snapshot> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid snapshot: {}", e))?;
+    let obj = v.as_object().ok_or("invalid snapshot: expected an object")?;
+    // A legacy map's keys are absolute paths, so a bare "version" key can
+    // only belong to the versioned format.
+    if obj.get("version").and_then(serde_json::Value::as_i64) == Some(2) {
+        return parse_v2(obj);
+    }
+    parse_legacy(obj)
+}
+
+fn parse_v2(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapshot> {
+    let files = obj
+        .get("files")
+        .and_then(|v| v.as_object())
+        .ok_or("invalid snapshot: files must be an object")?;
+    let mut out = Vec::with_capacity(files.len());
+    for (p, entry) in files {
+        out.push((normalize(p)?, entry_bytes(entry)?));
+    }
+    let mut dirs = BTreeSet::new();
+    if let Some(v) = obj.get("dirs") {
+        let arr = v.as_array().ok_or("invalid snapshot: dirs must be an array")?;
+        for d in arr {
+            let s = d.as_str().ok_or("invalid snapshot: dirs entries must be strings")?;
+            dirs.insert(normalize(s)?);
+        }
+    }
+    Ok((dirs, out))
+}
+
+fn entry_bytes(entry: &serde_json::Value) -> FsResult<Vec<u8>> {
+    let obj = entry
+        .as_object()
+        .ok_or("invalid snapshot: file entry must be {text} or {b64}")?;
+    if let Some(t) = obj.get("text") {
+        return t
+            .as_str()
+            .map(|s| s.as_bytes().to_vec())
+            .ok_or("invalid snapshot: text must be a string".to_string());
+    }
+    if let Some(b) = obj.get("b64") {
+        let s = b.as_str().ok_or("invalid snapshot: b64 must be a string")?;
+        return b64::decode(s).ok_or("invalid snapshot: bad base64".to_string());
+    }
+    Err("invalid snapshot: file entry must be {text} or {b64}".to_string())
+}
+
+fn parse_legacy(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapshot> {
+    let mut files = Vec::with_capacity(obj.len());
+    for (p, v) in obj {
+        let s = v.as_str().ok_or("invalid snapshot: old-format values must be strings")?;
+        files.push((normalize(p)?, s.as_bytes().to_vec()));
+    }
+    Ok((BTreeSet::new(), files))
+}
+
 /// Collapses `.`/`..`/duplicate slashes and rejects anything that is not an
 /// absolute path inside the sandbox root.
 fn normalize(path: &str) -> FsResult<String> {
@@ -401,6 +468,74 @@ impl RamFs {
         Ok(())
     }
 
+    /// Snapshot format version 2:
+    /// {"version":2,"files":{path:{"text":s}|{"b64":s}},"dirs":[...]}.
+    /// Valid UTF-8 content is stored as text, anything else as base64;
+    /// B-tree key order makes dumps deterministic. Old readers that only
+    /// understand the legacy flat map can still read text-only snapshots'
+    /// files through vm.fs.list/read, and this reader accepts both.
+    pub(crate) fn snapshot_json(&self) -> String {
+        let mut files = serde_json::Map::new();
+        for (p, bytes) in &self.files {
+            let entry = match std::str::from_utf8(bytes) {
+                Ok(text) => serde_json::json!({ "text": text }),
+                Err(_) => serde_json::json!({ "b64": b64::encode(bytes) }),
+            };
+            files.insert(p.clone(), entry);
+        }
+        let dirs: Vec<&str> = self.dirs.iter().map(String::as_str).collect();
+        let v = serde_json::json!({ "version": 2, "files": files, "dirs": dirs });
+        serde_json::to_string(&v).expect("a snapshot is always serializable")
+    }
+
+    /// Restores a version-2 snapshot or the legacy flat {path: text} map,
+    /// merging into the current state. All-or-nothing: a snapshot that
+    /// would break the caps or the quota changes nothing.
+    pub(crate) fn restore(&mut self, json: &str) -> FsResult<()> {
+        let (dirs, files) = parse_snapshot(json)?;
+        self.apply_snapshot(dirs, files)
+    }
+
+    /// Plans the merge on copies and commits only a state that fits. Every
+    /// ancestor of a restored entry becomes a directory, so stat, exists
+    /// and readdir see one uniform tree even for legacy snapshots.
+    fn apply_snapshot(
+        &mut self,
+        dirs: BTreeSet<String>,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> FsResult<()> {
+        let mut want = dirs.clone();
+        for d in &dirs {
+            want.extend(ancestors(d));
+        }
+        for (p, _) in &files {
+            want.extend(ancestors(p));
+        }
+        let mut next_dirs = self.dirs.clone();
+        let mut next_files = self.files.clone();
+        for d in want {
+            next_files.remove(&d);
+            next_dirs.insert(d);
+        }
+        for (p, bytes) in files {
+            if next_dirs.contains(&p) {
+                return Err(format!("is a directory: {}", p));
+            }
+            next_files.insert(p, bytes);
+        }
+        let used = usage(&next_files, &next_dirs);
+        if next_files.len() + next_dirs.len() - 1 > MAX_ENTRIES {
+            return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
+        }
+        if self.quota != 0 && used > self.quota {
+            return Err("fs quota exceeded".to_string());
+        }
+        self.files = next_files;
+        self.dirs = next_dirs;
+        self.used = used;
+        Ok(())
+    }
+
     /// Re-keys a directory subtree under a new path.
     fn move_subtree(&mut self, from: &str, to: &str) {
         let (files, dirs) = self.entries_under(&child_prefix(from));
@@ -420,6 +555,60 @@ impl RamFs {
 
 fn rekey(path: &str, from: &str, to: &str) -> String {
     format!("{}{}", to, &path[from.len()..])
+}
+
+/// Standard base64 with padding, in ~30 lines so the snapshot format needs
+/// no extra crate.
+mod b64 {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub(super) fn encode(data: &[u8]) -> String {
+        let digit = |v: u32| ALPHABET[(v & 63) as usize] as char;
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let mut b = [0u8; 3];
+            b[..chunk.len()].copy_from_slice(chunk);
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            out.push(digit(n >> 18));
+            out.push(digit(n >> 12));
+            out.push(if chunk.len() > 1 { digit(n >> 6) } else { '=' });
+            out.push(if chunk.len() > 2 { digit(n) } else { '=' });
+        }
+        out
+    }
+
+    pub(super) fn decode(s: &str) -> Option<Vec<u8>> {
+        let b = s.as_bytes();
+        if !b.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(b.len() / 4 * 3);
+        for chunk in b.chunks(4) {
+            let pad = chunk.iter().filter(|&&c| c == b'=').count();
+            // Padding is only ever trailing, and at most two characters.
+            if pad > 2 || chunk[..4 - pad].contains(&b'=') {
+                return None;
+            }
+            let mut n = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                let v = if c == b'=' {
+                    0
+                } else {
+                    ALPHABET.iter().position(|&a| a == c)? as u32
+                };
+                n |= v << (18 - 6 * i);
+            }
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(n as u8);
+            }
+        }
+        Some(out)
+    }
 }
 
 /// The `stat()` result: kind plus a size that means content bytes for files
@@ -588,6 +777,18 @@ guest_cb!(fs_rename, |args, _rv, scope| {
     }
 });
 
+guest_cb!(fs_snapshot, |_args, rv, scope| {
+    let json = world_mut(scope).fs.snapshot_json();
+    rv.set(str_local(scope, &json).into());
+});
+
+guest_cb!(fs_restore, |args, _rv, scope| {
+    let json = to_rust_string(scope, &args.get(0));
+    if let Err(e) = world_mut(scope).fs.restore(&json) {
+        throw(scope, &e);
+    }
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +952,81 @@ mod tests {
         let recount = f.files.values().map(|d| file_cost(d.len())).sum::<u64>()
             + ENTRY_OVERHEAD * (f.dirs.len() as u64 - 1); // root is free
         assert_eq!(f.used, recount);
+    }
+
+    #[test]
+    fn b64_roundtrips_everything_and_rejects_junk() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        for len in [0, 1, 2, 3, 4, 5, 63, 64, 255, 256] {
+            let data = &all[..len];
+            assert_eq!(b64::decode(&b64::encode(data)).unwrap(), data, "len {}", len);
+        }
+        assert_eq!(b64::encode(b"f"), "Zg==");
+        assert_eq!(b64::encode(b"fo"), "Zm8=");
+        assert_eq!(b64::encode(b"foo"), "Zm9v");
+        assert_eq!(b64::decode("Zm9v").unwrap(), b"foo");
+        assert_eq!(b64::decode("===="), None); // more than two pads
+        assert_eq!(b64::decode("A"), None); // not a multiple of four
+        assert_eq!(b64::decode("Zm9*"), None); // outside the alphabet
+        assert_eq!(b64::decode("Z=9v"), None); // interior padding
+    }
+
+    #[test]
+    fn snapshot_v2_roundtrips_text_bytes_and_dirs() {
+        let mut f = fs();
+        f.write("/a.txt", b"text".to_vec()).unwrap();
+        f.write("/bin", vec![0xff, 0x00, 0x81]).unwrap();
+        f.mkdir("/empty/deep", true).unwrap();
+        let json = f.snapshot_json();
+        // serde_json's map is a BTreeMap, so the layout is deterministic.
+        assert!(json.starts_with("{\"dirs\":[\"/\",\"/empty\",\"/empty/deep\"],\"files\":"));
+        assert!(json.contains("\"/a.txt\":{\"text\":\"text\"}"));
+        assert!(json.contains("\"/bin\":{\"b64\":\"/wCB\"}"));
+        let mut g = fs();
+        g.restore(&json).unwrap();
+        assert_eq!(g.read_bytes("/a.txt").unwrap(), b"text");
+        assert_eq!(g.read_bytes("/bin").unwrap(), vec![0xff, 0x00, 0x81]);
+        assert!(g.exists("/empty") && g.exists("/empty/deep"));
+        assert_eq!(g.readdir("/empty").unwrap(), vec!["deep".to_string()]);
+        assert_eq!(g.readdir("/empty/deep").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn restore_accepts_the_legacy_flat_map() {
+        let mut f = fs();
+        f.restore(r#"{"/greeting.txt":"hello","/lib/util.js":"u=7"}"#).unwrap();
+        assert_eq!(f.read_string("/greeting.txt").unwrap(), "hello");
+        assert!(f.exists("/lib")); // implicit parents materialize as dirs
+        assert_eq!(f.readdir("/lib").unwrap(), vec!["util.js".to_string()]);
+        // and it merges into existing state like the old per-file writes
+        f.write("/keep", b"k".to_vec()).unwrap();
+        f.restore("{\"/new\":\"n\"}").unwrap();
+        assert!(f.exists("/keep") && f.exists("/new"));
+    }
+
+    #[test]
+    fn restore_is_validated_and_atomic() {
+        let mut f = fs();
+        f.write("/keep", b"k".to_vec()).unwrap();
+        assert!(f.restore("{not json").unwrap_err().contains("invalid snapshot"));
+        assert!(f.restore("[]").unwrap_err().contains("invalid snapshot"));
+        assert!(f.restore("{}").is_ok()); // an empty legacy map is fine
+        let v2 =
+            serde_json::json!({"version": 2, "files": {"/x": "a string, not an object"}});
+        assert!(f.restore(&v2.to_string()).unwrap_err().contains("invalid snapshot"));
+        let bad_b64 = serde_json::json!({"version": 2, "files": {"/x": {"b64": "!!"}}});
+        assert!(f.restore(&bad_b64.to_string()).unwrap_err().contains("bad base64"));
+        assert!(f.restore(r#"{"/../escape": "x"}"#).unwrap_err().contains("path escapes root"));
+        assert!(f.restore(r#"{"n": 1}"#).unwrap_err().contains("old-format values"));
+        // a snapshot that does not fit changes nothing
+        let mut q = RamFs::new(ENTRY_OVERHEAD + 5);
+        let big = serde_json::json!({"version": 2, "files": {"/big": {"text": "0000000000"}}});
+        assert_eq!(q.restore(&big.to_string()).unwrap_err(), "fs quota exceeded");
+        assert!(!q.exists("/big") && q.list("/").unwrap().is_empty());
+        // a file cannot land on a directory the snapshot itself declares
+        let clash = serde_json::json!({"version": 2, "files": {"/d": {"text": "x"}}, "dirs": ["/d"]});
+        assert_eq!(f.restore(&clash.to_string()).unwrap_err(), "is a directory: /d");
+        assert!(f.exists("/keep")); // still untouched by every failure above
     }
 
     #[test]

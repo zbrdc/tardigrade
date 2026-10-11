@@ -35,11 +35,12 @@ and is not set by this repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]
+    v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
 - "--memory=<mb>" V8 heap cap in MB (default 256)
+- "--fs-quota=<mb>" RAM filesystem quota in MB (default 64, 0 disables)
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write vm.snapshot() to a file when the run ends
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
@@ -78,8 +79,6 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | queueMicrotask(fn) | Promise-based microtask |
 | vm.version / vm.args | engine version, arguments after the entry path |
 | vm.exit(code) | stop the program with code |
-| vm.fs.read/write/list/remove | RAM filesystem (throwing read/remove) |
-| vm.snapshot() / vm.restore(json) | whole-filesystem JSON snapshot / restore |
 | vm.run(path) | load-and-eval a file from the RAM fs |
 | vm.net.port() | fresh port number |
 | vm.net.listen(port, (payload, from) => ...) | receive messages on a port |
@@ -88,6 +87,44 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | vm.stdin.read() | Promise of the next stdin chunk; "" at EOF |
 
 WebAssembly, Intl/ICU, and all of ES2023 are available.
+
+### vm.fs
+
+A RAM-only tree of directories and byte-valued files. Paths are
+normalized (`.`, `..`, duplicate and trailing slashes collapse) and must
+be absolute; a path that would climb out of the root throws, and
+`exists` just returns false for it. Writing a file creates its missing
+parent directories.
+
+| API | Description |
+|---|---|
+| vm.fs.write(path, data) | write a file; data is a string, an ArrayBuffer, or a typed array / DataView (a view stores only the bytes it can see); an existing file is replaced wholesale |
+| vm.fs.read(path) | read as a string; bytes that are not valid UTF-8 come back as U+FFFD |
+| vm.fs.readBytes(path) | read as a Uint8Array |
+| vm.fs.list(dir) | recursive listing of file paths under dir, full paths, sorted; directories are not listed |
+| vm.fs.readdir(path) | immediate child names (files and directories), sorted |
+| vm.fs.mkdir(path, {recursive}) | create a directory; recursive also creates parents and tolerates an existing directory |
+| vm.fs.exists(path) | true when the path is a file or directory |
+| vm.fs.stat(path) | {type: 'file'\|'dir', size}: content bytes for files, immediate child count for directories |
+| vm.fs.rename(from, to) | POSIX-shaped: a file replaces a file, a directory moves onto an empty directory; mismatched kinds, a move into the source's own subtree, or a missing destination parent throw |
+| vm.fs.remove(path, {recursive}) | delete a file, an empty directory, or with recursive a whole subtree |
+| vm.snapshot() / vm.restore(json) | whole-filesystem snapshot; see below |
+
+A failed mutating call leaves the filesystem unchanged.
+
+The tree is quota-capped: usage is content bytes plus a flat 64 bytes
+per file or directory entry (the root is free). Default 64 MiB;
+`--fs-quota=<mb>` overrides it and 0 disables it. A write that would
+cross the quota throws Error('fs quota exceeded'). Normalized paths are
+capped at 4096 bytes and the tree at 100000 entries.
+
+Snapshots are JSON. The current format is
+`{"version":2,"files":{"/a.txt":{"text":"..."},"/b.bin":{"b64":"..."}},"dirs":["/","/d"]}`:
+valid-UTF-8 files are stored as text, anything else as base64, and
+keys are sorted so dumps are deterministic. vm.restore also accepts
+the old format, a flat `{"/path": "text"}` map, so --preload files
+written by earlier versions keep working; restore materializes parent
+directories of every restored entry.
 
 ## HTTP bridge
 
