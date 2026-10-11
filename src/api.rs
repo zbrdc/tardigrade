@@ -3,7 +3,8 @@
 use crate::console::{console_err, console_log};
 use crate::exit::vm_exit;
 use crate::fs::{
-    fs_exists, fs_list, fs_mkdir, fs_read, fs_readdir, fs_remove, fs_rename, fs_stat, fs_write,
+    fs_exists, fs_list, fs_mkdir, fs_read, fs_read_bytes, fs_readdir, fs_remove, fs_rename,
+    fs_stat, fs_write,
 };
 use crate::net::{net_close, net_listen, net_port, net_send};
 use crate::stdin::stdin_read;
@@ -63,6 +64,7 @@ pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
 
     let fs = v8::Object::new(scope);
     put_fn(fs, scope, "read", fs_read);
+    put_fn(fs, scope, "readBytes", fs_read_bytes);
     put_fn(fs, scope, "write", fs_write);
     put_fn(fs, scope, "list", fs_list);
     put_fn(fs, scope, "remove", fs_remove);

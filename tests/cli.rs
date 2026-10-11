@@ -138,6 +138,32 @@ fn ramfs_read_write_list_remove() {
 }
 
 #[test]
+fn fs_stores_bytes_and_write_accepts_strings_arrays_and_views() {
+    let r = run_js(
+        "fsbytes",
+        "vm.fs.write('/b.bin', new Uint8Array([255, 254, 0, 65]));
+         const bs = vm.fs.readBytes('/b.bin');
+         console.log(bs.constructor.name, bs.length, bs[0], bs[3]);
+         const u8 = new Uint8Array([1, 2, 3, 4]);
+         vm.fs.write('/v.bin', u8.buffer);
+         vm.fs.write('/dv.bin', new DataView(u8.buffer));
+         vm.fs.write('/off.bin', new Uint8Array(u8.buffer, 1, 2));
+         vm.fs.write('/s.bin', 'hé');
+         vm.fs.write('/z', new Uint8Array(0));
+         const rd = (p) => Array.from(vm.fs.readBytes(p)).join(',');
+         console.log(rd('/v.bin'), rd('/dv.bin'), rd('/off.bin'), rd('/s.bin'), vm.fs.readBytes('/z').length);
+         const text = vm.fs.read('/b.bin');
+         console.log(text.charCodeAt(0) === 0xFFFD, text.charCodeAt(3));
+         try { vm.fs.write('/x', 42); console.log('no throw'); } catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(
+        r.stdout,
+        "Uint8Array 4 255 65\n1,2,3,4 1,2,3,4 2,3 104,195,169 0\ntrue 65\nwrite data must be a string, ArrayBuffer, or typed array\n"
+    );
+}
+
+#[test]
 fn dump_then_preload_restores_the_filesystem() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.json");
     let writer = script("dump-writer", "vm.fs.write('/k', 'v\\u00e9');");

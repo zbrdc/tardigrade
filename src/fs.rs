@@ -1,8 +1,10 @@
 //! vm.fs: the RAM filesystem. Directories are explicit entries; writing a
 //! file creates its missing parent directories. Guest paths are normalized
 //! (`.`, `..`, duplicate and trailing slashes collapse) and always absolute;
-//! paths that would escape the root are rejected. Throwing read/remove, as
-//! documented.
+//! paths that would escape the root are rejected. Contents are bytes:
+//! `read` returns them as a lossy UTF-8 string, `readBytes` as a Uint8Array,
+//! and `write` accepts a string, ArrayBuffer, or typed array. Throwing
+//! read/remove, as documented.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,11 +79,11 @@ fn child_name<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
         .filter(|name| !name.is_empty())
 }
 
-/// The filesystem state: files plus the set of directories that exist in
-/// their own right (root included). Every file's ancestors are directories;
-/// `write` and `restore` maintain that invariant.
+/// The filesystem state: byte-valued files plus the set of directories
+/// that exist in their own right (root included). Every file's ancestors
+/// are directories; `write` and `restore` maintain that invariant.
 pub(crate) struct RamFs {
-    files: BTreeMap<String, String>,
+    files: BTreeMap<String, Vec<u8>>,
     dirs: BTreeSet<String>,
 }
 
@@ -147,7 +149,13 @@ impl RamFs {
         }
     }
 
-    pub(crate) fn read(&self, path: &str) -> FsResult<String> {
+    pub(crate) fn read_string(&self, path: &str) -> FsResult<String> {
+        // Lossy by design: binary files stay readable as strings with
+        // U+FFFD where the bytes are not valid UTF-8.
+        Ok(String::from_utf8_lossy(&self.read_bytes(path)?).into_owned())
+    }
+
+    pub(crate) fn read_bytes(&self, path: &str) -> FsResult<Vec<u8>> {
         let p = normalize(path)?;
         match self.files.get(&p) {
             Some(data) => Ok(data.clone()),
@@ -158,7 +166,7 @@ impl RamFs {
 
     /// Writing creates missing parent directories (documented guest rule)
     /// and replaces an existing file at `path` wholesale.
-    pub(crate) fn write(&mut self, path: &str, data: String) -> FsResult<()> {
+    pub(crate) fn write(&mut self, path: &str, data: Vec<u8>) -> FsResult<()> {
         let p = normalize(path)?;
         if self.is_dir(&p) {
             return Err(format!("is a directory: {}", p));
@@ -370,17 +378,58 @@ fn opt_flag(
     }
 }
 
+/// Extracts write() data: a string's UTF-8 bytes, a typed array's or
+/// DataView's contents, or a whole ArrayBuffer's backing store. Views are
+/// copied with their byte_offset/length honored, so a small view over a
+/// large buffer writes only what it can see.
+fn arg_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Option<Vec<u8>> {
+    if v.is_string() {
+        return Some(to_rust_string(scope, &v).into_bytes());
+    }
+    if v.is_array_buffer_view() {
+        let view = v8::Local::<v8::ArrayBufferView>::try_from(v).ok()?;
+        let mut buf = vec![0u8; view.byte_length()];
+        view.copy_contents(&mut buf);
+        return Some(buf);
+    }
+    if v.is_array_buffer() {
+        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(v).ok()?;
+        let view = v8::Uint8Array::new(scope, buffer, 0, buffer.byte_length())?;
+        let mut buf = vec![0u8; view.byte_length()];
+        view.copy_contents(&mut buf);
+        return Some(buf);
+    }
+    None
+}
+
 guest_cb!(fs_read, |args, rv, scope| {
     let path = to_rust_string(scope, &args.get(0));
-    match world_mut(scope).fs.read(&path) {
-        Ok(data) => rv.set(str_local(scope, &data).into()),
+    match world_mut(scope).fs.read_string(&path) {
+        Ok(text) => rv.set(str_local(scope, &text).into()),
         Err(e) => throw(scope, &e),
     }
 });
 
+guest_cb!(fs_read_bytes, |args, rv, scope| {
+    let path = to_rust_string(scope, &args.get(0));
+    let bytes = match world_mut(scope).fs.read_bytes(&path) {
+        Ok(b) => b,
+        Err(e) => return throw(scope, &e),
+    };
+    // The backing store owns the bytes; the Uint8Array is a view over it.
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let len = store.byte_length();
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let view = v8::Uint8Array::new(scope, buffer, 0, len).unwrap();
+    rv.set(view.into());
+});
+
 guest_cb!(fs_write, |args, _rv, scope| {
     let path = to_rust_string(scope, &args.get(0));
-    let data = to_rust_string(scope, &args.get(1));
+    let data = match arg_bytes(scope, args.get(1)) {
+        Some(d) => d,
+        None => return throw(scope, "write data must be a string, ArrayBuffer, or typed array"),
+    };
     if let Err(e) = world_mut(scope).fs.write(&path, data) {
         throw(scope, &e);
     }
@@ -476,7 +525,7 @@ mod tests {
     fn write_creates_parents_and_reads_back() {
         let mut f = fs();
         f.write("/a/b/c.txt", "hi".into()).unwrap();
-        assert_eq!(f.read("/a/b/c.txt").unwrap(), "hi");
+        assert_eq!(f.read_string("/a/b/c.txt").unwrap(), "hi");
         assert!(f.exists("/a") && f.exists("/a/b"));
         assert_eq!(f.readdir("/a").unwrap(), vec!["b".to_string()]);
     }
@@ -542,6 +591,28 @@ mod tests {
     }
 
     #[test]
+    fn binary_contents_roundtrip_and_lossy_read() {
+        let mut f = fs();
+        f.write("/b.bin", vec![0xff, 0xfe, 0x00, b'A']).unwrap();
+        assert_eq!(f.read_bytes("/b.bin").unwrap(), vec![0xff, 0xfe, 0x00, b'A']);
+        let text = f.read_string("/b.bin").unwrap();
+        assert_eq!(text.chars().count(), 4); // two U+FFFD chars + NUL + 'A'
+        assert_eq!(text, "\u{fffd}\u{fffd}\0A");
+        f.write("/empty", Vec::new()).unwrap();
+        assert_eq!(f.read_string("/empty").unwrap(), "");
+        assert_eq!(f.stat("/empty").unwrap().size, 0);
+    }
+
+    #[test]
+    fn write_replaces_file_bytes_wholesale() {
+        let mut f = fs();
+        f.write("/f", vec![1, 2, 3, 4]).unwrap();
+        f.write("/f", vec![9]).unwrap();
+        assert_eq!(f.read_bytes("/f").unwrap(), vec![9]);
+        assert_eq!(f.stat("/f").unwrap().size, 1);
+    }
+
+    #[test]
     fn remove_handles_files_dirs_and_subtrees() {
         let mut f = fs();
         f.write("/d/a.txt", "A".into()).unwrap();
@@ -560,14 +631,14 @@ mod tests {
         f.write("/a.txt", "1".into()).unwrap();
         f.write("/b.txt", "2".into()).unwrap();
         f.rename("/a.txt", "/b.txt").unwrap();
-        assert_eq!(f.read("/b.txt").unwrap(), "1");
+        assert_eq!(f.read_string("/b.txt").unwrap(), "1");
         assert!(!f.exists("/a.txt"));
 
         f.mkdir("/d", false).unwrap();
         f.write("/d/x", "X".into()).unwrap();
         f.mkdir("/e", false).unwrap();
         f.rename("/d", "/e").unwrap();
-        assert_eq!(f.read("/e/x").unwrap(), "X");
+        assert_eq!(f.read_string("/e/x").unwrap(), "X");
         assert!(f.exists("/e") && !f.exists("/d"));
     }
 
@@ -589,6 +660,6 @@ mod tests {
         assert_eq!(f.rename("/d", "/full").unwrap_err(), "directory not empty: /full");
         // rename onto itself is a no-op success
         f.rename("/f", "/f").unwrap();
-        assert_eq!(f.read("/f").unwrap(), "1");
+        assert_eq!(f.read_string("/f").unwrap(), "1");
     }
 }
