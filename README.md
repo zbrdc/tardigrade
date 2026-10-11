@@ -415,9 +415,11 @@ fs, net and stdin namespaces, console, the timers, queueMicrotask,
 TextEncoder/TextDecoder, atob/btoa, structuredClone and performance - so
 a project type-checks against v8vm instead of picking up DOM or Node
 types: it assumes "lib": ["esnext"] (which the loop's generated tsconfig
-sets), because v8vm is not a DOM environment. A cli test keeps it honest
-in both directions: every vm.* member it names exists in a live guest,
-and every runtime member is named.
+sets), because v8vm is not a DOM environment - the same file declares the
+WebAssembly surface (Module, Instance, Memory, compile, instantiate,
+validate) that lib esnext lacks. It is compared with the runtime by
+tests/cli.rs (vm_dts_members_match_the_runtime): every vm.* member it
+names exists in a live guest, and every runtime member is named.
 
 ## OS self-sandbox (--sandbox)
 

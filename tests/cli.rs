@@ -2919,8 +2919,10 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
 
 /// Members named by examples/vm.d.ts: (scope, name) with scope "vm",
 /// "vm.fs", .... A namespace line records the name and opens a scope, a
-/// lone "}" closes it, and function/const lines name their scope's
-/// members. Doc comments never match those shapes.
+/// lone "}" closes it, and every declaration shape the file may use -
+/// function, const, let, var, class, interface, type - names its scope's
+/// members, so a member smuggled in under any of them is still compared
+/// with the runtime. Doc comments never match those shapes.
 fn vm_dts_members(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack: Vec<String> = Vec::new();
@@ -2931,6 +2933,16 @@ fn vm_dts_members(text: &str) -> Vec<(String, String)> {
         } else if let Some(rest) = line.strip_prefix("function ") {
             (false, rest)
         } else if let Some(rest) = line.strip_prefix("const ") {
+            (false, rest)
+        } else if let Some(rest) = line.strip_prefix("let ") {
+            (false, rest)
+        } else if let Some(rest) = line.strip_prefix("var ") {
+            (false, rest)
+        } else if let Some(rest) = line.strip_prefix("class ") {
+            (false, rest)
+        } else if let Some(rest) = line.strip_prefix("interface ") {
+            (false, rest)
+        } else if let Some(rest) = line.strip_prefix("type ") {
             (false, rest)
         } else if line == "}" {
             stack.pop();
@@ -2975,9 +2987,12 @@ for (const [name, obj] of groups) {
     }
     let dts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/vm.d.ts"))
         .expect("read examples/vm.d.ts");
+    // Only the vm tree is compared: the runtime side enumerates vm, vm.fs,
+    // vm.net and vm.stdin, while the file also declares globals (console,
+    // WebAssembly, ...) that live outside it.
     let declared: Vec<(String, String)> = vm_dts_members(&dts)
         .into_iter()
-        .filter(|(scope, _)| !scope.is_empty())
+        .filter(|(scope, _)| scope == "vm" || scope.starts_with("vm."))
         .collect();
     assert!(!declared.is_empty(), "vm.d.ts parsed to nothing");
 
@@ -3236,4 +3251,66 @@ fn agent_loop_ts_with_the_tsc_fallback_passes() {
         "the fallback that ran must be named, stdout: {stdout}"
     );
     assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
+}
+
+/// vm.d.ts pins signatures, not just member names: misusing the guest API
+/// fails a real type-check (encodeInto takes a Uint8Array - the runtime
+/// throws for other views - and a net handler is (payload, from) => void),
+/// while the WebAssembly declarations type-check real use under lib esnext.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn vm_dts_rejects_api_misuse() {
+    let test = "vm_dts_rejects_api_misuse";
+    if !checker_runnable("npx -y tsc-rs@0.3.0", "tsc") {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but no usable type checker");
+        ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vm-dts-misuse");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir misuse scratch");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/vm.d.ts"),
+        root.join("vm.d.ts"),
+    )
+    .expect("copy vm.d.ts");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "lib": ["esnext"] }, "include": ["**/*.ts"] }"#,
+    )
+    .expect("write tsconfig");
+    std::fs::write(
+        root.join("good.ts"),
+        "const bytes = new TextEncoder().encode(\"{}\");\n\
+         const mod = new WebAssembly.Module(bytes);\n\
+         const valid: boolean = WebAssembly.validate(bytes);\n\
+         const mem = new WebAssembly.Memory({ initial: 1 });\n\
+         const grown: number = mem.grow(1);\n\
+         const buf: ArrayBuffer = mem.buffer;\n\
+         console.log(valid, grown, buf.byteLength, mod instanceof WebAssembly.Module);\n",
+    )
+    .expect("write good fixture");
+    std::fs::write(
+        root.join("bad.ts"),
+        "const enc = new TextEncoder();\n\
+         enc.encodeInto(\"ab\", new DataView(new ArrayBuffer(8)));\n\
+         vm.net.listen(1, (p: number) => p);\n",
+    )
+    .expect("write bad fixture");
+
+    let mut cmd = Command::new("npx");
+    cmd.args(["-y", "tsc-rs@0.3.0", "-p", "."]).current_dir(&root);
+    let out = output_within(cmd, 180);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "misuse must fail: {text}");
+    assert!(text.contains("bad.ts"), "errors must point at bad.ts: {text}");
+    assert!(
+        text.contains("error TS2345") && text.matches("error TS").count() >= 2,
+        "encodeInto and listen misuse must both be type errors: {text}"
+    );
+    assert!(!text.contains("good.ts"), "the WebAssembly typing must hold: {text}");
 }

@@ -1,9 +1,12 @@
-// Type definitions for the v8vm guest API, kept in sync with the Guest API
-// table of README.md by tests/cli.rs (vm_dts_members_match_the_runtime).
+// Type definitions for the v8vm guest API, compared with the runtime by
+// tests/cli.rs (vm_dts_members_match_the_runtime): every vm.* member
+// named here exists in a live guest, and every runtime member is named.
 //
 // v8vm guests are not DOM environments: the tsconfig should not pull in
 // lib.dom (the tsconfig that examples/agent-loop-ts.sh generates sets
-// "lib": ["esnext"]), or TextEncoder and friends would be declared twice.
+// "lib": ["esnext"]), or TextEncoder, WebAssembly and friends would be
+// declared twice - under lib esnext they are otherwise absent, so this
+// file declares the WebAssembly surface v8vm promises.
 
 declare namespace vm {
   /** The V8 engine version string. */
@@ -114,7 +117,7 @@ declare class TextEncoder {
   encode(input?: string): Uint8Array;
   encodeInto(
     source: string,
-    destination: ArrayBufferView,
+    destination: Uint8Array,
   ): { read: number; written: number };
 }
 
@@ -141,3 +144,30 @@ declare function structuredClone<T>(value: T): T;
 /** Monotonic milliseconds since the run started (virtual under
  *  --clock=virtual). */
 declare const performance: { now(): number };
+
+declare namespace WebAssembly {
+  class Module {
+    constructor(bytes: ArrayBuffer | ArrayBufferView);
+    static exports(module: Module): { name: string; kind: string }[];
+    static imports(module: Module): { module: string; name: string; kind: string }[];
+  }
+  class Instance {
+    constructor(module: Module, imports?: Record<string, unknown>);
+    readonly exports: any;
+  }
+  class Memory {
+    constructor(descriptor: { initial: number; maximum?: number; shared?: boolean });
+    readonly buffer: ArrayBuffer;
+    grow(delta: number): number;
+  }
+  function compile(bytes: ArrayBuffer | ArrayBufferView): Promise<Module>;
+  function instantiate(
+    bytes: ArrayBuffer | ArrayBufferView,
+    imports?: Record<string, unknown>,
+  ): Promise<{ module: Module; instance: Instance }>;
+  function instantiate(
+    module: Module,
+    imports?: Record<string, unknown>,
+  ): Promise<Instance>;
+  function validate(bytes: ArrayBuffer | ArrayBufferView): boolean;
+}
