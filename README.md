@@ -395,15 +395,24 @@ bun (required) or every checker (npx for tsc-rs, or tsc) is missing -
 never a silent pass - and V8VM_REQUIRE_TS=1 makes a missing toolchain
 fail.
 
+The loop honors three overrides: BUN selects the bun executable (also
+found via PATH or ~/.bun/bin/bun), and V8VM_TSC_RS / V8VM_TSC replace the
+two checker commands (each may be several words, for example a pinned
+standalone build or a specific tsc); examples/ts-smoke.sh reads the same
+variables.
+
 Limits: type-checking and bundling are host-side loop steps, and vm.run
 of a .ts file would evaluate raw TypeScript as JavaScript. The compiler
 can also run inside the guest itself, though: examples/ts-in-guest loads a
 WebAssembly build of ts-rust (its crates/ts_wasm, built for
 wasm32-wasip1) from vm.fs, bridges the compiler's eight host-fs
 operations onto vm.fs and answers its WASI imports from a ~60-line shim,
-so the whole compiler runs under v8vm's caps, timeout and --sandbox:
-~187 MB peak process RSS, ~0.6 s for a two-file project, working at
---memory=16 (WebAssembly memory sits outside the JS heap cap). The 5.9 MB
+so the whole compiler runs under v8vm's timeout and --sandbox (~0.6 s
+for a two-file project). --memory does not cap it: the wasm linear memory
+is outside the JS heap cap (like every WebAssembly.Memory in v8vm), and a
+one-file project peaks near 207 MB of process RSS. Its emit is one file
+per module with import/export kept, so vm.run of it throws SyntaxError -
+a bundler is still needed to run a multi-file project's emit. The 5.9 MB
 wasm artifact is not committed; examples/ts-in-guest/README.md has the
 pinned commit, the build recipe and the artifact's SHA-256, and the test
 covering it skips loudly until TSC_RUST_WASM points at a build. In-guest

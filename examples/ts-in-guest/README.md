@@ -2,9 +2,10 @@
 
 `tsc-guest.js` runs the ts-rust compiler — a Rust port of the TypeScript 7
 compiler — as a WebAssembly module **inside a v8vm guest**: the compiler
-itself lives under v8vm's `--memory`, `--timeout` and `--sandbox`, reads the
-project from `vm.fs`, and writes its emit back into `vm.fs`. No host-side
-Node, npx or bun is involved in the run.
+itself runs under v8vm's `--timeout` and `--sandbox`, reads the project
+from `vm.fs`, and writes its emit back into `vm.fs`. `--memory` does not
+cap it (the wasm linear memory is outside the JS heap cap; see Measured
+and Caveats). No host-side Node, npx or bun is involved in the run.
 
 This is a spike made real: it works, with the caveats at the end.
 
@@ -57,22 +58,30 @@ code, text) instead of text on fd 1.
 
 - module: 5.9 MB in `vm.fs` (7.5 MB as base64 in the preload snapshot);
   fits the default `--fs-quota=64` easily
-- guest peak RSS: ~187 MB total process — about 30 MB over v8vm's fixed
-  overhead, independent of `--memory`; runs fine at `--memory=16` because
-  the wasm linear memory sits outside the JS heap cap (like all
-  WebAssembly.Memory in v8vm)
+- guest peak RSS: ~207 MB total process for a one-file project (the plain
+  v8vm overhead is ~150-194 MB). `--memory` does NOT cap this: the wasm
+  linear memory sits outside the JS heap cap (like every
+  WebAssembly.Memory in v8vm), so a big compile can far exceed it; the JS
+  heap side is small, and the run also works at `--memory=16`
 - compile+instantiate: ~10 ms; checking a 2-file project: ~0.6 s
 - works unchanged under `--sandbox` (the shim is pure JS; no extra
   syscalls) and under `--clock=virtual`
 
 ## Caveats
 
+- The compiler runs under v8vm's timeout and `--sandbox`, but not under a
+  memory cap: `--memory` governs the JS heap and ArrayBuffers, and the
+  wasm linear memory grows outside it (see Measured). Budget host RAM
+  accordingly for untrusted projects.
+- In-guest emit is one file per module, keeping its `import`/`export`
+  statements. v8vm has no ES modules, so `vm.run` of an emitted file that
+  has them throws SyntaxError; a bundler is still needed to run a
+  multi-file project's emit. (A file without imports/exports emits as a
+  plain script and does run.)
 - ts-rust is an experimental port that moves fast; the ABI above is its
   crate contract, not a stable interface. Pin the commit and re-verify.
 - The `ts_host` bridge makes the compiler's whole file system the guest's
   `vm.fs`: a project can read (and, with emit, write) anything in the RAM
   filesystem, not only `/app`.
-- Seeding projects through argv (run.sh) caps one source file at the
-  kernel's ~128 KiB per-argument limit.
 - No watch mode, no `-b` build mode (the module exits with an error for
   `--build` with JSON diagnostics).

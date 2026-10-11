@@ -2872,7 +2872,7 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
     .expect("write bad tsconfig");
     std::fs::write(
         good.join("app.ts"),
-        "import { sum } from \"./lib/sum\";\nconsole.log(sum([\"a\", \"b\"]));\n",
+        "import { sum } from \"./lib/sum\";\nimport { two } from \"./lib/we\\\"ird\";\nconsole.log(sum([\"a\", \"b\"]) + two);\n",
     )
     .expect("write good app");
     std::fs::write(
@@ -2880,6 +2880,14 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
         "export const sum = (xs: string[]): string => xs.join(\"\");\n",
     )
     .expect("write good lib");
+    // A quote in a file name must travel as data: run.sh embeds every
+    // project file as a base64 snapshot entry and never splices a path
+    // into program text.
+    std::fs::write(
+        good.join("lib/we\"ird.ts"),
+        "export const two = 2;\n",
+    )
+    .expect("write oddly named lib");
     std::fs::write(
         good.join("tsconfig.json"),
         r#"{ "compilerOptions": { "strict": true, "outDir": "out" }, "include": ["app.ts", "lib"] }"#,
@@ -2913,6 +2921,10 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
     assert!(
         dump.contains("/app/out/lib/sum.js") && dump.contains("export const sum = (xs)"),
         "the transpiled lib must be in the dump: {dump}"
+    );
+    assert!(
+        dump.contains("/app/out/lib/we\\\"ird.js") && dump.contains("export const two = 2;"),
+        "the oddly named module must emit too: {dump}"
     );
     assert!(!root.join("good-ws.json.pre").exists(), "no stale .pre snapshot");
 }
