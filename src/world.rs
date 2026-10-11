@@ -41,6 +41,9 @@ pub(crate) struct World {
     /// This run's subscription to the process-wide stdin hub, created on the
     /// first vm.stdin.read() and dropped (released) when the run ends.
     pub(crate) stdin_sub: Option<StdinSub>,
+    /// Math.random counter for seeded runs (Config.seed); None leaves
+    /// V8's own Math.random in place.
+    pub(crate) random_state: Option<u64>,
     // ids cleared via clear_timer while their callback was on the stack
     pub(crate) cleared: Vec<u64>,
     exit_code: AtomicI32,
@@ -60,6 +63,7 @@ impl World {
             stdin_waiters: Vec::new(),
             stdin_eof: false,
             stdin_sub: None,
+            random_state: None,
             cleared: Vec::new(),
             exit_code: AtomicI32::new(-1),
             unhandled_rejection: None,

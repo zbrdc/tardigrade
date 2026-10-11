@@ -1,12 +1,18 @@
-//! The byte level of TextEncoder and TextDecoder: the JS classes live in
-//! prelude.js and add only per-instance streaming state. Everything
-//! byte-shaped is a small pure function here so it can be unit-tested
-//! without V8.
+//! Guest-facing web-platform APIs: atob/btoa, the byte level of
+//! TextEncoder and TextDecoder (the JS classes live in prelude.js and add
+//! only per-instance streaming state), structuredClone over V8's own
+//! ValueSerializer, performance.now on the real clock, and the seed-driven
+//! Math.random. Everything byte-shaped is a small pure function here so it
+//! can be unit-tested without V8.
 
 use std::cell::Cell;
+use std::sync::LazyLock;
+use std::time::Instant;
 
 use crate::diag::throw;
 use crate::guest_cb;
+use crate::world::world_mut;
+use crate::Config;
 
 // ---- v8 object helpers (same shapes as api.rs) ----
 
@@ -292,6 +298,7 @@ guest_cb!(encode_into_utf8, |args, rv, scope| {
     }
     throw_type(scope, "encodeInto destination must be a Uint8Array");
 });
+
 // ---- TextDecoder byte level ----
 
 /// The per-call decode options; carried as one group because they all
@@ -460,6 +467,7 @@ guest_cb!(decode_utf8, |args, rv, scope| {
         Err(()) => throw_type(scope, "The encoded data is not valid."),
     }
 });
+
 // ---- structuredClone ----
 
 /// Serializer delegate: V8 refuses functions, symbols and other
@@ -552,23 +560,104 @@ guest_cb!(structured_clone, |args, rv, scope| {
     }
 });
 
+// ---- performance.now ----
+
+/// performance.now()'s zero point: process start, so values are monotonic
+/// (Instant) and comparable across runs in one process.
+static PERFORMANCE_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+guest_cb!(performance_now, |_args, rv, scope| {
+    let ms = PERFORMANCE_ORIGIN.elapsed().as_secs_f64() * 1000.0;
+    rv.set(v8::Number::new(scope, ms).into());
+});
+
+// ---- seeded Math.random ----
+
+/// The splitmix64 increment: the golden-ratio constant that keeps
+/// successive counter values well spread.
+const GOLDEN_GAMMA: u64 = 0x9e3779b97f4a7c15;
+
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+/// One Math.random() draw for a seeded run: advance the counter, mix it,
+/// and scale the top 53 bits to a uniform value in [0, 1). Returns the
+/// next counter state with the draw so callers keep the state explicitly.
+pub(crate) fn random_draw(state: u64) -> (u64, f64) {
+    let next = state.wrapping_add(GOLDEN_GAMMA);
+    let draw = (mix64(next) >> 11) as f64 * (1.0 / (1u64 << 53) as f64);
+    (next, draw)
+}
+
+guest_cb!(math_random_seeded, |_args, rv, scope| {
+    // Registered only for seeded runs (install below); the guard keeps
+    // this callback non-panicking if that pairing ever breaks.
+    if let Some(state) = world_mut(scope).random_state.as_mut() {
+        let (next, draw) = random_draw(*state);
+        *state = next;
+        rv.set(v8::Number::new(scope, draw).into());
+    }
+});
+
 // ---- installation ----
 
-pub(crate) fn install(scope: &mut v8::HandleScope) {
+pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
     let global = scope.get_current_context().global(scope);
+
     put_fn(global, scope, "atob", atob);
-    put_fn(global, scope, "structuredClone", structured_clone);
     put_fn(global, scope, "btoa", btoa);
+    put_fn(global, scope, "structuredClone", structured_clone);
     // Helper callbacks the prelude's TextEncoder/TextDecoder classes bind
     // and then remove from the global object.
     put_fn(global, scope, "__encodeUtf8", encode_utf8);
     put_fn(global, scope, "__encodeIntoUtf8", encode_into_utf8);
     put_fn(global, scope, "__decodeUtf8", decode_utf8);
+
+    let performance = v8::Object::new(scope);
+    put_fn(performance, scope, "now", performance_now);
+    set_prop(global, scope, "performance", performance.into());
+
+    // Without a seed Math.random stays V8's own; with one, runs become
+    // reproducible (per-run state lives in the World).
+    if cfg.seed.is_some() {
+        let math_key = v8_str(scope, "Math");
+        if let Some(math) = global
+            .get(scope, math_key.into())
+            .and_then(|v| v8::Local::<v8::Object>::try_from(v).ok())
+        {
+            put_fn(math, scope, "random", math_random_seeded);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_round_trips_and_forgives_padding_shapes() {
+        for bytes in [&b""[..], &[0u8], &[0, 1], &[0, 1, 2], &[255, 254, 253, 0, 200]] {
+            let decoded = b64_decode_forgiving(&b64_encode(bytes)).unwrap();
+            assert_eq!(decoded, bytes);
+        }
+        // Whitespace is ignored, "one =" and "==" both work, QR== is Q with
+        // unchecked trailing bits, exactly like atob in browsers.
+        assert_eq!(b64_decode_forgiving(" Q U\n==").unwrap(), b"A");
+        assert_eq!(b64_decode_forgiving("QR==").unwrap(), b"A");
+        assert_eq!(b64_decode_forgiving("QUJD").unwrap(), b"ABC");
+    }
+
+    #[test]
+    fn base64_rejects_malformed_input() {
+        for bad in ["a", "====", "A===", "Q==", "AB=C", "A!BC"] {
+            assert!(b64_decode_forgiving(bad).is_err(), "{:?} decoded", bad);
+        }
+        // "=" may also close a full quad's final chunk, per the algorithm.
+        assert_eq!(b64_decode_forgiving("ABC=").unwrap(), [0x00, 0x10]);
+    }
 
     #[test]
     fn encode_into_counts_units_and_stops_whole() {
@@ -661,25 +750,31 @@ mod tests {
         let keep = opts(false, true, true, true);
         assert_eq!(decode_step(b"", &[0xef, 0xbb, 0xbf, b'a'], &keep).unwrap().text, "\u{feff}a");
     }
-    #[test]
-    fn base64_round_trips_and_forgives_padding_shapes() {
-        for bytes in [&b""[..], &[0u8], &[0, 1], &[0, 1, 2], &[255, 254, 253, 0, 200]] {
-            let decoded = b64_decode_forgiving(&b64_encode(bytes)).unwrap();
-            assert_eq!(decoded, bytes);
-        }
-        // Whitespace is ignored, "one =" and "==" both work, QR== is Q with
-        // unchecked trailing bits, exactly like atob in browsers.
-        assert_eq!(b64_decode_forgiving(" Q U\n==").unwrap(), b"A");
-        assert_eq!(b64_decode_forgiving("QR==").unwrap(), b"A");
-        assert_eq!(b64_decode_forgiving("QUJD").unwrap(), b"ABC");
-    }
 
     #[test]
-    fn base64_rejects_malformed_input() {
-        for bad in ["a", "====", "A===", "Q==", "AB=C", "A!BC"] {
-            assert!(b64_decode_forgiving(bad).is_err(), "{:?} decoded", bad);
+    fn splitmix64_draws_are_reproducible_and_uniform_shaped() {
+        // Pinned against canonical splitmix64 (independently computed):
+        // any change to the mixer, the increment or the scaling breaks this.
+        let pinned: Vec<f64> = (0..4).scan(42u64, |s, _| {
+            let (next, d) = random_draw(*s);
+            *s = next;
+            Some(d)
+        })
+        .collect();
+        assert_eq!(
+            pinned,
+            vec![0.7415648787718233, 0.1599103928769201, 0.27860113025513866, 0.34419071652363753]
+        );
+        // Different seeds differ immediately.
+        let (_, a) = random_draw(7);
+        let (_, b) = random_draw(8);
+        assert_ne!(a, b);
+        // Range and integer-bit sanity over a stretch of draws.
+        let mut s = 1u64;
+        for _ in 0..10_000 {
+            let (next, d) = random_draw(s);
+            assert!((0.0..1.0).contains(&d));
+            s = next;
         }
-        // "=" may also close a full quad's final chunk, per the algorithm.
-        assert_eq!(b64_decode_forgiving("ABC=").unwrap(), [0x00, 0x10]);
     }
 }

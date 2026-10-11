@@ -335,3 +335,59 @@ fn structured_clone_refuses_functions_symbols_and_transfer() {
         "DataCloneError true false\nDataCloneError true false\nDataCloneError true false\nDataCloneError true false\ntransfer: DataCloneError\nundefined\n1\n",
     );
 }
+
+// ---- performance.now ----
+
+#[test]
+fn performance_now_is_monotonic() {
+    ok(
+        "perf-now",
+        r#"
+        const a = performance.now();
+        let s = 0;
+        for (let i = 0; i < 5e7; i++) s += i;
+        const b = performance.now();
+        const c = performance.now();
+        console.log(typeof a, a >= 0, b > a, c >= b, s > 0);
+        "#,
+        "number true true true true\n",
+    );
+}
+
+// ---- --seed ----
+
+const DRAW_SEQ: &str =
+    "console.log([0,0,0,0,0].map(() => Math.random().toFixed(17)).join(\"\\n\"));";
+
+#[test]
+fn same_seed_prints_identical_sequences_in_two_processes() {
+    let path = script("seed-seq", DRAW_SEQ);
+    let a = v8vm(&["--seed=1234567890", path.to_str().unwrap()], b"");
+    let b = v8vm(&["--seed=1234567890", path.to_str().unwrap()], b"");
+    let c = v8vm(&["--seed=987654321", path.to_str().unwrap()], b"");
+    assert_eq!(a.code, 0, "stderr: {}", a.stderr);
+    assert_eq!(b.code, 0, "stderr: {}", b.stderr);
+    assert_eq!(c.code, 0, "stderr: {}", c.stderr);
+    assert_eq!(a.stdout.lines().count(), 5, "five draws: {}", a.stdout);
+    assert_eq!(a.stdout, b.stdout, "same seed must reproduce");
+    assert_ne!(a.stdout, c.stdout, "different seeds must differ");
+    // All draws are in [0, 1).
+    for line in a.stdout.lines() {
+        let v: f64 = line.parse().expect("draw is a number");
+        assert!((0.0..1.0).contains(&v), "draw out of range: {}", v);
+    }
+}
+
+#[test]
+fn seed_zero_is_a_seed_and_bad_seeds_are_usage_errors() {
+    let path = script("seed-zero", DRAW_SEQ);
+    let a = v8vm(&["--seed=0", path.to_str().unwrap()], b"");
+    let b = v8vm(&["--seed=0", path.to_str().unwrap()], b"");
+    let unseeded = v8vm(&[path.to_str().unwrap()], b"");
+    assert_eq!(a.code, 0, "stderr: {}", a.stderr);
+    assert_eq!(a.stdout, b.stdout);
+    assert_eq!(unseeded.code, 0, "unseeded runs keep V8's Math.random");
+    let bad = v8vm(&["--seed=oops", path.to_str().unwrap()], b"");
+    assert_eq!(bad.code, 2);
+    assert!(bad.stderr.contains("bad --seed"), "stderr: {}", bad.stderr);
+}

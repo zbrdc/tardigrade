@@ -70,6 +70,10 @@ pub struct Config {
     /// RAM filesystem quota in bytes: per entry, content plus path bytes
     /// plus 64 of bookkeeping. 0 disables it. Default 64 MiB.
     pub fs_quota_bytes: u64,
+    /// Deterministic Math.random seed for agent loops: two runs with the
+    /// same seed draw identical sequences, different seeds differ. None
+    /// (the default) keeps V8's own Math.random.
+    pub seed: Option<u64>,
 }
 
 impl Default for Config {
@@ -83,6 +87,7 @@ impl Default for Config {
             stdin_consumed: false,
             preload_data: None,
             fs_quota_bytes: DEFAULT_FS_QUOTA_BYTES,
+            seed: None,
         }
     }
 }
@@ -303,6 +308,9 @@ fn execute(
     let mut world = World::new(cfg.fs_quota_bytes);
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
+    // Seeded runs keep the PRNG counter in the World, so concurrent runs
+    // with different seeds stay independent.
+    world.random_state = cfg.seed;
 
     // Heap cap; past it V8 aborts with its own out-of-memory report.
     let params = v8::CreateParams::default().heap_limits(64 << 20, cfg.heap_mb << 20);

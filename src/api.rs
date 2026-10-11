@@ -97,5 +97,5 @@ pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
     put_fn(global, scope, "clearTimeout", clear_timer);
     put_fn(global, scope, "clearInterval", clear_timer);
 
-    webapi::install(scope);
+    webapi::install(scope, cfg);
 }

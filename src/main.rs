@@ -13,6 +13,7 @@ struct Cli {
     serve: bool,
     sandbox: bool,
     fs_quota_bytes: u64,
+    seed: Option<u64>,
 }
 
 fn parse(argv: &[String]) -> Result<Cli, String> {
@@ -27,6 +28,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         serve: false,
         sandbox: false,
         fs_quota_bytes: v8vm::DEFAULT_FS_QUOTA_BYTES,
+        seed: None,
     };
     for a in argv {
         if a == "--" {
@@ -48,6 +50,8 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
                 .ok_or_else(|| format!("bad --fs-quota: {}", v))?;
         } else if a == "--serve" {
             c.serve = true;
+        } else if let Some(v) = a.strip_prefix("--seed=") {
+            c.seed = Some(v.parse().map_err(|_| format!("bad --seed: {}", v))?);
         } else if a == "--sandbox" {
             c.sandbox = true;
         } else if a == "--sandbox-check" {
@@ -67,7 +71,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve {
         return Err(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
+            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
                 .to_string(),
         );
     }
@@ -116,6 +120,7 @@ fn main() {
         stdin_consumed,
         preload_data,
         fs_quota_bytes: c.fs_quota_bytes,
+        seed: c.seed,
     };
 
     let code = if c.serve {

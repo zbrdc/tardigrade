@@ -39,13 +39,17 @@ and is not set by this repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
+    v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
     v8vm --sandbox-check
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
 - "--memory=<mb>" V8 heap cap in MB (default 256)
 - "--fs-quota=<mb>" RAM filesystem quota in MB (default 64, 0 disables)
+- "--seed=<u64>" deterministic Math.random: two runs with the same seed
+  draw identical sequences, different seeds differ. Without it Math.random
+  is V8's own (seeded from the OS). The seed overrides Math.random for that
+  run only, so several runs in one process each keep their own sequence
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write the snapshot to a file when the run ends: normal
   exit, vm.exit (also from a timer, microtask or stdin read), uncaught
@@ -109,7 +113,7 @@ the same size check and `vm.restore` as a file, so legacy and version 2
 snapshots behave identically. After `apply` the dump is rewritten in place
 instead of through a temp file, which Landlock forbids; nothing needs
 configuring for that. Embedders that build a `Config` with a struct
-literal must set the newer fields (`preload_data`, `fs_quota_bytes`), or
+literal must set the newer fields (`preload_data`, `fs_quota_bytes`, `seed`), or
 use `..Default::default()`.
 
 The restrictions apply to the whole embedding process, not only to v8vm's
@@ -140,6 +144,30 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | vm.net.send(fromPort, toPort, payload) | queue a message; throws if no listener |
 | vm.net.close(port) | stop listening |
 | vm.stdin.read() | Promise of the next stdin chunk; "" at EOF |
+| TextEncoder() | encode / encodeInto, UTF-8 only. Unpaired surrogates
+ encode as U+FFFD (EF BF BD); encodeInto fills a Uint8Array (its window,
+ not the whole buffer), returns {read, written} and never writes a partial
+ code point; a detached destination has zero capacity |
+| TextDecoder([label][, {fatal, ignoreBOM}]) | decode, UTF-8 only (utf-8/
+ utf8/unicode-1-1-utf-8 labels; anything else throws RangeError). Invalid
+ bytes become U+FFFD, one per maximal ill-formed subsequence; fatal makes
+ them a TypeError; a leading U+FEFF BOM is stripped unless ignoreBOM, also
+ when it arrives split across stream:true chunks; {stream: true} carries
+ an incomplete trailing sequence (or a possible BOM prefix) to the next
+ call; a throwing decode leaves the state as it was before the call |
+| atob / btoa | Latin-1 base64 per spec: btoa accepts code units 0..0xFF
+ only, atob decodes forgiving-base64 (ASCII whitespace ignored, padding
+ only at the end); both throw Errors named InvalidCharacterError |
+| structuredClone(value[, options]) | V8's own structured clone (Map, Set,
+ Date, RegExp, typed arrays, cycles, shared references inside the clone).
+ Functions, symbols and WebAssembly.Module throw DataCloneError; there is
+ no transfer list ({transfer: [...]} throws DataCloneError),
+ SharedArrayBuffer is not cloneable here, and symbol-keyed properties are
+ dropped, as the spec's clone algorithm dictates |
+| performance.now() | milliseconds since process start on the real clock
+ (a monotonic Instant); values are comparable across runs in one process |
+| Math.random under --seed | splitmix64 draws, 53 bits scaled to [0, 1),
+ per run (see --seed above) |
 
 WebAssembly, Intl/ICU, and all of ES2023 are available.
 

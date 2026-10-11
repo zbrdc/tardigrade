@@ -1273,6 +1273,29 @@ mod sandbox_run {
         assert_eq!(r.code, 0, "stderr: {}", r.stderr);
         assert_eq!(r.stdout, "2\n5\n");
     }
+
+    /// The web-platform globals work under the sandbox layers too (the
+    /// V8VM_REQUIRE_SANDBOX gate runs this test for real).
+    #[test]
+    fn sandbox_webapi_globals_work() {
+        let test = "sandbox_webapi_globals_work";
+        let path = script(
+            "sb-webapi",
+            r#"
+            const e = new TextEncoder();
+            const d = new TextDecoder();
+            console.log(d.decode(e.encode("h\u00e9")), atob(btoa("ok")));
+            console.log(structuredClone({ a: [1, 2] }).a.join("+"));
+            console.log(typeof performance.now(), performance.now() >= 0);
+            let n = 0;
+            for (let i = 0; i < 3; i++) n = Math.random();
+            console.log(n >= 0 && n < 1);
+            "#,
+        );
+        let Some(r) = sandboxed(test, &[path.to_str().unwrap()], b"") else { return; };
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert_eq!(r.stdout, "h\u{e9} ok\n1+2\nnumber true\ntrue\n");
+    }
 }
 
 /// Where the layers cannot be built, `--sandbox` must still be a clear
