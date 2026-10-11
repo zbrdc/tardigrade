@@ -1,7 +1,10 @@
 //! performance.now and the seeded Math.random. performance.now reports
-//! monotonic milliseconds (std Instant) since the run started - the
-//! origin is created with the run's World, so each run's timeline
-//! starts near zero and stays comparable within the run.
+//! milliseconds elapsed since the run started: real runs measure a
+//! monotonic std Instant whose origin is the start of the run, so each
+//! run's timeline starts near zero; virtual runs (--clock=virtual)
+//! report the virtual timeline, which starts at exactly 0 and moves
+//! only when the event loop jumps it to the next due timer (the run's
+//! clock, read through the World).
 
 use crate::guest_cb;
 use crate::world::world_mut;
@@ -26,7 +29,7 @@ pub(crate) fn random_draw(state: u64) -> (u64, f64) {
 }
 
 guest_cb!(performance_now, |_args, rv, scope| {
-    let ms = world_mut(scope).perf_origin.elapsed().as_secs_f64() * 1000.0;
+    let ms = world_mut(scope).clock.perf_ms();
     rv.set(v8::Number::new(scope, ms).into());
 });
 

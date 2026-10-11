@@ -39,7 +39,7 @@ and is not set by this repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
+    v8vm [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
     v8vm --sandbox-check
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
@@ -58,6 +58,65 @@ and is not set by this repo.
   draw identical sequences, different seeds differ, and concurrent seeded
   runs each keep their own sequence. Without it Math.random is V8's own
   (seeded from the OS)
+- "--clock=virtual" virtual time for deterministic runs: Date.now(),
+  new Date() with no argument, Date() called as a function and
+  performance.now() read a virtual clock instead of the host clock, and
+  it advances only when timers fire - when the event loop has no
+  runnable work it jumps the clock straight to the next due timer
+  instead of sleeping, so a run whose guest waits on nothing but timers
+  finishes instantly regardless of the delays it schedules. The virtual
+  clock starts at 0 for performance.now() and at --epoch (default 0) for
+  the Date timeline. Date forms with an explicit argument (new
+  Date(ms), new Date(y, m, ...)) are passed through untouched, so they
+  stay exact. In virtual mode the prelude rebuilds Date over the
+  virtual clock (the host installs one hidden time callback, the prelude
+  captures and removes it, and the original Date constructor stays
+  reachable only from that prelude closure), so no Date read - Date.now,
+  the no-argument constructor, the function-call string form, or Date
+  prototype methods on a no-argument date - can observe the host clock.
+  Nor can any object-graph path reach a host-clock-bound constructor:
+  the rebuilt Date's [[Prototype]] is Function.prototype (not the
+  original Date), its statics are own copies (parse, UTC - neither reads
+  a clock), and every intrinsic it uses at call time is captured with
+  it, so replaced globals (Reflect.construct, Function.prototype
+  methods, ...) neither change what runs nor trap the original
+  constructor, and guest-installed index accessors on
+  Array.prototype/Object.prototype are never run (the constructor's
+  arguments go to Reflect.construct as the strict arguments object,
+  whose indices are own data properties). The rebuilt constructor is
+  shaped like the platform's: own length, name, prototype, now, parse,
+  UTC - all non-enumerable - with a non-writable prototype property and
+  a non-constructable, correctly named now. Two things remain
+  detectable, though neither reads a clock: Function.prototype.toString
+  of Date and Date.now shows the prelude wrapper's source instead of
+  native code, and a virtual-mode construction carries one extra stack
+  frame (the wrapper in prelude.js) inside `new Date`.
+  --seed plus --clock=virtual makes a guest that touches nothing real
+  byte-for-byte reproducible across runs.
+- Wall-clock rules are unchanged under "--clock=virtual": --timeout
+  measures real time and still kills a busy-looping guest with 124, and
+  an endless timer schedule (a never-cleared setInterval) runs at full
+  CPU until --timeout, because the clock jumps instantly. A
+  self-sustaining net ping-pong is the same trap with the roles
+  swapped: while runnable net work is pending the loop never jumps, so
+  pending timers starve until --timeout - and between net generations
+  the loop spins without the 50 ms poll pause real time takes, so keep
+  --timeout set for such guests. stdin and net delivery
+  stay real: net messages are delivered on the next loop turn without
+  advancing the clock, and a pending stdin read stays pending while the
+  clock jumps (the read resolves when its data arrives in real time; a
+  run whose other work ends first exits with the read still pending).
+  When only a stdin read is pending - no timers, no net - the loop
+  waits in real time exactly as without the flag. Under --serve the
+  virtual clock is one timeline for the whole session: it persists
+  across commands, and each command's timers settle instantly in the
+  loop turn after it.
+- "--epoch=<ms>" the Date timeline's zero point under --clock=virtual
+  (default 0); a usage error without --clock=virtual, and above the
+  ECMAScript maximum time value (8640000000000000) - the Date timeline
+  clamps there instead of leaving the Date range, while performance.now()
+  keeps counting the raw timeline (a u64 of milliseconds, so it saturates
+  at 18446744073709551615 rather than clamping)
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write the snapshot to a file when the run ends: normal
   exit, vm.exit (also from a timer, microtask or stdin read), uncaught
@@ -129,7 +188,7 @@ snapshots behave identically. After `apply` the dump is rewritten in place
 instead of through a temp file, which Landlock forbids; nothing needs
 configuring for that. Embedders that build a `Config` with a struct
 literal must set the newer fields (`preload_data`, `fs_quota_bytes`, `seed`,
-`command_timeout_ms`), or use `..Default::default()`.
+`command_timeout_ms`, `clock`), or use `..Default::default()`.
 
 The restrictions apply to the whole embedding process, not only to v8vm's
 threads. The filters cover every thread (apply refuses unless the caller is
@@ -143,6 +202,9 @@ The process stays alive while guest work is pending: live timers, queued
 network messages, or stdin readers. Each loop turn delivers one generation of
 network messages, runs due timers, drains microtasks, and polls stdin. Exit
 when nothing is pending: scripts that schedule nothing terminate immediately.
+Under --clock=virtual the same loop never sleeps to wait for a timer: with no
+runnable work it jumps the virtual clock to the next due timer (see the flag
+above).
 
 ## Guest API
 
@@ -163,7 +225,7 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | TextDecoder([label][, options]) | decode, UTF-8 only |
 | atob / btoa | Latin-1 base64 per spec |
 | structuredClone(value[, options]) | V8's own structured clone |
-| performance.now() | monotonic ms since the run started |
+| performance.now() | monotonic ms since the run started (virtual ms under --clock=virtual) |
 | Math.random under --seed | splitmix64 draws, 53 bits in [0, 1), per run |
 
 Details and limits of the web APIs above:
@@ -203,7 +265,9 @@ Details and limits of the web APIs above:
   properties are dropped, as the clone algorithm dictates.
 - performance.now() reports milliseconds on the real clock (a monotonic
   Instant) with the start of the run as its zero point, so values begin
-  near zero in every run and never go backwards within one.
+  near zero in every run and never go backwards within one; under
+  --clock=virtual it is the virtual timeline, which starts at exactly 0
+  and moves only when the event loop jumps the virtual clock.
 - All of these decode/encode paths bound their Rust-side allocations
   (decode reads the input from its backing store in pieces sized to the
   input, atob walks the string's own units and fails on the first
@@ -540,6 +604,11 @@ On other platforms (not Linux x86_64) the sandbox tests compile away, and
     Measured peaks: about 150-194 MB at cap 8, about 194 MB at cap 32,
     about 1.67 GB at cap 256. Budget roughly 150 MB plus up to 6x the
     cap; churn stays lower.
+  - Virtual reservations scale with the cap too: V8 sizes the
+    per-isolate CodeRange from the heap limit (min(512 MB, limit)), so
+    the 3x headroom above the cap adds up to ~260 MB of address space
+    per isolate at the default --memory; RLIMIT_AS embedders must
+    budget for it.
   - Worst case: a native builtin that ignores interrupts can keep
     allocating after the callback fired, up to the raised limit of 3 x
     V8's limit, about 9 x the cap (the raise is `limit_ceiling` in

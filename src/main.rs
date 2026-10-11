@@ -15,6 +15,34 @@ struct Cli {
     sandbox: bool,
     fs_quota_bytes: u64,
     seed: Option<u64>,
+    clock_virtual: bool,
+    epoch_ms: u64,
+    epoch_set: bool,
+}
+
+/// Parses --clock=virtual or --epoch=<ms>; Ok(false) means the argument
+/// is neither and parse's chain continues. The epoch is stored plain and
+/// validated after the whole argv walk, so flag order never matters.
+fn clock_pair(c: &mut Cli, arg: &str) -> Result<bool, String> {
+    if let Some(v) = arg.strip_prefix("--clock=") {
+        if v != "virtual" {
+            return Err(format!("bad --clock: {} (only virtual)", v));
+        }
+        c.clock_virtual = true;
+        return Ok(true);
+    }
+    if let Some(v) = arg.strip_prefix("--epoch=") {
+        c.epoch_ms = v.parse().map_err(|_| format!("bad --epoch: {}", v))?;
+        if c.epoch_ms > v8vm::Clock::MAX_EPOCH_MS {
+            return Err(format!(
+                "bad --epoch: {} (above the ES time range)",
+                v
+            ));
+        }
+        c.epoch_set = true;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn parse(argv: &[String]) -> Result<Cli, String> {
@@ -31,9 +59,15 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         sandbox: false,
         fs_quota_bytes: v8vm::DEFAULT_FS_QUOTA_BYTES,
         seed: None,
+        clock_virtual: false,
+        epoch_ms: 0,
+        epoch_set: false,
     };
     for a in argv {
         if a == "--" {
+            continue;
+        }
+        if clock_pair(&mut c, a)? {
             continue;
         }
         if let Some(v) = a.strip_prefix("--timeout=") {
@@ -78,12 +112,15 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve {
         return Err(
-            "usage: v8vm [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
+            "usage: v8vm [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
                 .to_string(),
         );
     }
     if c.serve && c.entry == "-" {
         return Err("--serve needs a file entry; stdin is the command channel".into());
+    }
+    if c.epoch_set && !c.clock_virtual {
+        return Err("--epoch needs --clock=virtual".into());
     }
     Ok(c)
 }
@@ -129,6 +166,11 @@ fn main() {
         fs_quota_bytes: c.fs_quota_bytes,
         seed: c.seed,
         command_timeout_ms: c.command_timeout_ms,
+        clock: if c.clock_virtual {
+            v8vm::Clock::Virtual { epoch_ms: c.epoch_ms }
+        } else {
+            v8vm::Clock::Real
+        },
     };
 
     let code = if c.serve {

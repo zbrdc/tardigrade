@@ -26,7 +26,7 @@
 //! allocator entirely (see README).
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::world::{world_mut, TermReason, Termination};
@@ -135,6 +135,13 @@ fn counting_vtable() -> &'static v8::RustAllocatorVtable<AllocState> {
 pub(crate) struct AllocState {
     live: AtomicUsize,
     cap_bytes: usize,
+    /// Set by the vtable entry points whenever they refused an allocation
+    /// because of the budget (a system OOM is no refusal). Read through
+    /// [AllocState::take_refused] by structuredClone, whose deserialize
+    /// failure must be named DataCloneError only for this refusal - V8's
+    /// own errors there (a stack-overflow RangeError from deeply nested
+    /// values) keep their identity.
+    refused: AtomicBool,
 }
 
 impl AllocState {
@@ -143,7 +150,20 @@ impl AllocState {
         AllocState {
             live: AtomicUsize::new(0),
             cap_bytes,
+            refused: AtomicBool::new(false),
         }
+    }
+
+    /// Reads and clears the refusal mark; callers bracket the operation
+    /// they are attributing refusals to.
+    pub(crate) fn take_refused(&self) -> bool {
+        self.refused.swap(false, Ordering::SeqCst)
+    }
+
+    /// Forgets earlier refusals, so only refusals from the operation about
+    /// to run are attributed to it.
+    pub(crate) fn clear_refused(&self) {
+        self.refused.store(false, Ordering::SeqCst)
     }
 
     /// True when `extra` more backing-store bytes fit under the budget.
@@ -153,6 +173,11 @@ impl AllocState {
             .checked_add(extra)
             .map(|need| need <= self.cap_bytes)
             .unwrap_or(false)
+    }
+
+    /// Refused for budget reasons: record it for the attribution above.
+    fn refuse(&self) {
+        self.refused.store(true, Ordering::SeqCst);
     }
 
     /// Reserves `len` bytes atomically; false (nothing reserved) when they
@@ -224,6 +249,7 @@ fn layout(len: usize) -> std::alloc::Layout {
 /// into V8. The count only moves after a successful allocation.
 unsafe extern "C" fn allocate(st: &AllocState, len: usize) -> *mut c_void {
     if !st.fits(len) {
+        st.refuse();
         return std::ptr::null_mut();
     }
     let ptr = unsafe { std::alloc::alloc_zeroed(layout(len)) };
@@ -235,6 +261,7 @@ unsafe extern "C" fn allocate(st: &AllocState, len: usize) -> *mut c_void {
 
 unsafe extern "C" fn allocate_uninitialized(st: &AllocState, len: usize) -> *mut c_void {
     if !st.fits(len) {
+        st.refuse();
         return std::ptr::null_mut();
     }
     let ptr = unsafe { std::alloc::alloc(layout(len)) };
@@ -270,6 +297,7 @@ unsafe extern "C" fn reallocate(
         return ptr;
     }
     if new_len > old_len && !st.fits(new_len - old_len) {
+        st.refuse();
         return std::ptr::null_mut();
     }
     let ptr = unsafe {

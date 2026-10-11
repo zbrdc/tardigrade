@@ -8,18 +8,25 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::clock::RunClock;
 use crate::fs::RamFs;
 use crate::heap::AllocState;
 use crate::stdin::StdinSub;
 use crate::timers::RunningTimer;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
-/// survives between loop turns.
+/// survives between loop turns. The deadline sits on the run's clock
+/// timeline in its own ticks (nanoseconds under Real, milliseconds
+/// under Virtual), so real and virtual runs share one scheduling path;
+/// `seq` is the registration order, and timers due at the same instant
+/// fire in it (Node and mainline are FIFO, and equal deadlines are
+/// common in virtual mode's whole milliseconds).
 pub(crate) struct Timer {
     pub(crate) id: u64,
+    pub(crate) seq: u64,
     pub(crate) repeat: bool,
     pub(crate) interval_ms: u64,
-    pub(crate) when: Instant,
+    pub(crate) when: u64,
     pub(crate) cb: v8::Global<v8::Function>,
 }
 
@@ -182,6 +189,10 @@ pub(crate) struct World {
     pub(crate) fs: RamFs,
     pub(crate) timers: Vec<Timer>,
     pub(crate) next_timer_id: u64,
+    /// Monotonic registration counter: the FIFO tiebreak for timers that
+    /// share a deadline. Reassigned on reschedule, so a repeating timer
+    /// that collides with a fresh one queues behind it.
+    pub(crate) next_timer_seq: u64,
     pub(crate) net: VecDeque<NetMsg>,
     pub(crate) listeners: BTreeMap<u64, v8::Global<v8::Function>>,
     pub(crate) next_port: u64,
@@ -196,9 +207,10 @@ pub(crate) struct World {
     /// Math.random counter for seeded runs (Config.seed); None leaves
     /// V8's own Math.random in place.
     pub(crate) random_state: Option<u64>,
-    /// Zero point of this run's performance.now(): the moment the run's
-    /// state was created, i.e. the start of the run.
-    pub(crate) perf_origin: std::time::Instant,
+    /// The run's time source: real, or the virtual clock that advances
+    /// only when the event loop jumps it to the next due timer.
+    /// performance.now and the timer deadlines read it.
+    pub(crate) clock: RunClock,
     /// The timer whose callback is on the stack, if any.
     pub(crate) running_timer: RunningTimer,
     exit_code: AtomicI32,
@@ -219,11 +231,12 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(fs_quota_bytes: u64) -> Self {
+    pub(crate) fn new(fs_quota_bytes: u64, clock: RunClock) -> Self {
         World {
             fs: RamFs::new(fs_quota_bytes),
             timers: Vec::new(),
             next_timer_id: 1,
+            next_timer_seq: 0,
             net: VecDeque::new(),
             listeners: BTreeMap::new(),
             next_port: 1,
@@ -231,7 +244,7 @@ impl World {
             stdin_eof: false,
             stdin_sub: None,
             random_state: None,
-            perf_origin: Instant::now(),
+            clock,
             running_timer: RunningTimer::new(),
             exit_code: AtomicI32::new(-1),
             term: Arc::new(Termination::new()),
@@ -389,11 +402,11 @@ mod tests {
 
     #[test]
     fn the_first_exit_code_wins() {
-        let w = World::new(0);
+        let w = World::new(0, RunClock::Real(Instant::now()));
         w.set_exit_code(3);
         w.set_exit_code(4);
         assert_eq!(w.exit_code(), 3);
-        let w2 = World::new(0);
+        let w2 = World::new(0, RunClock::Real(Instant::now()));
         w2.set_exit_code(0);
         w2.set_exit_code(9);
         assert_eq!(w2.exit_code(), 0, "an explicit 0 also wins");
@@ -409,7 +422,7 @@ mod tests {
 
     #[test]
     fn a_command_timeout_maps_to_its_own_code_and_is_consumed() {
-        let mut w = World::new(0);
+        let mut w = World::new(0, RunClock::Real(Instant::now()));
         w.term.mark(TermReason::CommandTimeout);
         assert_eq!(w.take_terminated_exit(), COMMAND_TIMEOUT_CODE);
         assert_eq!(w.term.reason(), None, "taken, like every reason");

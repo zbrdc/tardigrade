@@ -149,3 +149,64 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
 }
+
+// --clock=virtual: Date must read the run's virtual clock, never the
+// host clock. The host installs __virtualDateMs only for virtual runs;
+// capture it like the encoder hooks above, delete it, and rebuild Date
+// over the original constructor. The original stays reachable only from
+// this closure: the rebuilt Date's [[Prototype]] is Function.prototype
+// (chaining it to the original would hand the guest the host clock
+// through Object.getPrototypeOf), its statics are own copies, and every
+// intrinsic the override touches at call time is captured here too - so
+// no date object, prototype, subclass chain or replaced Reflect yields a
+// constructor bound to the host clock.
+if (typeof globalThis.__virtualDateMs === "function") {
+  const __vnow = globalThis.__virtualDateMs;
+  delete globalThis.__virtualDateMs;
+  const HostDate = Date;
+  const __construct = Reflect.construct;
+  const __apply = Reflect.apply;
+  // Date() as a function ignores its arguments (ECMA-262 21.4.2.1) and
+  // builds its string without consulting the (replaceable)
+  // Date.prototype methods; the captured toString does the same.
+  const __dateString = HostDate.prototype.toString;
+  // A plain function, not a class, so Date() without new still works;
+  // strict with a simple parameter list, so it carries no own
+  // arguments/caller accessors the platform's constructor does not have.
+  // Reflect.construct keeps new.target (subclasses, prototype changes)
+  // honest, an explicit argument is passed through untouched, so
+  // new Date(ms) (and every other form) stays exact, and the strict
+  // arguments object - whose indices are own data properties - goes to
+  // Reflect.construct as-is: copying through any array would run guest
+  // index accessors on Array.prototype/Object.prototype instead.
+  // The no-argument [__vnow()] is an array literal, whose elements are
+  // own data properties from creation, so it cannot hit them either.
+  const VDate = function Date() {
+    "use strict";
+    if (new.target === undefined) {
+      return __apply(__dateString, new HostDate(__vnow()), []);
+    }
+    return __construct(HostDate, arguments.length ? arguments : [__vnow()], new.target);
+  };
+  VDate.prototype = HostDate.prototype;
+  // now stays non-constructable like the platform's (an arrow), with
+  // the platform's name.
+  const nowFn = () => __vnow();
+  Object.defineProperty(nowFn, "name", { value: "now", configurable: true });
+  // Platform constructor shape: own length, name, prototype, now, parse
+  // and UTC, all non-enumerable (Object.keys(Date) is empty), with the
+  // prototype property non-writable like a class's.
+  Object.defineProperty(VDate, "prototype", { writable: false });
+  Object.defineProperty(VDate, "length", { value: 7, configurable: true });
+  Object.defineProperty(VDate, "now", {
+    value: nowFn,
+    writable: true, configurable: true,
+  });
+  for (const staticName of ["parse", "UTC"]) {
+    Object.defineProperty(
+      VDate, staticName, Object.getOwnPropertyDescriptor(HostDate, staticName)
+    );
+  }
+  HostDate.prototype.constructor = VDate;
+  globalThis.Date = VDate;
+}
