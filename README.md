@@ -41,9 +41,10 @@ in-process from Rust:
     let code = v8vm::run(source, "app.js", &v8vm::Config::new());
     let code = v8vm::serve(std::io::stdout(), source, "app.js", &cfg);
 
-Note: run()/serve() use process-global world state for the duration of a
-call; one guest at a time per process. serve() reads commands from process
-stdin.
+Note: each run()/serve() call creates its own isolate and world; several
+guests can run concurrently in one process and do not see each other's
+state. serve() still reads commands from process stdin, which remains one
+shared stream per process.
 
 ## Event loop
 

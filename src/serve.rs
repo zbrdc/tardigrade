@@ -1,0 +1,106 @@
+//! Console protocol: one JS expression per input line, one JSON line out.
+
+use std::io::{BufRead, Write};
+
+use crate::event_loop::{event_loop, report};
+use crate::world::{to_rust_string, world_mut};
+
+/// Wraps one command line as a guest expression that always yields a JSON
+/// string. The line sits between newlines so a trailing `//` comment ends at
+/// the newline instead of swallowing the closing brackets. JSON.stringify
+/// returns undefined for undefined/functions; that becomes `null` so every
+/// output line is valid JSON. Concatenation, not format!: a missing brace in
+/// an escaped template becomes a guest SyntaxError.
+fn wrap_serve_expr(line: &str) -> String {
+    String::from("(function(){try{var r=JSON.stringify((\n")
+        + line
+        + "\n));return r===undefined?\"null\":r}catch(e){return JSON.stringify({$error:String(e&&e.message||e)})}})()"
+}
+
+/// Compiles and evaluates one wrapped serve expression.
+fn eval_serve_line<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    wrapped: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let src = v8::String::new_from_utf8(scope, wrapped.as_bytes(), v8::NewStringType::Normal)
+        .unwrap();
+    let name = v8::String::new(scope, "serve").unwrap();
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let script = v8::Script::compile(scope, src, Some(&origin))?;
+    script.run(scope)
+}
+
+/// All encoding happens guest-side (JSON.stringify), so the host stays
+/// JSON-free.
+pub(crate) fn serve_loop<R: BufRead, W: Write>(
+    scope: &mut v8::HandleScope,
+    input: R,
+    mut output: W,
+) -> i32 {
+    for line in input.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let wrapped = wrap_serve_expr(&line);
+        let mut tc = v8::TryCatch::new(scope);
+        match eval_serve_line(&mut tc, &wrapped) {
+            Some(v) => {
+                let out = to_rust_string(&mut tc, &v);
+                let _ = writeln!(output, "{}", out);
+                let _ = output.flush();
+            }
+            None => {
+                if tc.is_execution_terminating() {
+                    tc.cancel_terminate_execution();
+                    let code = world_mut(&mut tc).exit_code();
+                    return if code >= 0 { code } else { 124 };
+                }
+                report(&mut tc);
+                return 1;
+            }
+        }
+        drop(tc);
+        let code = event_loop(scope); // settle timers/net between commands
+        let exit = world_mut(scope).exit_code();
+        if exit >= 0 {
+            return exit;
+        }
+        if code != 0 {
+            return code;
+        }
+    }
+    let exit = world_mut(scope).exit_code();
+    if exit >= 0 {
+        exit
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_wrapper_isolates_the_line() {
+        let w = wrap_serve_expr("1 + 1 // note");
+        assert!(w.contains("\n1 + 1 // note\n"));
+        assert!(w.ends_with("})()"));
+    }
+}

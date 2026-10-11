@@ -203,39 +203,42 @@ fn stdin_from_entry_dash_is_at_eof() {
     assert_eq!(r.stdout, "[]\n");
 }
 
-fn serve(commands: &str) -> Run {
-    let path = script("serve-entry", "globalThis.state = { n: 0 };");
+/// Each serve test gets its own entry file: they run in parallel and a
+/// shared path races writer against reader (an empty read silently skips
+/// the entry script).
+fn serve(entry: &str, commands: &str) -> Run {
+    let path = script(entry, "globalThis.state = { n: 0 };");
     v8vm(&["--serve", path.to_str().unwrap()], commands.as_bytes())
 }
 
 #[test]
 fn serve_answers_one_json_line_per_command() {
-    let r = serve("1 + 1\nstate.n += 5\n({a: [1, 'x']})\n");
+    let r = serve("serve-answers", "1 + 1\nstate.n += 5\n({a: [1, 'x']})\n");
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, "2\n5\n{\"a\":[1,\"x\"]}\n");
 }
 
 #[test]
 fn serve_accepts_a_trailing_line_comment() {
-    let r = serve("40 + 2 // the answer\n");
+    let r = serve("serve-comment", "40 + 2 // the answer\n");
     assert_eq!(r.stdout, "42\n");
 }
 
 #[test]
 fn serve_prints_null_for_undefined_results() {
-    let r = serve("undefined\n(() => 1)\nstate.missing\n");
+    let r = serve("serve-null", "undefined\n(() => 1)\nstate.missing\n");
     assert_eq!(r.stdout, "null\nnull\nnull\n");
 }
 
 #[test]
 fn serve_reports_thrown_errors_as_json_and_keeps_going() {
-    let r = serve("(() => { throw new Error('bad') })()\n7\n");
+    let r = serve("serve-errors", "(() => { throw new Error('bad') })()\n7\n");
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, "{\"$error\":\"bad\"}\n7\n");
 }
 
 #[test]
 fn serve_settles_timers_between_commands() {
-    let r = serve("setTimeout(() => { state.n = 9 }, 5)\nstate.n\n");
+    let r = serve("serve-timers", "setTimeout(() => { state.n = 9 }, 5)\nstate.n\n");
     assert_eq!(r.stdout, "1\n9\n"); // first line is the timer id
 }
