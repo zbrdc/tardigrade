@@ -1,4 +1,4 @@
-//! End-to-end tests: drive the v8vm binary the way users and the Makefile do.
+//! End-to-end tests: drive the tardigrade binary the way users and the Makefile do.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,21 +21,21 @@ fn script(name: &str, source: &str) -> PathBuf {
     path
 }
 
-fn v8vm(args: &[&str], stdin: &[u8]) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+fn tardigrade(args: &[&str], stdin: &[u8]) -> Run {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn v8vm");
+        .expect("spawn tardigrade");
     let mut pipe = child.stdin.take().unwrap();
     let input = stdin.to_vec();
     // Feed on a thread: a large input must not deadlock against the child.
     let feeder = std::thread::spawn(move || {
         let _ = pipe.write_all(&input);
     });
-    let out = child.wait_with_output().expect("wait v8vm");
+    let out = child.wait_with_output().expect("wait tardigrade");
     feeder.join().unwrap();
     Run {
         code: out.status.code().expect("exit code, not a signal"),
@@ -46,7 +46,7 @@ fn v8vm(args: &[&str], stdin: &[u8]) -> Run {
 
 fn run_js(name: &str, source: &str) -> Run {
     let path = script(name, source);
-    v8vm(&[path.to_str().unwrap()], b"")
+    tardigrade(&[path.to_str().unwrap()], b"")
 }
 
 /// run_js with extra CLI flags before the script path.
@@ -54,7 +54,7 @@ fn run_js_with(flags: &[&str], name: &str, source: &str) -> Run {
     let path = script(name, source);
     let mut args = flags.to_vec();
     args.push(path.to_str().unwrap());
-    v8vm(&args, b"")
+    tardigrade(&args, b"")
 }
 
 /// Waits for a child with a bound, so a guest that ignores its termination
@@ -99,7 +99,7 @@ fn unhandled_rejection_exits_1() {
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("nope"), "stderr: {}", r.stderr);
     assert!(
-        r.stderr.contains("v8vm: unhandled promise rejection:"),
+        r.stderr.contains("tardigrade: unhandled promise rejection:"),
         "stderr: {}",
         r.stderr
     );
@@ -186,7 +186,7 @@ fn a_rejection_from_a_stdin_continuation_fails_the_run() {
         "vm.stdin.read().then(() => { throw new Error('boom') });",
     );
     for input in [b"hi\n" as &[u8], b""] {
-        let r = v8vm(&[path.to_str().unwrap()], input);
+        let r = tardigrade(&[path.to_str().unwrap()], input);
         assert_eq!(r.code, 1, "input {:?}: stderr: {}", input, r.stderr);
         assert!(r.stderr.contains("unhandled promise rejection: Error: boom"), "stderr: {}", r.stderr);
     }
@@ -200,7 +200,7 @@ fn an_oom_inside_a_microtask_reports_137() {
         "oom-microtask",
         "const a = []; Promise.resolve().then(() => { for (;;) a.push({ x: new Array(1e4).fill(1) }); });",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
     assert!(r.stderr.contains("heap limit exceeded"), "stderr: {}", r.stderr);
 }
@@ -209,7 +209,7 @@ fn an_oom_inside_a_microtask_reports_137() {
 fn the_watchdog_reaches_a_microtask_that_spins() {
     let path = script("spin-microtask", "Promise.resolve().then(() => { for (;;) {} });");
     let start = std::time::Instant::now();
-    let r = v8vm(&["--timeout=300", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--timeout=300", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 124, "stderr: {}", r.stderr);
     assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
 }
@@ -218,7 +218,7 @@ fn the_watchdog_reaches_a_microtask_that_spins() {
 fn the_watchdog_reaches_a_guest_idle_on_a_far_timer() {
     let path = script("idle-timer", "setTimeout(() => {}, 10000);");
     let start = std::time::Instant::now();
-    let r = v8vm(&["--timeout=1000", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--timeout=1000", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 124, "stderr: {}", r.stderr);
     assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
 }
@@ -226,13 +226,13 @@ fn the_watchdog_reaches_a_guest_idle_on_a_far_timer() {
 #[test]
 fn the_watchdog_reaches_a_guest_idle_on_stdin() {
     let path = script("idle-stdin", "vm.stdin.read().then(() => {});");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
         .args(["--timeout=1000", path.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn v8vm");
+        .expect("spawn tardigrade");
     let _held = child.stdin.take(); // open, never written: the guest idles
     let start = std::time::Instant::now();
     let out = wait_within(child, 3);
@@ -245,7 +245,7 @@ fn rejection_value_is_stringified_in_stderr() {
     let r = run_js("rej-stringified", "Promise.reject({ code: 42 })");
     assert_eq!(r.code, 1);
     assert!(
-        r.stderr.contains("v8vm: unhandled promise rejection: [object Object]"),
+        r.stderr.contains("tardigrade: unhandled promise rejection: [object Object]"),
         "stderr: {}",
         r.stderr
     );
@@ -261,14 +261,14 @@ fn async_function_throwing_without_a_catcher_fails() {
 #[test]
 fn timeout_kills_a_spinning_guest_with_124() {
     let path = script("spin", "for (;;) {}");
-    let r = v8vm(&["--timeout=100", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--timeout=100", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 124);
 }
 
 #[test]
 fn memory_zero_is_a_usage_error() {
     let path = script("mem-zero", "console.log('never runs');");
-    let r = v8vm(&["--memory=0", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=0", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 2);
     assert!(r.stderr.contains("--memory"), "stderr: {}", r.stderr);
 }
@@ -276,7 +276,7 @@ fn memory_zero_is_a_usage_error() {
 #[test]
 fn memory_below_eight_is_a_usage_error() {
     let path = script("mem-four", "console.log('never runs');");
-    let r = v8vm(&["--memory=4", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=4", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 2);
     assert!(r.stderr.contains("at least 8"), "stderr: {}", r.stderr);
 }
@@ -287,10 +287,10 @@ fn map_number_growth_reports_137_not_v8s_fatal_oom() {
     // V8's fatal out-of-memory abort.
     let path = script("oom-map", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
     for cap in ["32", "64"] {
-        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        let r = tardigrade(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
         assert_eq!(r.code, 137, "cap {}: stderr: {}", cap, r.stderr);
         assert!(
-            r.stderr.contains("v8vm: heap limit exceeded"),
+            r.stderr.contains("tardigrade: heap limit exceeded"),
             "cap {}: stderr: {}",
             cap,
             r.stderr
@@ -306,9 +306,9 @@ fn small_object_growth_reports_137() {
     // Fine-grained growth of small live objects must end in the
     // near-heap-limit callback too.
     let path = script("oom-objects", "const a = []; for (;;) a.push({});");
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
-    assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("tardigrade: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
 }
 
 #[test]
@@ -316,9 +316,9 @@ fn set_growth_reports_137_at_the_largest_cap() {
     // The deterministic over-cap shape at 256: the Map-size race above does
     // not exist for string Sets.
     let path = script("oom-set", "const s = new Set(); for (let i = 0;; i++) s.add('s' + i);");
-    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=256", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
-    assert!(r.stderr.contains("v8vm: heap limit exceeded"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("tardigrade: heap limit exceeded"), "stderr: {}", r.stderr);
 }
 
 #[test]
@@ -333,7 +333,7 @@ fn large_array_churn_near_the_cap_passes() {
             .replace("CHURN", churn)
             .replace("CSZ", if cap == "128" { "4000000" } else { "1000000" });
         let path = script("churn-large-arrays", &source);
-        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        let r = tardigrade(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
         assert_eq!(r.code, 0, "live {}: stderr: {}", live, r.stderr);
         assert_eq!(r.stdout, "ok\n", "live {}", live);
     }
@@ -348,7 +348,7 @@ fn multi_megabyte_temporaries_at_a_small_cap_pass() {
          for (let i = 0; i < 400; i++) { x += new Array(500000).fill(i + 0.5).length; }
          console.log('ok', x);",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert!(r.stdout.starts_with("ok 200000000"), "stdout: {}", r.stdout);
 
@@ -360,7 +360,7 @@ fn multi_megabyte_temporaries_at_a_small_cap_pass() {
          for (let i = 0; i < 100; i++) { x += new Array(1000000).fill(i).length; }
          console.log('done', x);",
     );
-    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=8", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "done 100000000\n");
 }
@@ -371,14 +371,14 @@ fn map_of_objects_growth_reports_137() {
         "oom-map-obj",
         "const m = new Map(); for (let i = 0;; i++) m.set(i, { a: i, b: 'k' + i });",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
 }
 
 #[test]
 fn object_key_growth_reports_137() {
     let path = script("oom-objkeys", "const o = {}; for (let i = 0;; i++) o['k' + i] = { a: i };");
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
 }
 
@@ -388,7 +388,7 @@ fn string_concat_reports_the_range_error_not_an_abort() {
     // string length with an ordinary uncaught RangeError (Node does the
     // same), not with the heap cap or a fatal abort.
     let path = script("oom-str", "let s = 'x'; for (;;) s = s + s;");
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 1, "stderr: {}", r.stderr);
     assert!(r.stderr.contains("Invalid string length"), "stderr: {}", r.stderr);
 }
@@ -396,9 +396,9 @@ fn string_concat_reports_the_range_error_not_an_abort() {
 #[test]
 fn the_smallest_supported_cap_reports_137() {
     let path = script("oom-cap8", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
-    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=8", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
-    assert!(r.stderr.contains("v8vm: heap limit exceeded (8 MB)"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("tardigrade: heap limit exceeded (8 MB)"), "stderr: {}", r.stderr);
 }
 
 #[test]
@@ -411,7 +411,7 @@ fn big_temporary_arrays_under_the_cap_never_report_137() {
          console.log('done', x);",
     );
     for cap in ["64", "256"] {
-        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        let r = tardigrade(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
         assert_eq!(r.code, 0, "cap {}: stderr: {}", cap, r.stderr);
         assert_eq!(r.stdout, "done 100000000\n");
     }
@@ -424,7 +424,7 @@ fn moderate_array_churn_under_the_cap_never_reports_137() {
         "let x = 0; for (let r = 0; r < 200; r++) { const t = new Array(200000).fill(r); x += t.length; }
          console.log('done', x);",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "done 40000000\n");
 }
@@ -438,7 +438,7 @@ fn a_live_set_with_map_copies_under_the_cap_never_reports_137() {
          let s = 0; for (let r = 0; r < 8; r++) { const t = live.map((o) => ({ ...o, r })); s += t.length; }
          console.log('done', s);",
     );
-    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=256", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "done 1600000\n");
 }
@@ -457,7 +457,7 @@ fn arraybuffer_budget_fractions_of_the_cap() {
              console.log('done', n !== 0);"
             .replace("LIVE", live);
         let path = script("ab-fraction", &source);
-        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        let r = tardigrade(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
         assert_eq!(r.code, 0, "live {}: stderr: {}", live, r.stderr);
         assert!(r.stdout.starts_with("done"), "stdout: {}", r.stdout);
     }
@@ -531,7 +531,7 @@ fn a_caught_arraybuffer_failure_does_not_kill_later_work() {
          const fine = new ArrayBuffer(1 << 20); new Uint8Array(fine).fill(1);
          setTimeout(() => console.log('later', fine.byteLength), 5);",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert!(r.stdout.contains("RangeError"), "stdout: {}", r.stdout);
     assert!(r.stdout.ends_with("later 1048576\n"), "stdout: {}", r.stdout);
@@ -542,7 +542,7 @@ fn a_huge_memory_flag_does_not_wrap() {
     // 16 TiB in MB used to shift-wrap to zero at two call sites; a zero
     // cap would refuse this buffer.
     let path = script("huge-cap", "const b = new Uint8Array(1 << 20); b[0] = 1; console.log('ok', b[0]);");
-    let r = v8vm(&["--memory=17592186044416", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=17592186044416", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "ok 1\n");
 }
@@ -552,7 +552,7 @@ fn a_guest_exit_prefers_code_then_reason_over_exceptions() {
     // A blocked callback returns undefined, the guest throws before V8
     // observes the termination - the exit code / reason still wins.
     let path = script("exit-then-use", "vm.exit(2); vm.fs.read('/x').split(',');");
-    let r = v8vm(&[path.to_str().unwrap()], b"");
+    let r = tardigrade(&[path.to_str().unwrap()], b"");
     assert_eq!(r.code, 2, "stderr: {}", r.stderr);
     assert_eq!(r.stderr, "");
 }
@@ -560,7 +560,7 @@ fn a_guest_exit_prefers_code_then_reason_over_exceptions() {
 #[test]
 fn a_timeout_beats_the_exception_from_a_blocked_callback() {
     let path = script("hammer-exit", "vm.fs.write('/x', 'abc'); for (;;) { vm.fs.read('/x').length; }");
-    let r = v8vm(&["--timeout=50", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--timeout=50", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 124, "stderr: {}", r.stderr);
     assert_eq!(r.stderr, "");
 }
@@ -572,16 +572,16 @@ fn a_callback_loop_oom_reports_137_not_a_type_error() {
         "vm.fs.write('/x', 'y'); const a = [];
          for (;;) { a.push(vm.fs.read('/x').length, new Array(1000).fill(1)); }",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
-    assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("tardigrade: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
     assert!(!r.stderr.contains("TypeError"), "stderr: {}", r.stderr);
 }
 
 #[test]
 fn vm_exit_beats_the_stdin_continuation() {
     let path = script("exit-stdin", "vm.exit(3); vm.stdin.read().then(() => {});");
-    let r = v8vm(&[path.to_str().unwrap()], b"");
+    let r = tardigrade(&[path.to_str().unwrap()], b"");
     assert_eq!(r.code, 3, "stderr: {}", r.stderr);
     assert_eq!(r.stderr, "");
 }
@@ -591,7 +591,7 @@ fn a_hundred_mib_arraybuffer_under_the_cap_passes() {
     // External (ArrayBuffer) memory counts toward the cap: 100 MiB is
     // under a 256 MiB cap, so the run must succeed.
     let path = script("one-buffer", "new Uint8Array(100 << 20).fill(1); console.log('ok');");
-    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=256", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "ok\n");
 }
@@ -603,7 +603,7 @@ fn retained_arraybuffers_past_the_cap_fail_with_a_range_error() {
     // not catch (a catching guest keeps running - see the fail2 shape).
     let path = script("typed-oom", "const a = []; for (;;) a.push(new Uint8Array(1 << 20));");
     let start = std::time::Instant::now();
-    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=256", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 1, "stderr: {}", r.stderr);
     assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
     assert!(
@@ -655,7 +655,7 @@ fn fs_writes_after_vm_exit_do_not_land_in_the_dump() {
          vm.fs.write('/g', 'y'); vm.fs.mkdir('/d'); vm.fs.rename('/f', '/h');
          vm.fs.remove('/f'); vm.restore('{}');",
     );
-    let r = v8vm(
+    let r = tardigrade(
         &[&format!("--dump={}", dump.display()), path.to_str().unwrap()],
         b"",
     );
@@ -673,7 +673,7 @@ fn vm_exit_inside_a_timer_callback_stops_effects() {
         "vm.fs.write('/f', 'x');
          setTimeout(() => { vm.exit(0); vm.fs.write('/g', 'y'); console.log('after'); }, 5);",
     );
-    let r = v8vm(
+    let r = tardigrade(
         &[&format!("--dump={}", dump.display()), path.to_str().unwrap()],
         b"",
     );
@@ -695,7 +695,7 @@ fn dump_is_written_after_an_oom() {
         "vm.fs.write('/kept.txt', 'before the oom');
          const a = []; for (;;) a.push(new Array(1e5).fill(1));",
     );
-    let r = v8vm(
+    let r = tardigrade(
         &[
             "--memory=32",
             &format!("--dump={}", dump.display()),
@@ -704,7 +704,7 @@ fn dump_is_written_after_an_oom() {
         b"",
     );
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
-    assert!(r.stderr.contains("v8vm: heap limit exceeded"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("tardigrade: heap limit exceeded"), "stderr: {}", r.stderr);
     assert!(!r.stderr.contains("dump"), "no dump complaint: {}", r.stderr);
     let json = std::fs::read_to_string(&dump).expect("dump written after an OOM");
     assert!(json.contains("/kept.txt") && json.contains("before the oom"), "dump: {}", json);
@@ -716,10 +716,10 @@ fn heap_cap_oom_exits_137_quickly_without_a_signal() {
     // OOM abort, SIGTRAP) fails this test before the code assert runs.
     let path = script("oom", "const a = []; for (;;) a.push(new Array(1e5).fill(1));");
     let start = std::time::Instant::now();
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
     assert!(
-        r.stderr.contains("v8vm: heap limit exceeded (32 MB)"),
+        r.stderr.contains("tardigrade: heap limit exceeded (32 MB)"),
         "stderr: {}",
         r.stderr
     );
@@ -733,7 +733,7 @@ fn guests_staying_under_the_cap_are_unaffected() {
         "const a = []; for (let i = 0; i < 100; i++) a.push(new Array(1000).fill(7));
          console.log(a.length);",
     );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "100\n");
 }
@@ -743,16 +743,16 @@ fn a_small_memory_cap_still_creates_the_isolate() {
     // The initial heap used to be hard-coded at 64 MiB, so any cap below
     // that died with a V8 check failure (SIGTRAP) before the guest ran.
     let path = script("mem-16", "console.log('fits');");
-    let r = v8vm(&["--memory=16", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=16", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "fits\n");
 }
 
 #[test]
 fn usage_errors_exit_2() {
-    assert_eq!(v8vm(&[], b"").code, 2);
-    assert_eq!(v8vm(&["--bogus", "x.js"], b"").code, 2);
-    assert_eq!(v8vm(&["/nonexistent/entry.js"], b"").code, 2);
+    assert_eq!(tardigrade(&[], b"").code, 2);
+    assert_eq!(tardigrade(&["--bogus", "x.js"], b"").code, 2);
+    assert_eq!(tardigrade(&["/nonexistent/entry.js"], b"").code, 2);
 }
 
 #[test]
@@ -808,7 +808,7 @@ fn rejecting_with_a_symbol_still_prints_a_reason() {
     let r = run_js("rej-symbol", "Promise.reject(Symbol('s'))");
     assert_eq!(r.code, 1);
     assert!(
-        r.stderr.contains("v8vm: unhandled promise rejection: <unprintable rejection value>"),
+        r.stderr.contains("tardigrade: unhandled promise rejection: <unprintable rejection value>"),
         "stderr: {}",
         r.stderr
     );
@@ -904,7 +904,7 @@ fn fs_quota_flag_enforces_the_limit_and_leaves_state_unchanged() {
          catch (e) { console.log(e.message, vm.fs.stat('/f').size); }
          try { vm.fs.mkdir('/d', {recursive: true}); } catch (e) { console.log(e.message, vm.fs.exists('/d')); }",
     );
-    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--fs-quota=1", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "1048510\nfs quota exceeded 1048510\nfs quota exceeded false\n");
 }
@@ -912,11 +912,11 @@ fn fs_quota_flag_enforces_the_limit_and_leaves_state_unchanged() {
 #[test]
 fn fs_quota_zero_disables_the_limit_and_bad_values_exit_2() {
     let path = script("quota-off", "vm.fs.write('/f', new Uint8Array(1048576 + 1)); console.log(vm.fs.stat('/f').size);");
-    let r = v8vm(&["--fs-quota=0", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--fs-quota=0", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "1048577\n");
-    assert_eq!(v8vm(&["--fs-quota=x", "-"], b"").code, 2);
-    assert_eq!(v8vm(&["--fs-quota=18446744073709551616", "-"], b"").code, 2);
+    assert_eq!(tardigrade(&["--fs-quota=x", "-"], b"").code, 2);
+    assert_eq!(tardigrade(&["--fs-quota=18446744073709551616", "-"], b"").code, 2);
 }
 
 #[test]
@@ -941,14 +941,14 @@ fn dump_preload_roundtrips_binary_files_and_dirs() {
          vm.fs.mkdir('/cfg', {recursive: true});
          vm.fs.write('/cfg/x', 't');",
     );
-    let w = v8vm(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
+    let w = tardigrade(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
     assert_eq!(w.code, 0, "stderr: {}", w.stderr);
     let reader = script(
         "bin-reader",
         "const b = vm.fs.readBytes('/img.bin');
          console.log(Array.from(b).join(','), vm.fs.stat('/img.bin').size, vm.fs.exists('/cfg'), vm.fs.read('/cfg/x'), vm.fs.stat('/cfg').type);",
     );
-    let r = v8vm(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
+    let r = tardigrade(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "0,255,254,1,254,255,0 7 true t dir\n");
 }
@@ -963,7 +963,7 @@ fn preload_accepts_the_legacy_snapshot_fixture() {
          vm.run('/lib/util.js');
          console.log(globalThis.seven);",
     );
-    let r = v8vm(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
+    let r = tardigrade(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "hello from the old format true /greeting.txt,/lib/util.js\n7\n");
 }
@@ -1070,13 +1070,13 @@ fn fs_replacement_char_paths_round_trip_through_dump_and_preload() {
         "fffd-writer",
         "vm.fs.write('/a\\uFFFDb', 'x'); vm.fs.mkdir('/d\\uFFFD', {recursive: true}); vm.fs.write('/d\\uFFFD/f', 'y');",
     );
-    let w = v8vm(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
+    let w = tardigrade(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
     assert_eq!(w.code, 0, "stderr: {}", w.stderr);
     let reader = script(
         "fffd-reader",
         "console.log(vm.fs.read('/a\\uFFFDb'), vm.fs.exists('/d\\uFFFD'), vm.fs.read('/d\\uFFFD/f'));\n         console.log(vm.fs.list('/').includes('/a\\uFFFDb'), vm.fs.readdir('/').includes('d\\uFFFD'));\n         console.log(vm.snapshot().includes('a\\uFFFDb'));",
     );
-    let r = v8vm(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
+    let r = tardigrade(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "x true y\ntrue true\ntrue\n");
 }
@@ -1139,8 +1139,8 @@ fn restore_rejects_bad_versions_and_non_canonical_base64() {
 #[test]
 fn fs_quota_flag_multiplication_overflow_exits_2() {
     // 2^64 bytes would need an mb value whose << 20 overflows u64.
-    assert_eq!(v8vm(&["--fs-quota=17592186044416", "-"], b"").code, 2);
-    assert_eq!(v8vm(&["--fs-quota=17592186044415", "-"], b"").code, 0);
+    assert_eq!(tardigrade(&["--fs-quota=17592186044416", "-"], b"").code, 2);
+    assert_eq!(tardigrade(&["--fs-quota=17592186044415", "-"], b"").code, 0);
 }
 
 #[test]
@@ -1151,7 +1151,7 @@ fn preload_accepts_relative_legacy_keys() {
         "legacy-relative",
         "console.log(vm.fs.read('/rel/a.txt'), vm.fs.read('/abs.txt'), vm.fs.list('/').join(','));",
     );
-    let r = v8vm(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
+    let r = tardigrade(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "relative key ok absolute key ok /abs.txt,/rel/a.txt\n");
 }
@@ -1172,7 +1172,7 @@ fn fs_file_too_large_to_read_as_a_string() {
          catch (e) { console.log(e.message); }
          console.log(vm.fs.readBytes('/f').length);",
     );
-    let r = v8vm(&["--fs-quota=0", "--memory=1200", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--fs-quota=0", "--memory=1200", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "file too large to read as a string\n566231040\n");
 }
@@ -1194,7 +1194,7 @@ fn restore_rejects_duplicate_paths_and_keeps_the_quota_honest() {
          catch (e) { console.log(e.message); }
          try { vm.restore('{\"b\":\"1\",\"/b\":\"2\"}'); } catch (e) { console.log(e.message); }",
     );
-    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--fs-quota=1", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(
         r.stdout,
@@ -1230,7 +1230,7 @@ fn write_probes_string_lengths_against_the_quota() {
          try { vm.fs.write('/t', { toString() { throw new Error('never runs'); } }); }
          catch (e) { console.log(e.message.slice(0, 20)); }",
     );
-    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--fs-quota=1", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "fs quota exceeded\n200000\nwrite data must be a\n");
 }
@@ -1240,16 +1240,16 @@ fn a_failed_dump_exits_74_when_the_guest_succeeded() {
     let path = script("dump-fail", "vm.fs.write('/f', 'x');");
     // Writing the dump into a directory fails; the guest itself was fine.
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let r = v8vm(&[&format!("--dump={}", dir.display()), path.to_str().unwrap()], b"");
+    let r = tardigrade(&[&format!("--dump={}", dir.display()), path.to_str().unwrap()], b"");
     assert_eq!(r.code, 74);
     assert!(r.stderr.contains("cannot write dump"), "stderr: {}", r.stderr);
     // A guest that already failed keeps its own exit code.
     let bad = script("dump-fail-2", "throw new Error('boom');");
-    let r2 = v8vm(&[&format!("--dump={}", dir.display()), bad.to_str().unwrap()], b"");
+    let r2 = tardigrade(&[&format!("--dump={}", dir.display()), bad.to_str().unwrap()], b"");
     assert_eq!(r2.code, 1);
     // A healthy dump still exits 0.
     let ok_dump = dir.join("dump-ok.json");
-    let r3 = v8vm(&[&format!("--dump={}", ok_dump.display()), path.to_str().unwrap()], b"");
+    let r3 = tardigrade(&[&format!("--dump={}", ok_dump.display()), path.to_str().unwrap()], b"");
     assert_eq!(r3.code, 0);
 }
 
@@ -1273,13 +1273,13 @@ fn entries(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// Runs v8vm with RLIMIT_FSIZE set to `limit` bytes, so any write that grows
+/// Runs tardigrade with RLIMIT_FSIZE set to `limit` bytes, so any write that grows
 /// a file past it fails partway with EFBIG. SIGXFSZ is ignored (the default
 /// action kills the process); the setting survives the exec.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn v8vm_with_file_size_cap(args: &[&str], limit: u64) -> Run {
+fn tardigrade_with_file_size_cap(args: &[&str], limit: u64) -> Run {
     use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_v8vm"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tardigrade"));
     cmd.args(args).stdin(Stdio::null());
     // SAFETY: the closure only makes async-signal-safe libc calls.
     unsafe {
@@ -1292,7 +1292,7 @@ fn v8vm_with_file_size_cap(args: &[&str], limit: u64) -> Run {
             Ok(())
         });
     }
-    let out = cmd.output().expect("run v8vm");
+    let out = cmd.output().expect("run tardigrade");
     Run {
         code: out.status.code().expect("exit code, not a signal"),
         stdout: String::from_utf8(out.stdout).unwrap(),
@@ -1314,7 +1314,7 @@ fn a_failed_dump_write_leaves_the_old_dump_intact() {
     std::fs::write(&dump, "OLD-DUMP").expect("seed dump");
     let guest = script("atomic-dump-fail", "vm.fs.write('/big', 'x'.repeat(65536));");
     let dump_arg = format!("--dump={}", dump.display());
-    let r = v8vm_with_file_size_cap(&[&dump_arg, guest.to_str().unwrap()], 1024);
+    let r = tardigrade_with_file_size_cap(&[&dump_arg, guest.to_str().unwrap()], 1024);
     assert_eq!(r.code, 74, "stderr: {}", r.stderr);
     assert!(r.stderr.contains("cannot write dump"), "stderr: {}", r.stderr);
     assert!(r.stderr.contains("File too large"), "OS error missing: {}", r.stderr);
@@ -1328,7 +1328,7 @@ fn a_failed_dump_write_leaves_the_old_dump_intact() {
 fn dump_run(test: &str, dump: &std::path::Path) -> Run {
     let guest = script(test, "vm.fs.write('/f', 'x');");
     let dump_arg = format!("--dump={}", dump.display());
-    v8vm_bounded(&[&dump_arg, guest.to_str().unwrap()], b"", std::time::Duration::from_secs(60))
+    tardigrade_bounded(&[&dump_arg, guest.to_str().unwrap()], b"", std::time::Duration::from_secs(60))
 }
 
 /// The replacement keeps the old dump's mode.
@@ -1400,22 +1400,22 @@ fn a_dump_to_dev_stdout_redirected_to_a_file_keeps_the_inode() {
     let out_file = std::fs::File::create(&out).expect("create stdout file");
     let inode = out_file.metadata().unwrap().ino();
     let guest = script("dump-dev-stdout", "vm.fs.write('/f', 'x');");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
         .args(["--dump=/dev/stdout", guest.to_str().unwrap()])
         .stdin(Stdio::null())
         .stdout(out_file)
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn v8vm");
+        .expect("spawn tardigrade");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("poll v8vm") {
+        if let Some(status) = child.try_wait().expect("poll tardigrade") {
             break status;
         }
         if std::time::Instant::now() > deadline {
-            child.kill().expect("kill hung v8vm");
-            child.wait().expect("reap v8vm");
-            panic!("v8vm still running after 60s");
+            child.kill().expect("kill hung tardigrade");
+            child.wait().expect("reap tardigrade");
+            panic!("tardigrade still running after 60s");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
@@ -1480,7 +1480,7 @@ fn a_250_character_dump_name_is_written() {
 #[test]
 fn a_dump_to_a_device_is_written_in_place() {
     let guest = script("dump-devnull", "vm.fs.write('/f', 'x');");
-    let r = v8vm(&["--dump=/dev/null", guest.to_str().unwrap()], b"");
+    let r = tardigrade(&["--dump=/dev/null", guest.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
 }
 
@@ -1504,7 +1504,7 @@ fn full_quota_control_characters_survive_a_snapshot_round_trip() {
     // A 1 MiB quota: ~260 long control-character keys fill it, and their
     // ~6 MB snapshot (control bytes escape to six each) must clear the
     // 6x gate and restore cleanly - a 4x gate would reject it.
-    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--fs-quota=1", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     let mut lines = r.stdout.lines();
     let full = lines.next().unwrap();
@@ -1574,7 +1574,7 @@ fn dump_is_written_for_every_ending() {
         let mut args = e.flags.to_vec();
         args.push(&dump_arg);
         args.push(script_path.to_str().unwrap());
-        let r = v8vm_bounded(&args, e.stdin, std::time::Duration::from_secs(60));
+        let r = tardigrade_bounded(&args, e.stdin, std::time::Duration::from_secs(60));
         assert_eq!(r.code, e.want, "{}: exit code (stderr: {})", e.what, r.stderr);
         assert!(dump_has_f(&name), "{}: dump missing /f", e.what);
     }
@@ -1616,11 +1616,11 @@ fn fs_error_messages_truncate_huge_paths() {
 fn dump_then_preload_restores_the_filesystem() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.json");
     let writer = script("dump-writer", "vm.fs.write('/k', 'v\\u00e9');");
-    let w = v8vm(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
+    let w = tardigrade(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
     assert_eq!(w.code, 0);
 
     let reader = script("preload-reader", "console.log(vm.fs.read('/k'));");
-    let r = v8vm(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
+    let r = tardigrade(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, "vé\n");
 }
@@ -1628,7 +1628,7 @@ fn dump_then_preload_restores_the_filesystem() {
 #[test]
 fn missing_preload_exits_2() {
     let path = script("noop", "");
-    let r = v8vm(&["--preload=/nonexistent.json", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--preload=/nonexistent.json", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 2);
 }
 
@@ -1664,14 +1664,14 @@ fn stdin_keeps_multibyte_characters_whole_across_read_boundaries() {
         STDIN_ECHO
     );
     let path = script("stdin-multibyte", &source);
-    let r = v8vm(&[path.to_str().unwrap()], payload.as_bytes());
+    let r = tardigrade(&[path.to_str().unwrap()], payload.as_bytes());
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, format!("{}:same\n", expected));
 }
 
 #[test]
 fn stdin_from_entry_dash_is_at_eof() {
-    let r = v8vm(
+    let r = tardigrade(
         &["-"],
         b"vm.stdin.read().then((c) => console.log('[' + c + ']'));",
     );
@@ -1683,7 +1683,7 @@ fn stdin_from_entry_dash_is_at_eof() {
 /// the entry script).
 fn serve(entry: &str, commands: &str) -> Run {
     let path = script(entry, "globalThis.state = { n: 0 };");
-    v8vm(&["--serve", path.to_str().unwrap()], commands.as_bytes())
+    tardigrade(&["--serve", path.to_str().unwrap()], commands.as_bytes())
 }
 
 #[test]
@@ -1721,14 +1721,14 @@ fn serve_settles_timers_between_commands() {
 #[test]
 fn an_unhandled_rejection_inside_a_serve_command_fails_the_session() {
     let path = script("serve-reject", "globalThis.p = null;");
-    let r = v8vm(
+    let r = tardigrade(
         &["--serve", path.to_str().unwrap()],
         b"p = Promise.reject('sv')\n42\n",
     );
     assert_eq!(r.code, 1, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "{}\n", "the reply goes out before the boundary decides");
     assert!(
-        r.stderr.contains("v8vm: unhandled promise rejection: sv"),
+        r.stderr.contains("tardigrade: unhandled promise rejection: sv"),
         "stderr: {}",
         r.stderr
     );
@@ -1737,7 +1737,7 @@ fn an_unhandled_rejection_inside_a_serve_command_fails_the_session() {
 #[test]
 fn an_oom_inside_a_serve_expression_reports_137() {
     let path = script("serve-oom", "");
-    let r = v8vm(
+    let r = tardigrade(
         &["--memory=32", "--serve", path.to_str().unwrap()],
         b"(() => { const a = []; for (;;) a.push(new Array(1e5).fill(1)); })()\n",
     );
@@ -1759,7 +1759,7 @@ fn serve_replies_reach_stdout_before_later_guest_output() {
     let expected = "\"A\"\nn1\n\"B\"\nn2\n\"C\"\nt\n";
     let mut violations = 0;
     for _ in 0..50 {
-        let r = v8vm(&["--serve", path.to_str().unwrap()], commands);
+        let r = tardigrade(&["--serve", path.to_str().unwrap()], commands);
         assert_eq!(r.code, 0, "stderr: {}", r.stderr);
         if r.stdout != expected {
             violations += 1;
@@ -1768,27 +1768,27 @@ fn serve_replies_reach_stdout_before_later_guest_output() {
     assert_eq!(violations, 0, "reply ordering violated {} of 50 times", violations);
 }
 
-/// Like `v8vm`, but kills the child and fails if it outlives `limit`, so a
+/// Like `tardigrade`, but kills the child and fails if it outlives `limit`, so a
 /// hang regression is a test failure instead of a stuck test run.
-fn v8vm_bounded(args: &[&str], stdin: &[u8], limit: std::time::Duration) -> Run {
-    v8vm_bounded_started(args, stdin, limit, |_| {})
+fn tardigrade_bounded(args: &[&str], stdin: &[u8], limit: std::time::Duration) -> Run {
+    tardigrade_bounded_started(args, stdin, limit, |_| {})
 }
 
-/// `v8vm_bounded` that also calls `started` with the child's pid right after
+/// `tardigrade_bounded` that also calls `started` with the child's pid right after
 /// the spawn, before any input is sent.
-fn v8vm_bounded_started(
+fn tardigrade_bounded_started(
     args: &[&str],
     stdin: &[u8],
     limit: std::time::Duration,
     started: impl FnOnce(u32),
 ) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn v8vm");
+        .expect("spawn tardigrade");
     started(child.id());
     let mut pipe = child.stdin.take().unwrap();
     let input = stdin.to_vec();
@@ -1798,18 +1798,18 @@ fn v8vm_bounded_started(
     });
     let start = std::time::Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().expect("poll v8vm") {
+        if let Some(status) = child.try_wait().expect("poll tardigrade") {
             break status;
         }
         if start.elapsed() > limit {
-            child.kill().expect("kill hung v8vm");
-            child.wait().expect("reap v8vm");
-            panic!("v8vm still running after {:?}", limit);
+            child.kill().expect("kill hung tardigrade");
+            child.wait().expect("reap tardigrade");
+            panic!("tardigrade still running after {:?}", limit);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     feeder.join().unwrap();
-    let out = child.wait_with_output().expect("collect v8vm output");
+    let out = child.wait_with_output().expect("collect tardigrade output");
     Run {
         code: status.code().expect("exit code, not a signal"),
         stdout: String::from_utf8(out.stdout).unwrap(),
@@ -1820,7 +1820,7 @@ fn v8vm_bounded_started(
 #[test]
 fn serve_answers_a_final_command_without_a_trailing_newline_and_exits() {
     let path = script("serve-no-newline", "globalThis.s = 1;");
-    let r = v8vm_bounded(
+    let r = tardigrade_bounded(
         &["--serve", path.to_str().unwrap()],
         b"1+1",
         std::time::Duration::from_secs(10),
@@ -2022,7 +2022,7 @@ fn virtual_time_timeout_still_kills_a_busy_loop_with_124() {
     // The watchdog measures real time: a guest that busy-loops under
     // virtual time is stopped exactly like a real-time one.
     let path = script("vclock-spin", "for (;;) {}");
-    let r = v8vm_bounded(
+    let r = tardigrade_bounded(
         &["--clock=virtual", "--timeout=150", path.to_str().unwrap()],
         b"",
         std::time::Duration::from_secs(10),
@@ -2040,20 +2040,20 @@ fn virtual_time_does_not_wait_for_a_pending_stdin_read() {
         "vclock-stdin",
         "vm.stdin.read().then((c) => console.log('stdin', JSON.stringify(c)));\n         setTimeout(() => { console.log('timer', Date.now()); vm.exit(0); }, 1000);",
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
         .args(["--clock=virtual", "--timeout=5000", path.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn v8vm");
+        .expect("spawn tardigrade");
     let hold = child.stdin.take().unwrap(); // held open: no data, no EOF
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || tx.send(child.wait_with_output()).unwrap());
     let out = rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("guest finished without waiting for stdin")
-        .expect("wait v8vm");
+        .expect("wait tardigrade");
     drop(hold);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "timer 1000\n");
@@ -2209,17 +2209,17 @@ fn virtual_time_date_clamps_at_the_es_maximum() {
 fn virtual_time_flags_are_validated() {
     let path = script("vclock-flags", "");
     let entry = path.to_str().unwrap();
-    assert_eq!(v8vm(&["--clock=real", entry], b"").code, 2);
-    assert_eq!(v8vm(&["--clock=virtual", "--epoch=abc", entry], b"").code, 2);
-    assert_eq!(v8vm(&["--epoch=5", entry], b"").code, 2);
-    assert_eq!(v8vm(&["--clock=virtual", "--epoch=0", entry], b"").code, 0);
+    assert_eq!(tardigrade(&["--clock=real", entry], b"").code, 2);
+    assert_eq!(tardigrade(&["--clock=virtual", "--epoch=abc", entry], b"").code, 2);
+    assert_eq!(tardigrade(&["--epoch=5", entry], b"").code, 2);
+    assert_eq!(tardigrade(&["--clock=virtual", "--epoch=0", entry], b"").code, 0);
     // One above the ECMAScript maximum time value.
     assert_eq!(
-        v8vm(&["--clock=virtual", "--epoch=8640000000000001", entry], b"").code,
+        tardigrade(&["--clock=virtual", "--epoch=8640000000000001", entry], b"").code,
         2
     );
     assert_eq!(
-        v8vm(&["--clock=virtual", "--epoch=8640000000000000", entry], b"").code,
+        tardigrade(&["--clock=virtual", "--epoch=8640000000000000", entry], b"").code,
         0
     );
 }
@@ -2256,7 +2256,7 @@ const SANDBOX_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// independently of the library under test, so a lying answer fails.
 #[test]
 fn sandbox_check_matches_the_kernel() {
-    let r = v8vm(&["--sandbox-check"], b"");
+    let r = tardigrade(&["--sandbox-check"], b"");
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if common::kernel_supports_sandbox() {
         assert_eq!((r.code, r.stdout.trim()), (0, "supported"), "stderr: {}", r.stderr);
@@ -2273,7 +2273,7 @@ fn sandbox_check_before_the_entry_or_with_other_flags_is_a_usage_error() {
     let path = script("sb-check-misplaced", "console.log('ran');");
     let entry = path.to_str().unwrap();
     for args in [vec!["--sandbox-check", "--bogus"], vec!["--sandbox-check", entry], vec!["--", "--sandbox-check"]] {
-        let r = v8vm(&args, b"");
+        let r = tardigrade(&args, b"");
         assert_eq!(r.code, 2, "{:?} stderr: {}", args, r.stderr);
         assert_eq!(r.stdout, "", "{:?}: no probe answer and no guest run", args);
         assert!(r.stderr.contains("--sandbox-check must be the only argument"), "stderr: {}", r.stderr);
@@ -2287,7 +2287,7 @@ fn sandbox_check_after_the_entry_is_a_guest_argument() {
     let path = script("sb-check-arg", "console.log(JSON.stringify(vm.args));");
     let entry = path.to_str().unwrap();
     for args in [vec![entry, "--sandbox-check"], vec![entry, "--", "--sandbox-check"]] {
-        let r = v8vm(&args, b"");
+        let r = tardigrade(&args, b"");
         assert_eq!(r.code, 0, "{:?} stderr: {}", args, r.stderr);
         assert_eq!(r.stdout, "[\"--sandbox-check\"]\n", "{:?}", args);
     }
@@ -2304,7 +2304,7 @@ mod sandbox_prepare {
         let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-dir/sb.json");
         let path = script("sb-refused", "console.log('ran');");
         let dump_arg = format!("--dump={}", dump.display());
-        let r = v8vm_bounded(&["--sandbox", &dump_arg, path.to_str().unwrap()], b"", SANDBOX_LIMIT);
+        let r = tardigrade_bounded(&["--sandbox", &dump_arg, path.to_str().unwrap()], b"", SANDBOX_LIMIT);
         assert_eq!(r.code, 2);
         assert_eq!(r.stdout, "", "guest must not run");
         assert!(r.stderr.contains("sandbox"), "stderr: {}", r.stderr);
@@ -2314,7 +2314,7 @@ mod sandbox_prepare {
     fn sandbox_refuses_a_dump_that_is_not_a_regular_file() {
         // The child's stdout is a pipe, so /dev/stdout is one too.
         let path = script("sb-pipe-dump", "console.log('ran');");
-        let r = v8vm_bounded(
+        let r = tardigrade_bounded(
             &["--sandbox", "--dump=/dev/stdout", path.to_str().unwrap()],
             b"",
             SANDBOX_LIMIT,
@@ -2327,7 +2327,7 @@ mod sandbox_prepare {
 
 /// Whether this kernel can sandbox. Where it cannot, the test must then
 /// check the refusal with `assert_refused` and return, and a skip notice is
-/// printed. V8VM_REQUIRE_SANDBOX=1 makes such a kernel a failure instead.
+/// printed. TARDIGRADE_REQUIRE_SANDBOX=1 makes such a kernel a failure instead.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn sandbox_available(test: &str) -> bool {
     if common::kernel_supports_sandbox() {
@@ -2335,7 +2335,7 @@ fn sandbox_available(test: &str) -> bool {
     }
     assert!(
         !common::sandbox_required(),
-        "V8VM_REQUIRE_SANDBOX=1 but the kernel reports Landlock ABI {}, need {}",
+        "TARDIGRADE_REQUIRE_SANDBOX=1 but the kernel reports Landlock ABI {}, need {}",
         common::landlock_abi(),
         common::REQUIRED_LANDLOCK_ABI
     );
@@ -2347,21 +2347,21 @@ fn sandbox_available(test: &str) -> bool {
 /// guest run, never an unsandboxed run.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn assert_refused(args: &[&str], stdin: &[u8]) {
-    let r = v8vm_bounded(args, stdin, SANDBOX_LIMIT);
+    let r = tardigrade_bounded(args, stdin, SANDBOX_LIMIT);
     assert_eq!(r.code, 2, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "", "guest must not run");
-    assert!(r.stderr.contains("v8vm: --sandbox:"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("tardigrade: --sandbox:"), "stderr: {}", r.stderr);
     assert!(r.stderr.contains("Landlock"), "stderr: {}", r.stderr);
 }
 
-/// Runs v8vm under `--sandbox`; None means the kernel cannot sandbox and the
+/// Runs tardigrade under `--sandbox`; None means the kernel cannot sandbox and the
 /// refusal has been checked.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn sandboxed(test: &str, args: &[&str], stdin: &[u8]) -> Option<Run> {
     let mut full = vec!["--sandbox"];
     full.extend_from_slice(args);
     if sandbox_available(test) {
-        return Some(v8vm_bounded(&full, stdin, SANDBOX_LIMIT));
+        return Some(tardigrade_bounded(&full, stdin, SANDBOX_LIMIT));
     }
     assert_refused(&full, stdin);
     None
@@ -2390,7 +2390,7 @@ mod sandbox_run {
             return;
         };
         assert_eq!(r.code, 137, "stderr: {}", r.stderr);
-        assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("tardigrade: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
         let json = std::fs::read_to_string(&dump).expect("dump written after the OOM");
         assert!(json.contains("/kept"), "dump: {}", json);
 
@@ -2473,7 +2473,7 @@ mod sandbox_run {
             assert_refused(&args, commands);
             return;
         }
-        let r = v8vm_bounded_started(&args, commands, SANDBOX_LIMIT, wait_for_seccomp);
+        let r = tardigrade_bounded_started(&args, commands, SANDBOX_LIMIT, wait_for_seccomp);
         assert_eq!(r.code, 0, "stderr: {}", r.stderr);
         assert_eq!(r.stdout, "2\n5\n");
     }
@@ -2494,7 +2494,7 @@ mod sandbox_run {
     }
 
     /// The web-platform globals work under the sandbox layers too (the
-    /// V8VM_REQUIRE_SANDBOX gate runs this test for real).
+    /// TARDIGRADE_REQUIRE_SANDBOX gate runs this test for real).
     #[test]
     fn sandbox_webapi_globals_work() {
         let test = "sandbox_webapi_globals_work";
@@ -2523,7 +2523,7 @@ mod sandbox_run {
 #[test]
 fn sandbox_flag_is_refused_on_unsupported_platforms() {
     let path = script("sb-unsupported", "console.log('ran');");
-    let r = v8vm_bounded(&["--sandbox", path.to_str().unwrap()], b"", SANDBOX_LIMIT);
+    let r = tardigrade_bounded(&["--sandbox", path.to_str().unwrap()], b"", SANDBOX_LIMIT);
     assert_eq!(r.code, 2);
     assert_eq!(r.stdout, "", "guest must not run");
     assert!(

@@ -25,14 +25,14 @@ pub(crate) struct Job {
 static HOST: LazyLock<Sender<Job>> = LazyLock::new(|| {
     let (tx, rx) = mpsc::channel::<Job>();
     std::thread::Builder::new()
-        .name("v8vm-host".to_string())
+        .name("tardigrade-host".to_string())
         .spawn(move || host_thread(rx))
-        .expect("spawn v8vm host thread");
+        .expect("spawn tardigrade host thread");
     tx
 });
 
 pub(crate) fn submit(job: Job) {
-    LazyLock::force(&HOST).send(job).expect("v8vm host thread alive");
+    LazyLock::force(&HOST).send(job).expect("tardigrade host thread alive");
 }
 
 /// True once the host thread has been spawned (it initializes V8 as its
@@ -59,7 +59,7 @@ fn host_thread(rx: Receiver<Job>) {
         // job fails, with exit code 70 (EX_SOFTWARE).
         let fail_done = done.clone();
         let spawned = std::thread::Builder::new()
-            .name("v8vm-guest".to_string())
+            .name("tardigrade-guest".to_string())
             .spawn(move || {
                 // Panics are caught so the payload can be resumed on the
                 // calling thread (see run/serve) instead of vanishing here.
@@ -70,7 +70,7 @@ fn host_thread(rx: Receiver<Job>) {
                 let _ = done.send(code);
             });
         if spawned.is_err() {
-            eprintln!("v8vm: cannot spawn guest thread");
+            eprintln!("tardigrade: cannot spawn guest thread");
             let _ = fail_done.send(Ok(70));
         }
     }

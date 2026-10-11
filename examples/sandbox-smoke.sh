@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Smoke check for --sandbox. The guest must run sandboxed. When this host
 # cannot sandbox at all (not Linux x86_64, or a kernel without Landlock ABI 6,
-# which needs Linux 6.12) the check is reported as a skip; V8VM_REQUIRE_SANDBOX=1
+# which needs Linux 6.12) the check is reported as a skip; TARDIGRADE_REQUIRE_SANDBOX=1
 # makes that a failure. Any other refusal fails: the kernel was able to
 # sandbox and did not.
 set -u
-OUT=${OUT:?set OUT to the v8vm binary}
+OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 
 # --sandbox-check exits 0 (can sandbox) or 2 (cannot). Any other status is a
@@ -17,8 +17,8 @@ if [ "$check" -ne 0 ]; then
     echo "sandbox smoke: --sandbox-check exited $check, expected 0 or 2" >&2
     exit 1
   fi
-  if [ "${V8VM_REQUIRE_SANDBOX:-}" = 1 ]; then
-    echo "sandbox smoke: V8VM_REQUIRE_SANDBOX=1 but this host cannot sandbox" >&2
+  if [ "${TARDIGRADE_REQUIRE_SANDBOX:-}" = 1 ]; then
+    echo "sandbox smoke: TARDIGRADE_REQUIRE_SANDBOX=1 but this host cannot sandbox" >&2
     exit 1
   fi
   echo "SKIPPED (cannot sandbox here): --sandbox smoke check"

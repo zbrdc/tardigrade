@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Minimal agent loop: an agent (here a canned edit step - swap it for your
-# LLM call) develops an application inside the v8-vm RAM workspace.
+# LLM call) develops an application inside the tardigrade RAM workspace.
 #
 #   bash examples/agent-loop.sh
 #
 set -euo pipefail
-OUT=${OUT:?set OUT to the v8vm binary}
+OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 WS=${WS:-$(dirname "$OUT")/agent-ws.json}
 

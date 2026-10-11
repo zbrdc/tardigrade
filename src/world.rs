@@ -240,7 +240,7 @@ impl World {
         }
         match self.term.take_reason() {
             Some(TermReason::Oom) => {
-                eprintln!("v8vm: heap limit exceeded ({} MB)", self.heap_mb);
+                eprintln!("tardigrade: heap limit exceeded ({} MB)", self.heap_mb);
                 137
             }
             _ => 124,

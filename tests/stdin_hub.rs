@@ -35,9 +35,9 @@ fn main() {
 /// Two sequential runs: the first reads one chunk and exits; the second must
 /// receive the chunk that arrives after the first run ended.
 fn child_two_runs() {
-    let cfg = v8vm::Config::new();
-    let a = v8vm::run(READ_ONE, "one.js", &cfg);
-    let b = v8vm::run(READ_TWO, "two.js", &cfg);
+    let cfg = tardigrade::Config::new();
+    let a = tardigrade::run(READ_ONE, "one.js", &cfg);
+    let b = tardigrade::run(READ_TWO, "two.js", &cfg);
     std::process::exit(if a == 0 && b == 0 { 0 } else { 1 });
 }
 
@@ -45,9 +45,9 @@ fn child_two_runs() {
 /// commands must flow through the same stdin hub instead of deadlocking on
 /// the reader's stdin lock.
 fn child_run_then_serve() {
-    let cfg = v8vm::Config::new();
-    let a = v8vm::run(READ_ONE, "one.js", &cfg);
-    let b = v8vm::serve(std::io::stdout(), "globalThis.q = 1;", "serve.js", &cfg);
+    let cfg = tardigrade::Config::new();
+    let a = tardigrade::run(READ_ONE, "one.js", &cfg);
+    let b = tardigrade::serve(std::io::stdout(), "globalThis.q = 1;", "serve.js", &cfg);
     std::process::exit(if a == 0 && b == 0 { 0 } else { 1 });
 }
 

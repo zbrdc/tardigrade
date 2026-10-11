@@ -1,5 +1,5 @@
 [package]
-name = "v8vm"
+name = "tardigrade"
 version = "0.1.0"
 edition = "2021"
 autobins = true
@@ -23,7 +23,7 @@ libc = "=0.2.190"
 test-layers = []
 
 [dev-dependencies]
-v8vm = { path = ".", features = ["test-layers"] }
+tardigrade = { path = ".", features = ["test-layers"] }
 
 [profile.release]
 opt-level = 2

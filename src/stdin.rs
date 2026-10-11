@@ -25,7 +25,7 @@ use crate::guest_cb;
 use crate::world::world_mut;
 
 /// Past this many buffered bytes the reader thread blocks until a consumer
-/// pulls chunks (backpressure for e.g. `yes | v8vm guest.js`).
+/// pulls chunks (backpressure for e.g. `yes | tardigrade guest.js`).
 const HIGH_WATER_MARK: usize = 1 << 20;
 
 /// A run's or session's subscription to the stdin hub. Dropping it releases
@@ -198,7 +198,7 @@ pub(crate) fn subscribe() -> StdinSub {
     let (id, start_reader) = HUB.subscribe();
     if start_reader {
         std::thread::Builder::new()
-            .name("v8vm-stdin".to_string())
+            .name("tardigrade-stdin".to_string())
             .spawn(reader_loop)
             .expect("spawn stdin reader");
     }
