@@ -12,10 +12,16 @@ struct Guest {
     proc: Child,
 }
 
+/// Each relayed request becomes one serve command; a bound keeps one
+/// stuck handler from parking the bridge forever (the reply for an
+/// expired bound is the fixed "command timed out").
+const BRIDGE_COMMAND_TIMEOUT_MS: u64 = 30_000;
+
 impl Guest {
     fn new(tardigrade: &str, app: &str) -> Guest {
         let proc = Command::new(tardigrade)
             .arg("--serve")
+            .arg(format!("--command-timeout={}", BRIDGE_COMMAND_TIMEOUT_MS))
             .arg(app)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -90,23 +96,37 @@ fn relay(stream: &mut TcpStream, guest: &mut Guest, req: &Request) {
     let expr = format!("handler({})", payload);
     let out = guest.call(&expr);
 
-    let (status, ctype, body): (i64, String, String) = match serde_json::from_str::<serde_json::Value>(&out) {
-        Ok(v) if v.get("$error").is_some() => (
-            500,
-            "text/plain".to_string(),
-            v.get("$error").and_then(|e| e.as_str()).unwrap_or("error").to_string(),
-        ),
-        Ok(v) => (
-            v.get("status").and_then(|s| s.as_i64()).unwrap_or(200),
-            v.get("type").and_then(|t| t.as_str()).unwrap_or("text/html").to_string(),
-            v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        ),
-        Err(_) => (200, "text/plain".to_string(), out),
-    };
+    let (status, ctype, body): (i64, String, String) =
+        match serde_json::from_str::<serde_json::Value>(&out) {
+            Ok(v) if v.get("$error").is_some_and(|e| e.as_str() == Some("command timed out")) => {
+                (504, "text/plain".to_string(), "command timed out".to_string())
+            }
+            Ok(v) if v.get("$error").is_some() => (
+                500,
+                "text/plain".to_string(),
+                v.get("$error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("error")
+                    .to_string(),
+            ),
+            Ok(v) => (
+                v.get("status").and_then(|s| s.as_i64()).unwrap_or(200),
+                v.get("type").and_then(|t| t.as_str()).unwrap_or("text/html").to_string(),
+                v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
+            ),
+            Err(_) => (200, "text/plain".to_string(), out),
+        };
 
+    let reason = match status {
+        200 => "OK",
+        500 => "Internal Server Error",
+        504 => "Gateway Timeout",
+        _ => "OK",
+    };
     let response = format!(
-        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
+        reason,
         ctype,
         body.len(),
         body

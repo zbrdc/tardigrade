@@ -29,18 +29,27 @@ use crate::world::world_mut;
 const HIGH_WATER_MARK: usize = 1 << 20;
 
 /// A run's or session's subscription to the stdin hub. Dropping it releases
-/// the hub slot so a later consumer can receive chunks.
+/// the hub slot so a later consumer can receive chunks. A `dead`
+/// subscription is one whose reader thread could not be started: it
+/// reports EOF forever instead of parking (see [subscribe]).
 pub(crate) struct StdinSub {
     id: u64,
+    dead: bool,
 }
 
 impl StdinSub {
     /// Blocks until a chunk (or EOF) is available for this subscription.
     pub(crate) fn wait_take(&self) -> Option<Vec<u8>> {
+        if self.dead {
+            return None;
+        }
         HUB.wait_take(self.id)
     }
 
     fn try_take(&self) -> Option<Option<Vec<u8>>> {
+        if self.dead {
+            return Some(None);
+        }
         HUB.try_take(self.id)
     }
 }
@@ -81,6 +90,16 @@ impl HubState {
     fn push_chunk(&mut self, chunk: Vec<u8>) {
         self.bytes += chunk.len();
         self.buf.push_back(chunk);
+    }
+
+    /// Returns bytes a consumer pulled but never used to the front of the
+    /// buffer; the next take sees them first, in order. May push the total
+    /// past the high-water mark: the reader thread then blocks on its next
+    /// push until the bytes are pulled (the overshoot is one consumer's
+    /// leftover, bounded by what it took).
+    fn push_front(&mut self, chunk: Vec<u8>) {
+        self.bytes += chunk.len();
+        self.buf.push_front(chunk);
     }
 
     fn take_chunk(&mut self) -> Option<Vec<u8>> {
@@ -149,6 +168,23 @@ impl Hub {
         self.wake.notify_all();
     }
 
+    /// Returns leftover bytes to the front of the buffer, for a session
+    /// that ended before it could read them ("input a run does not read
+    /// is kept").
+    fn push_front(&self, chunk: Vec<u8>) {
+        let mut st = self.state.lock().unwrap();
+        st.push_front(chunk);
+        drop(st);
+        self.wake.notify_all();
+    }
+
+    /// Lets a later subscribe retry the reader: called only when the spawn
+    /// failed, so `started` keeps meaning "a reader thread exists".
+    fn spawn_failed(&self) {
+        self.state.lock().unwrap().started = false;
+        self.wake.notify_all();
+    }
+
     /// Enqueues a subscriber; the bool says whether the reader thread still
     /// needs starting (decided under the lock, so it happens once).
     fn subscribe(&self) -> (u64, bool) {
@@ -193,16 +229,29 @@ impl Hub {
 
 static HUB: LazyLock<Hub> = LazyLock::new(Hub::new);
 
-/// Subscribes (and starts the one reader thread on first use).
+/// Subscribes (and starts the one reader thread on first use). A failed
+/// spawn must not panic (subscribe runs inside V8 callbacks, where a panic
+/// aborts the process): that subscription reports EOF and the next
+/// subscribe retries the spawn.
 pub(crate) fn subscribe() -> StdinSub {
     let (id, start_reader) = HUB.subscribe();
     if start_reader {
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("tardigrade-stdin".to_string())
-            .spawn(reader_loop)
-            .expect("spawn stdin reader");
+            .spawn(reader_loop);
+        if let Err(e) = spawned {
+            eprintln!("tardigrade: cannot spawn stdin reader: {}", e);
+            HUB.unsubscribe(id);
+            HUB.spawn_failed();
+            return StdinSub { id, dead: true };
+        }
     }
-    StdinSub { id }
+    StdinSub { id, dead: false }
+}
+
+/// Returns bytes to the hub (see [Hub::push_front]).
+pub(crate) fn push_front(chunk: Vec<u8>) {
+    HUB.push_front(chunk);
 }
 
 /// Length of the prefix of `buf` that can go to the guest now. A multi-byte
@@ -486,5 +535,48 @@ mod tests {
         assert_eq!(h.try_take(a), Some(Some(vec![b'x'; HIGH_WATER_MARK])));
         feeder.join().unwrap();
         assert_eq!(h.try_take(a), Some(Some(b"over".to_vec())));
+    }
+
+    #[test]
+    fn hub_push_front_returns_bytes_to_the_next_take_in_order() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        h.push(b"one".to_vec());
+        assert_eq!(h.try_take(a), Some(Some(b"one".to_vec())));
+        h.push_front(b"back".to_vec());
+        h.push(b"two".to_vec());
+        assert_eq!(h.try_take(a), Some(Some(b"back".to_vec())));
+        assert_eq!(h.try_take(a), Some(Some(b"two".to_vec())));
+    }
+
+    #[test]
+    fn hub_push_front_survives_a_close_and_reaches_a_later_subscriber() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        h.push(b"kept".to_vec());
+        h.close();
+        h.unsubscribe(a);
+        h.push_front(b"returned".to_vec());
+        let (b, _) = h.subscribe();
+        assert_eq!(h.try_take(b), Some(Some(b"returned".to_vec())));
+        assert_eq!(h.try_take(b), Some(Some(b"kept".to_vec())));
+        assert_eq!(h.try_take(b), Some(None));
+    }
+
+    #[test]
+    fn a_failed_reader_spawn_can_be_retried() {
+        let h = Hub::new();
+        let (_, start) = h.subscribe();
+        assert!(start);
+        h.spawn_failed();
+        let (_, start_again) = h.subscribe();
+        assert!(start_again, "started must reflect a live reader, not an attempt");
+    }
+
+    #[test]
+    fn a_dead_subscription_reports_eof_and_never_blocks() {
+        let sub = StdinSub { id: 4242, dead: true };
+        assert_eq!(sub.try_take(), Some(None));
+        assert_eq!(sub.wait_take(), None);
     }
 }

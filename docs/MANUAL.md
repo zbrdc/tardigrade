@@ -118,16 +118,23 @@ and `--timeout` under the virtual clock are in
 `--serve` keeps a program loaded and evaluates one JavaScript expression
 per line of stdin, answering each with one line of JSON:
 
-    $ printf 'globalThis.n = 1\nn + 41\n({a: [1, 2]})\nnope.x\n' | tardigrade --serve
+    $ printf 'globalThis.n = 1\nn + 41\n({a: [1, 2]})\nnope.x\nnew Promise((r) => setTimeout(() => r("later"), 10))\n' | tardigrade --serve
     1
     42
     {"a":[1,2]}
-    {"$error":"nope is not defined"}
+    {"$error":"ReferenceError: nope is not defined"}
+    "later"
 
 An entry file is optional; when given, it runs first, so it can define
-functions for the commands to call. The current limits of this mode
-(statements end the session, promises are not awaited, no per-command
-timeout) are listed in [KNOWN_BUGS.md](KNOWN_BUGS.md#console-mode---serve).
+functions for the commands to call. A command that fails to compile or
+throw is answered with `$error` and the session continues, and a promise
+value is awaited, so its settled value is the reply. `--command-timeout`
+bounds each command (the reply becomes
+`{"$error":"command timed out"}` and the session survives); without it
+`--timeout` defaults to 0 and bounds nothing. The full rules, including
+what a leftover timer does to later commands, are in
+[OPTIONS.md](OPTIONS.md#--serve), and the current limits of this mode
+are listed in [KNOWN_BUGS.md](KNOWN_BUGS.md#console-mode---serve).
 
 ## An HTTP front end
 
@@ -146,8 +153,11 @@ guest's global `handler(req)` over console mode, and the returned
 `OUT` names the tardigrade binary; without it the bridge runs `tardigrade`
 from your `PATH`. The arguments are the guest file (default
 `examples/webapp.js`) and the port (default 8077); the bridge listens on
-127.0.0.1 only. `examples/webapp.js` also shows WebAssembly running inside
-the guest. The bridge is a demonstration: read
+127.0.0.1 only. The bridge runs the guest with
+`--command-timeout=30000`, so one stuck handler cannot park it forever:
+a command that replies `$error` becomes HTTP 500 with the error text, a
+timed-out one 504. `examples/webapp.js` also shows WebAssembly running
+inside the guest. The bridge is a demonstration: read
 [KNOWN_BUGS.md](KNOWN_BUGS.md#http-bridge-serve_bridge) before exposing it
 to anything.
 

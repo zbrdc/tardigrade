@@ -28,6 +28,7 @@ calling thread before the guest continues.
 | Field | Default | Meaning |
 |---|---|---|
 | `timeout_ms: u64` | 60000 | wall-clock limit; 0 disables it |
+| `command_timeout_ms: u64` | 0 | per-command wall-clock limit in console mode; 0 disables it |
 | `heap_mb: usize` | 256 | heap cap in MB; values below 8 are raised to 8 |
 | `args: Vec<String>` | empty | the guest's `vm.args` |
 | `preload: Option<PathBuf>` | `None` | snapshot file to load into `vm.fs` before the run |
@@ -38,11 +39,14 @@ calling thread before the guest continues.
 | `seed: Option<u64>` | `None` | deterministic `Math.random` seed |
 | `clock: Clock` | `Clock::Real` | `Clock::Virtual { epoch_ms }` gives the guest a virtual clock |
 
-`serve()` applies `timeout_ms` to the whole session. The CLI uses 0 for
-`--serve` unless `--timeout` is given; a library caller who wants an
-unbounded session sets `timeout_ms: 0`. A session whose time has run out
-while it waits for input ends with exit 124 when its next input line or
-the end of input arrives.
+`serve()` applies `timeout_ms` to the whole session and
+`command_timeout_ms` to each command (the limit that answers a slow
+command with `{"$error":"command timed out"}` and keeps the session;
+see [OPTIONS.md](OPTIONS.md#--command-timeoutms)). The CLI uses 0 for
+both in `--serve` unless the matching flag is given; a library caller who
+wants an unbounded session sets `timeout_ms: 0`. A session whose time has
+run out while it waits for input ends with exit 124 when its next input
+line or the end of input arrives.
 
 `preload_data` goes through the same size check and `vm.restore` as a
 preload file, so legacy and version 2 snapshots behave the same. If you

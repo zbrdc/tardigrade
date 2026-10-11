@@ -44,18 +44,14 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
 ## Console mode (--serve)
 
-- **A command that is not an expression ends the session.** Statements
-  such as `let x = 1` or `throw new Error()`, and any syntax error, stop
-  the whole session with exit 1. An expression that throws at run time is
-  answered with `{"$error": ...}` and the session continues. Wrap
-  statements in an expression, for example `(() => { let x = 1; return x })()`.
-- **Promises are not awaited.** A command whose value is a promise is
-  answered with `{}`, the JSON form of the promise object.
 - **Guest output shares stdout with replies.** `console.log` and
   `console.info` output appears on stdout between the JSON replies.
-- **No per-command time limit.** A command that never finishes blocks the
-  session forever, because `--timeout` defaults to 0 in this mode. Set
-  `--timeout` to bound the whole session.
+- **No per-command time limit unless `--command-timeout` is given.** A
+  command that never finishes blocks the session forever, because
+  `--timeout` defaults to 0 in this mode; `--command-timeout` bounds each
+  command, and work a command leaves pending (an uncleared repeating
+  timer) keeps blocking later commands' settling with or without it. See
+  [OPTIONS.md](OPTIONS.md#--serve).
 
 ## HTTP bridge (serve_bridge)
 
@@ -75,4 +71,5 @@ localhost:
   instead of answering 502 and restarting the guest;
 - the status code and content type returned by the guest are written into
   the response unchecked: a content type containing CR or LF can inject
-  headers, and every status is sent with the reason phrase `OK`.
+  headers, and every status other than 200, 500 and 504 is sent with the reason
+  phrase `OK`.

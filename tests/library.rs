@@ -22,6 +22,13 @@ fn run_returns_the_guest_exit_code_and_can_run_again() {
 }
 
 #[test]
+fn the_default_config_has_no_per_command_timeout() {
+    // 0 keeps serve untimed unless the host asks for a bound.
+    assert_eq!(tardigrade::Config::default().command_timeout_ms, 0);
+    assert_eq!(tardigrade::Config::new().command_timeout_ms, 0);
+}
+
+#[test]
 fn heap_cap_oom_returns_137_and_later_runs_still_work() {
     let cfg = tardigrade::Config {
         heap_mb: 32,

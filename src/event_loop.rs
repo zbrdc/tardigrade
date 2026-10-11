@@ -158,10 +158,10 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
 
 // ---- unhandled rejections ----
 
-/// Removes the remembered rejection for `msg`'s promise, if any: a handler
-/// attached before the next checkpoint un-fails the run.
-fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
-    let promise = msg.get_promise();
+/// Drops the remembered rejection for `promise`, as an attached handler
+/// would: the host itself consumed the rejection (the serve console
+/// answers with it), so it must not fail the run at the next checkpoint.
+pub(crate) fn forget_rejection_of(scope: &mut v8::Isolate, promise: &v8::Promise) {
     let hash = promise.get_identity_hash().get();
     // Bucketed by identity hash so a mass catch does not scan every
     // remembered rejection; identity is confirmed with == inside the
@@ -170,11 +170,17 @@ fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessag
         Some(b) => b,
         None => return,
     };
-    bucket.retain(|e| e.promise.open(scope) != &*promise);
+    bucket.retain(|e| e.promise.open(scope) != promise);
     let world = world_mut(scope);
     if !bucket.is_empty() {
         world.pending_rejections.insert(hash, bucket);
     }
+}
+
+/// Removes the remembered rejection for `msg`'s promise, if any: a handler
+/// attached before the next checkpoint un-fails the run.
+fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
+    forget_rejection_of(scope, &msg.get_promise());
 }
 
 pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
@@ -237,44 +243,75 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
 }
 
 pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
+    event_loop_until(scope, &mut |_| false)
+}
+
+/// The loop with a stop condition: it returns 0 as soon as `done` is
+/// satisfied (checked at each turn and after each microtask drain), so a
+/// caller waiting for one promise does not also wait out every other
+/// pending job. Leftover work stays scheduled for the next caller,
+/// exactly as an idle return would leave it.
+pub(crate) fn event_loop_until(
+    scope: &mut HandleScope,
+    done: &mut dyn FnMut(&mut HandleScope) -> bool,
+) -> i32 {
     loop {
-        if let Some(c) = stopped(scope) {
+        // The turn first, and the park only when the loop continues: a
+        // tuple match would evaluate park_between_turns even for a
+        // finished loop, and under --clock=virtual that jumps the clock
+        // to the next pending timer - past work the caller never waited
+        // for (an awaited promise settling while a far timer is queued
+        // would leave the clock at the far timer's time).
+        if let Some(c) = turn(scope, done) {
             return c;
         }
-        if let Some(c) = run_net(scope) {
-            return c;
-        }
-        if let Some(c) = run_timers(scope) {
-            return c;
-        }
-        if let Some(c) = drain_microtasks(scope) {
-            return c;
-        }
-        if stdin::poll_stdin(scope) {
-            // Resolving a waiter runs its continuations; a rejection or a
-            // termination raised there meets the same checkpoint check.
-            if let Some(c) = drain_microtasks(scope) {
-                return c;
-            }
-        }
-        let (has_timers, has_net, has_stdin) = {
-            let world = world_mut(scope);
-            (
-                !world.timers.is_empty(),
-                !world.net.is_empty(),
-                !world.stdin_waiters.is_empty(),
-            )
-        };
-        match park_between_turns(scope, has_timers, has_net, has_stdin) {
+        match park_between_turns(scope) {
             Park::Done => break,
             Park::Spin => continue,
             Park::Sleep(wait) => std::thread::sleep(wait),
         }
     }
-    // Final sweep: continuations queued by the very last stdin delivery
-    // still count, and a termination that landed as the loop wound down
-    // (idle runs notice the watchdog only through the reason flag) ends
-    // the run instead of falling through to a clean exit.
+    sweep(scope)
+}
+
+/// One loop turn: due network messages, due timers, microtasks, stdin.
+/// Some(code) ends the loop (a stop condition met, an exit decided);
+/// None means the turn ran and the caller decides whether to park.
+fn turn(scope: &mut HandleScope, done: &mut dyn FnMut(&mut HandleScope) -> bool) -> Option<i32> {
+    if done(scope) {
+        return Some(0);
+    }
+    if let Some(c) = stopped(scope) {
+        return Some(c);
+    }
+    if let Some(c) = run_net(scope) {
+        return Some(c);
+    }
+    if let Some(c) = run_timers(scope) {
+        return Some(c);
+    }
+    if let Some(c) = drain_microtasks(scope) {
+        return Some(c);
+    }
+    if done(scope) {
+        return Some(0);
+    }
+    if stdin::poll_stdin(scope) {
+        // Resolving a waiter runs its continuations; a rejection or a
+        // termination raised there meets the same checkpoint check.
+        if let Some(c) = drain_microtasks(scope) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// The final sweep after the loop goes idle: continuations queued by the
+/// very last stdin delivery still count, a termination that landed as the
+/// loop wound down (idle runs notice the watchdog only through the reason
+/// flag) ends the run, and an unhandled rejection or a decided exit code
+/// conclude it.
+fn sweep(scope: &mut HandleScope) -> i32 {
     scope.perform_microtask_checkpoint();
     if let Some(c) = stopped(scope).or_else(|| check_unhandled(scope)) {
         return c;
@@ -285,6 +322,35 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     } else {
         0
     }
+}
+
+/// Settles only work already due at the current point of the timeline:
+/// due timers, one generation of queued network messages, microtasks,
+/// stdin. The clock is never advanced, so under --clock=virtual a later
+/// timer stays queued instead of being jumped to - a serve command's
+/// post-reply settling uses this, where jumping to a leftover repeating
+/// timer would spin virtual time (and the CPU) without bound.
+pub(crate) fn settle_due(scope: &mut HandleScope) -> i32 {
+    loop {
+        if let Some(c) = turn(scope, &mut |_| false) {
+            return c;
+        }
+        // Work that became due during this turn still belongs to "now"
+        // (a listener answering into the net queue, or a timer whose
+        // deadline was reached while the clock stood still); anything
+        // later waits for whoever moves the clock. Zero-delay timers do
+        // not qualify: their deadlines are clamped to at least 1 ms, so
+        // they are never due at the instant they are scheduled.
+        let due = {
+            let world = world_mut(scope);
+            let now = world.clock.now();
+            world.timers.iter().any(|t| t.when <= now) || !world.net.is_empty()
+        };
+        if !due {
+            break;
+        }
+    }
+    sweep(scope)
 }
 
 /// What the loop does at a turn boundary.
@@ -298,7 +364,9 @@ enum Park {
 }
 
 /// Decides the turn boundary: exit when nothing is pending, and otherwise
-/// when (and whether) to wait. Real runs sleep until the next timer or the
+/// when (and whether) to wait. Reads the pending flags itself - the
+/// flags live in the World, so the decision belongs with the policy.
+/// Real runs sleep until the next timer or the
 /// stdin poll cadence. Virtual time never sleeps to wait for a timer:
 /// runnable network work is delivered on the next turn as-is, and with no
 /// runnable work left the clock jumps straight to the next due timer, so a
@@ -306,12 +374,15 @@ enum Park {
 /// stdin read waits, in real time: chunks arrive on the real clock, the
 /// read stays pending until one does, and the clock has no deadline to
 /// jump to anyway.
-fn park_between_turns(
-    scope: &mut HandleScope,
-    has_timers: bool,
-    has_net: bool,
-    has_stdin: bool,
-) -> Park {
+fn park_between_turns(scope: &mut HandleScope) -> Park {
+    let (has_timers, has_net, has_stdin) = {
+        let world = world_mut(scope);
+        (
+            !world.timers.is_empty(),
+            !world.net.is_empty(),
+            !world.stdin_waiters.is_empty(),
+        )
+    };
     if !has_timers && !has_net && !has_stdin {
         return Park::Done;
     }
