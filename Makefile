@@ -36,7 +36,11 @@ ci:
 	$(MAKE) clippy
 	$(MAKE) check
 
+# Memory-heavy tests (multi-hundred-megabyte guests); not part of ci.
+test-heavy:
+	$(CARGO) test --release $(CARGOFLAGS) -- --ignored
+
 clean:
 	$(CARGO) clean
 
-.PHONY: check clean build test clippy ci
+.PHONY: check clean build test clippy ci test-heavy

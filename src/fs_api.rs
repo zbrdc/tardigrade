@@ -1,8 +1,10 @@
 //! Guest-facing vm.fs callbacks: argument conversion in, results and
 //! errors out. Every conversion is fallible where V8 can refuse (strings
-//! past the engine's maximum length, toString that throws, detached or
-//! out-of-bounds buffers), and none of them panic: a panic inside an
-//! extern "C" callback would abort the whole process.
+//! past the engine's maximum length, toString that throws, detached
+//! buffers), and none of them panic: a panic inside an extern "C"
+//! callback would abort the whole process. Paths containing lone
+//! surrogates are rejected here, where the raw UTF-16 is still visible;
+//! a genuine U+FFFD character is a perfectly legal path byte.
 
 use crate::diag::{throw, to_rust_string};
 use crate::fs::Stat;
@@ -10,19 +12,92 @@ use crate::guest_cb;
 use crate::snapshot;
 use crate::world::world_mut;
 
-/// Converts an argument to a Rust string. `None` means the conversion
-/// itself threw (a toString override can raise): the caller returns from
-/// the callback without touching the pending exception, so the guest sees
-/// its own error rather than a confusing path message.
-fn arg_str(scope: &mut v8::HandleScope, v: &v8::Value) -> Option<String> {
+/// Getting a guest string can end three ways: it converts, the
+/// conversion itself threw (a toString override can raise - the caller
+/// returns and leaves the pending exception alone), or it is a path
+/// containing an unpaired surrogate, which Rust cannot represent and
+/// which must not silently become U+FFFD and alias another path.
+enum PathArg {
+    Text(String),
+    Threw,
+    LoneSurrogate,
+}
+
+fn arg_path(scope: &mut v8::HandleScope, v: &v8::Value) -> PathArg {
+    let s = match v.to_string(scope) {
+        Some(s) => s,
+        None => return PathArg::Threw,
+    };
+    if has_lone_surrogate(&s, scope) {
+        return PathArg::LoneSurrogate;
+    }
+    PathArg::Text(s.to_rust_string_lossy(scope))
+}
+
+/// True when the raw UTF-16 code units contain an unpaired surrogate.
+/// Read through String::write, which reports the code units verbatim
+/// (the lossy Rust conversion would already have replaced them).
+fn has_lone_surrogate(s: &v8::String, scope: &mut v8::HandleScope) -> bool {
+    let mut units = vec![0u16; s.length()];
+    let wrote = s.write(scope, &mut units, 0, v8::WriteOptions::NO_NULL_TERMINATION);
+    lone_surrogate_in(&units[..wrote])
+}
+
+/// Pure scan: a lead surrogate must be followed by a trail surrogate,
+/// and a trail surrogate must be preceded by a lead.
+fn lone_surrogate_in(units: &[u16]) -> bool {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xd800..0xdc00).contains(&u) {
+            match units.get(i + 1) {
+                Some(next) if (0xdc00..0xe000).contains(next) => i += 1,
+                _ => return true,
+            }
+        } else if (0xdc00..0xe000).contains(&u) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Reads a path argument, propagating a thrown conversion and rejecting
+/// lone surrogates with a clear error.
+macro_rules! path_arg {
+    ($scope:ident, $args:ident, $i:expr) => {
+        match arg_path($scope, &$args.get($i)) {
+            PathArg::Text(p) => p,
+            PathArg::Threw => return,
+            PathArg::LoneSurrogate => {
+                return throw($scope, "path contains lone surrogates")
+            }
+        }
+    };
+}
+
+/// Converts a non-path argument (write data, restore payload) to a Rust
+/// string; `None` means the conversion threw and the pending guest
+/// exception should propagate.
+fn arg_text(scope: &mut v8::HandleScope, v: &v8::Value) -> Option<String> {
     let s = v.to_string(scope)?;
     Some(s.to_rust_string_lossy(scope))
+}
+
+/// True when a byte length is within a string size limit. Split out so
+/// the boundary is testable without building a half-gigabyte string;
+/// new_from_utf8 remains the final authority.
+fn fits_v8_string(len: usize, limit: usize) -> bool {
+    len <= limit
 }
 
 /// Makes a V8 string, or None when the content exceeds V8's maximum
 /// string length (~536 M characters); callers turn that into a guest
 /// Error instead of aborting the process.
 fn str_local<'s>(scope: &mut v8::HandleScope<'s>, s: &str) -> Option<v8::Local<'s, v8::String>> {
+    if !fits_v8_string(s.len(), v8::String::MAX_LENGTH) {
+        return None;
+    }
     v8::String::new_from_utf8(scope, s.as_bytes(), v8::NewStringType::Normal)
 }
 
@@ -58,45 +133,46 @@ fn opt_flag(
     }
 }
 
-/// The number of bytes `write` would copy for this value, without copying
-/// them: None for strings (already cheap to convert) and for values that
-/// are not writable data at all.
-fn arg_byte_len(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> Option<usize> {
+/// The number of bytes `write` would copy for this value, computed
+/// without copying: `utf8_length` for strings, the current view length
+/// for buffers (a view left out of bounds by a resize reports zero,
+/// exactly as the guest sees it). None for values that are not writable
+/// data - those fail in arg_bytes with the type error.
+fn data_len(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> Option<usize> {
+    if v.is_string() {
+        return v.to_string(scope).map(|s| s.utf8_length(scope));
+    }
     if v.is_array_buffer_view() {
-        let view = v8::Local::<v8::ArrayBufferView>::try_from(*v).ok()?;
-        check_view(scope, &view).ok()?;
-        return Some(view.byte_length());
+        return v8::Local::<v8::ArrayBufferView>::try_from(*v)
+            .ok()
+            .map(|view| view.byte_length());
     }
     if v.is_array_buffer() {
-        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(*v).ok()?;
-        if buffer.was_detached() {
-            return None;
-        }
-        return Some(buffer.byte_length());
+        return v8::Local::<v8::ArrayBuffer>::try_from(*v)
+            .ok()
+            .map(|buffer| buffer.byte_length());
     }
     if v.is_shared_array_buffer() {
-        let buffer = v8::Local::<v8::SharedArrayBuffer>::try_from(*v).ok()?;
-        return Some(buffer.byte_length());
+        return v8::Local::<v8::SharedArrayBuffer>::try_from(*v)
+            .ok()
+            .map(|buffer| buffer.byte_length());
     }
     None
 }
 
-/// Rejects views whose buffer was detached and views left out of bounds
-/// by a resizable-buffer shrink: their stale offset no longer fits the
-/// buffer. V8 reports the raw stored offset here, not the clamped value
-/// the guest sees.
-fn check_view(scope: &mut v8::HandleScope, view: &v8::Local<v8::ArrayBufferView>) -> Result<(), String> {
-    let buffer = match view.buffer(scope) {
-        Some(b) => b,
-        None => return Ok(()), // no buffer to validate against
-    };
-    if buffer.was_detached() {
-        return Err("cannot write from a detached ArrayBuffer".to_string());
+/// Only detachment is an error. A view left out of bounds by a
+/// resizable-buffer shrink behaves the way JS shows it: length zero, so
+/// the write stores an empty file.
+fn check_view(
+    scope: &mut v8::HandleScope,
+    view: &v8::Local<v8::ArrayBufferView>,
+) -> Result<(), String> {
+    match view.buffer(scope) {
+        Some(buffer) if buffer.was_detached() => {
+            Err("cannot write from a detached ArrayBuffer".to_string())
+        }
+        _ => Ok(()),
     }
-    if view.byte_offset() + view.byte_length() > buffer.byte_length() {
-        return Err("cannot write from an out-of-bounds view".to_string());
-    }
-    Ok(())
 }
 
 /// Extracts write() data: a string's UTF-8 bytes, a typed array's or
@@ -154,7 +230,7 @@ fn stat_obj<'s>(scope: &mut v8::HandleScope<'s>, st: &Stat) -> v8::Local<'s, v8:
 }
 
 guest_cb!(fs_read, |args, rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     match world_mut(scope).fs.read_string(&path) {
         Ok(text) => match str_local(scope, &text) {
             Some(s) => rv.set(s.into()),
@@ -165,7 +241,7 @@ guest_cb!(fs_read, |args, rv, scope| {
 });
 
 guest_cb!(fs_read_bytes, |args, rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     let bytes = match world_mut(scope).fs.read_bytes(&path) {
         Ok(b) => b,
         Err(e) => return throw(scope, &e),
@@ -181,10 +257,10 @@ guest_cb!(fs_read_bytes, |args, rv, scope| {
 });
 
 guest_cb!(fs_write, |args, _rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     let data = args.get(1);
-    // Reject a giant buffer against the quota before copying it in.
-    if let Some(len) = arg_byte_len(scope, &data) {
+    // Reject a giant string or buffer against the quota before copying.
+    if let Some(len) = data_len(scope, &data) {
         if let Err(e) = world_mut(scope).fs.probe_write(&path, len) {
             return throw(scope, &e);
         }
@@ -201,8 +277,7 @@ guest_cb!(fs_write, |args, _rv, scope| {
 
 guest_cb!(fs_list, |args, rv, scope| {
     let dir = if args.length() > 0 && !args.get(0).is_undefined() {
-        let Some(d) = arg_str(scope, &args.get(0)) else { return };
-        d
+        path_arg!(scope, args, 0)
     } else {
         "/".to_string()
     };
@@ -213,7 +288,7 @@ guest_cb!(fs_list, |args, rv, scope| {
 });
 
 guest_cb!(fs_remove, |args, _rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     let recursive = opt_flag(scope, &args, 1, "recursive");
     if let Err(e) = world_mut(scope).fs.remove(&path, recursive) {
         throw(scope, &e);
@@ -221,7 +296,7 @@ guest_cb!(fs_remove, |args, _rv, scope| {
 });
 
 guest_cb!(fs_mkdir, |args, _rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     let recursive = opt_flag(scope, &args, 1, "recursive");
     if let Err(e) = world_mut(scope).fs.mkdir(&path, recursive) {
         throw(scope, &e);
@@ -229,13 +304,17 @@ guest_cb!(fs_mkdir, |args, _rv, scope| {
 });
 
 guest_cb!(fs_exists, |args, rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
-    let hit = world_mut(scope).fs.exists(&path);
+    // Like any other nonsense path, a lone surrogate here just means no.
+    let hit = match arg_path(scope, &args.get(0)) {
+        PathArg::Text(p) => world_mut(scope).fs.exists(&p),
+        PathArg::Threw => return,
+        PathArg::LoneSurrogate => false,
+    };
     rv.set(v8::Boolean::new(scope, hit).into());
 });
 
 guest_cb!(fs_stat, |args, rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     match world_mut(scope).fs.stat(&path) {
         Ok(st) => rv.set(stat_obj(scope, &st).into()),
         Err(e) => throw(scope, &e),
@@ -243,7 +322,7 @@ guest_cb!(fs_stat, |args, rv, scope| {
 });
 
 guest_cb!(fs_readdir, |args, rv, scope| {
-    let Some(path) = arg_str(scope, &args.get(0)) else { return };
+    let path = path_arg!(scope, args, 0);
     match world_mut(scope).fs.readdir(&path) {
         Ok(names) => rv.set(str_array(scope, names).into()),
         Err(e) => throw(scope, &e),
@@ -251,10 +330,9 @@ guest_cb!(fs_readdir, |args, rv, scope| {
 });
 
 guest_cb!(fs_rename, |args, _rv, scope| {
-    let (Some(from), Some(to)) = (arg_str(scope, &args.get(0)), arg_str(scope, &args.get(1)))
-    else {
-        return;
-    };
+    // One at a time: if `from`'s conversion throws, `to`'s must not run.
+    let from = path_arg!(scope, args, 0);
+    let to = path_arg!(scope, args, 1);
     if let Err(e) = world_mut(scope).fs.rename(&from, &to) {
         throw(scope, &e);
     }
@@ -272,8 +350,41 @@ guest_cb!(fs_snapshot, |_args, rv, scope| {
 });
 
 guest_cb!(fs_restore, |args, _rv, scope| {
-    let Some(json) = arg_str(scope, &args.get(0)) else { return };
+    let Some(json) = arg_text(scope, &args.get(0)) else { return };
     if let Err(e) = world_mut(scope).fs.restore(&json) {
         throw(scope, &e);
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lone_surrogate_scan_matches_utf16_pairing() {
+        assert!(!lone_surrogate_in(&[]));
+        assert!(!lone_surrogate_in(&[0x61, 0x62]));
+        assert!(!lone_surrogate_in(&[0xd800, 0xdc00])); // a valid pair
+        assert!(lone_surrogate_in(&[0xd800])); // lead alone
+        assert!(lone_surrogate_in(&[0xdc00])); // trail alone
+        assert!(lone_surrogate_in(&[0x61, 0xd800, 0x62])); // lead then BMP
+        assert!(lone_surrogate_in(&[0xd800, 0xd800])); // lead, lead
+        assert!(!lone_surrogate_in(&[0xd83d, 0xde00, 0xfffd])); // emoji + U+FFFD
+        assert!(!lone_surrogate_in(&[0xfffd, 0xfffd])); // genuine U+FFFD is fine
+    }
+
+    #[test]
+    fn v8_string_limit_is_inclusive_at_the_boundary() {
+        // Injected limit so the error path is exercised without a
+        // half-gigabyte allocation; the real call site passes
+        // v8::String::MAX_LENGTH.
+        assert!(fits_v8_string(1024, 1024));
+        assert!(!fits_v8_string(1025, 1024));
+        assert!(fits_v8_string(0, 0));
+        assert!(fits_v8_string(v8::String::MAX_LENGTH, v8::String::MAX_LENGTH));
+        assert!(!fits_v8_string(
+            v8::String::MAX_LENGTH + 1,
+            v8::String::MAX_LENGTH
+        ));
+    }
+}

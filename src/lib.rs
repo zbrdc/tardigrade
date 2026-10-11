@@ -198,21 +198,29 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
     1
 }
 
-fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
+/// Writes the dump; false means it could not be produced (too large,
+/// snapshot error, or the file could not be written).
+fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
     let mut tc = v8::TryCatch::new(scope);
     match eval_src(&mut tc, "vm.snapshot()", "dump") {
         Some(v) => {
             let json = diag::to_rust_string(&mut tc, &v);
-            if std::fs::write(dump, json).is_err() {
-                eprintln!("v8vm: cannot write dump {:?}", dump);
+            match std::fs::write(dump, json) {
+                Ok(()) => true,
+                Err(_) => {
+                    eprintln!("v8vm: cannot write dump {:?}", dump);
+                    false
+                }
             }
         }
         None if tc.is_execution_terminating() => {
             tc.cancel_terminate_execution();
+            false
         }
         None => {
             report(&mut tc);
             eprintln!("v8vm: snapshot failed; dump not written");
+            false
         }
     }
 }
@@ -245,7 +253,11 @@ fn execute_inner(
     drop(watchdog);
 
     if let Some(dump) = &spec.cfg.dump {
-        write_dump(scope, dump);
+        // EX_IOERR: the run was asked to produce a dump and could not.
+        // A guest that already failed keeps its own exit code.
+        if !write_dump(scope, dump) && code == 0 {
+            code = 74;
+        }
     }
     code
 }

@@ -18,6 +18,16 @@ pub(crate) struct Snapshot {
     pub(crate) files: Vec<(String, Vec<u8>)>,
 }
 
+/// Records one normalized path; two spellings of the same path in one
+/// snapshot would otherwise be planned twice and charged twice while the
+/// commit inserts only the last, drifting the usage counter.
+fn push_seen(seen: &mut BTreeSet<String>, key: String) -> FsResult<()> {
+    if seen.insert(key.clone()) {
+        return Ok(());
+    }
+    Err(format!("duplicate path in snapshot: {}", key))
+}
+
 /// Serializes the tree. Path keys and the `dirs` list come out sorted
 /// because both containers are B-trees.
 pub(crate) fn encode(
@@ -74,9 +84,24 @@ fn parse_v2(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapsh
         .get("files")
         .and_then(|v| v.as_object())
         .ok_or("invalid snapshot: files must be an object")?;
+    // Count before decoding anything: an over-cap snapshot is refused
+    // before the host has normalized or materialized its entries.
+    let dirs_len = match obj.get("dirs") {
+        Some(v) => v
+            .as_array()
+            .ok_or("invalid snapshot: dirs must be an array")?
+            .len(),
+        None => 0,
+    };
+    if files.len() + dirs_len > MAX_ENTRIES {
+        return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
+    }
+    let mut seen = BTreeSet::new();
     let mut out = Vec::with_capacity(files.len());
     for (p, entry) in files {
-        out.push((normalize(p)?, entry_bytes(entry)?));
+        let key = normalize(p)?;
+        push_seen(&mut seen, key.clone())?;
+        out.push((key, entry_bytes(entry)?));
     }
     let mut dirs = BTreeSet::new();
     if let Some(v) = obj.get("dirs") {
@@ -85,22 +110,12 @@ fn parse_v2(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapsh
             let s = d
                 .as_str()
                 .ok_or("invalid snapshot: dirs entries must be strings")?;
-            dirs.insert(normalize(s)?);
+            let key = normalize(s)?;
+            push_seen(&mut seen, key.clone())?;
+            dirs.insert(key);
         }
     }
-    let snap = Snapshot { dirs, files: out };
-    check_entry_cap(&snap)?;
-    Ok(snap)
-}
-
-/// Fails as soon as the snapshot alone would fill the tree, so a hostile
-/// payload is rejected while it is being walked, not after it is built.
-fn check_entry_cap(snap: &Snapshot) -> FsResult<()> {
-    let entries = snap.dirs.len() + snap.files.len();
-    if entries > MAX_ENTRIES {
-        return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
-    }
-    Ok(())
+    Ok(Snapshot { dirs, files: out })
 }
 
 fn entry_bytes(entry: &serde_json::Value) -> FsResult<Vec<u8>> {
@@ -125,6 +140,10 @@ fn entry_bytes(entry: &serde_json::Value) -> FsResult<Vec<u8>> {
 /// flat filesystem tolerated; keys that then escape the root or break the
 /// path cap fail with an error that names them.
 fn parse_legacy(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapshot> {
+    if obj.len() > MAX_ENTRIES {
+        return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
+    }
+    let mut seen = BTreeSet::new();
     let mut files = Vec::with_capacity(obj.len());
     for (p, v) in obj {
         let s = v
@@ -135,14 +154,13 @@ fn parse_legacy(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Sn
         } else {
             normalize(&format!("/{}", p))?
         };
+        push_seen(&mut seen, key.clone())?;
         files.push((key, s.as_bytes().to_vec()));
     }
-    let snap = Snapshot {
+    Ok(Snapshot {
         dirs: BTreeSet::new(),
         files,
-    };
-    check_entry_cap(&snap)?;
-    Ok(snap)
+    })
 }
 
 /// Standard base64 with padding, strict on decode: `=` only in the final

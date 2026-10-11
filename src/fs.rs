@@ -1,14 +1,18 @@
 //! The RAM filesystem core: path normalization and the [`RamFs`] tree.
 //! Guest-facing callbacks live in [crate::fs_api]; the snapshot codec in
 //! [crate::snapshot]. Paths are normalized (`.`, `..`, duplicate and
-//! trailing slashes collapse) and always absolute; paths that would escape
-//! the root, or that contain U+FFFD (which is what lone UTF-16 surrogates
-//! become when converted, so allowing it would let two distinct guest
-//! strings name one file), are rejected.
+//! trailing slashes collapse) and always absolute, and paths that would
+//! escape the root are rejected. (Lone surrogates in a guest path are
+//! caught at the conversion layer in [crate::fs_api], where the raw
+//! UTF-16 is still visible.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) type FsResult<T> = Result<T, String>;
+
+/// Error for impossible usage arithmetic (checked everywhere so a bug
+/// cannot wrap the counter past the quota).
+const ACCOUNTING: &str = "fs accounting overflow";
 
 /// Flat bookkeeping cost per entry on top of its key and content bytes.
 pub(crate) const ENTRY_OVERHEAD: u64 = 64;
@@ -48,12 +52,6 @@ pub(crate) fn usage(files: &BTreeMap<String, Vec<u8>>, dirs: &BTreeSet<String>) 
 pub(crate) fn normalize(path: &str) -> FsResult<String> {
     if path.contains('\0') {
         return Err(format!("path contains NUL: {}", path));
-    }
-    if path.contains('\u{fffd}') {
-        return Err(format!(
-            "path contains U+FFFD (lone surrogates are rejected): {}",
-            path
-        ));
     }
     if !path.starts_with('/') {
         return Err(format!("path must be absolute: {}", path));
@@ -139,7 +137,9 @@ struct WritePlan {
     new_file: usize,
 }
 
-/// What a rename will do once committed.
+/// What a rename will do once committed. `used_delta` is the re-keying
+/// delta only (shorter keys free bytes); destination removals are
+/// refunded separately when the plan commits.
 struct RenamePlan {
     from: String,
     to: String,
@@ -178,6 +178,33 @@ impl RamFs {
             quota,
             used: 0,
         }
+    }
+
+    /// Checked usage bookkeeping: an overflow or underflow is a bug, not
+    /// something a guest should be able to trigger, so it surfaces as an
+    /// error instead of wrapping around the quota.
+    fn charge(&mut self, delta: u64) -> FsResult<()> {
+        self.used = self
+            .used
+            .checked_add(delta)
+            .ok_or_else(|| ACCOUNTING.to_string())?;
+        Ok(())
+    }
+
+    fn refund(&mut self, delta: u64) -> FsResult<()> {
+        self.used = self
+            .used
+            .checked_sub(delta)
+            .ok_or_else(|| ACCOUNTING.to_string())?;
+        Ok(())
+    }
+
+    fn charge_signed(&mut self, delta: i64) -> FsResult<()> {
+        self.used = self
+            .used
+            .checked_add_signed(delta)
+            .ok_or_else(|| ACCOUNTING.to_string())?;
+        Ok(())
     }
 
     fn entries(&self) -> usize {
@@ -314,8 +341,7 @@ impl RamFs {
         } = plan;
         self.insert_dirs(missing);
         self.files.insert(path, data);
-        self.used += add - old;
-        Ok(())
+        self.charge_signed(add as i64 - old as i64)
     }
 
     /// `recursive` mirrors Node: missing parents are created, and an
@@ -346,8 +372,7 @@ impl RamFs {
         self.reserve(self.used + add, self.entries() + count)?;
         self.insert_dirs(missing);
         self.dirs.insert(p);
-        self.used += add;
-        Ok(())
+        self.charge(add)
     }
 
     /// Unlike the mutating calls, a nonsense path here just means "no".
@@ -405,8 +430,7 @@ impl RamFs {
             return Err("cannot remove root".to_string());
         }
         if let Some(data) = self.files.remove(&p) {
-            self.used -= file_cost(&p, data.len());
-            return Ok(());
+            return self.refund(file_cost(&p, data.len()));
         }
         if !self.is_dir(&p) {
             return Err(format!("no such file: {}", p));
@@ -428,8 +452,7 @@ impl RamFs {
             self.dirs.remove(&d);
         }
         self.dirs.remove(&p);
-        self.used -= freed;
-        Ok(())
+        self.refund(freed)
     }
 
     /// POSIX-shaped rename: a file replaces a file, a directory moves onto
@@ -462,17 +485,7 @@ impl RamFs {
         if from_is_dir && t.starts_with(&child_prefix(f)) {
             return Err(format!("cannot rename a directory into itself: {}", t));
         }
-        let dest_is_file = self.files.contains_key(t);
-        let dest_is_dir = self.is_dir(t);
-        if dest_is_file && from_is_dir {
-            return Err(format!("not a directory: {}", t));
-        }
-        if dest_is_dir && !from_is_dir {
-            return Err(format!("is a directory: {}", t));
-        }
-        if dest_is_dir && !self.child_names(t).is_empty() {
-            return Err(format!("directory not empty: {}", t));
-        }
+        let (dest_is_file, dest_is_dir) = self.check_rename_dest(t, from_is_dir)?;
         let key_growth = if from_is_dir {
             self.subtree_key_growth(f, t)?
         } else {
@@ -488,6 +501,23 @@ impl RamFs {
             dest_is_dir,
             used_delta: key_growth,
         })
+    }
+
+    /// Kind rules for the destination: a file may replace a file, a
+    /// directory may move onto an empty directory, anything else errors.
+    fn check_rename_dest(&self, t: &str, from_is_dir: bool) -> FsResult<(bool, bool)> {
+        let dest_is_file = self.files.contains_key(t);
+        let dest_is_dir = self.is_dir(t);
+        if dest_is_file && from_is_dir {
+            return Err(format!("not a directory: {}", t));
+        }
+        if dest_is_dir && !from_is_dir {
+            return Err(format!("is a directory: {}", t));
+        }
+        if dest_is_dir && !self.child_names(t).is_empty() {
+            return Err(format!("directory not empty: {}", t));
+        }
+        Ok((dest_is_file, dest_is_dir))
     }
 
     /// Bytes freed by dropping the destination (a replaced file or the
@@ -509,36 +539,38 @@ impl RamFs {
             return Ok(());
         }
         let entries_after = self.entries() - usize::from(dest_is_file);
-        self.reserve((self.used as i64 + net) as u64, entries_after)
+        let used_after = self
+            .used
+            .checked_add_signed(net)
+            .ok_or_else(|| ACCOUNTING.to_string())?;
+        self.reserve(used_after, entries_after)
     }
 
     fn commit_rename(&mut self, plan: RenamePlan) -> FsResult<()> {
         if plan.dest_is_file {
             if let Some(data) = self.files.remove(&plan.to) {
-                self.used -= file_cost(&plan.to, data.len());
+                self.refund(file_cost(&plan.to, data.len()))?;
             }
         }
         if plan.dest_is_dir {
             self.dirs.remove(&plan.to);
-            self.used -= dir_cost(&plan.to);
+            self.refund(dir_cost(&plan.to))?;
         }
         if plan.from_is_dir {
             self.move_subtree(&plan.from, &plan.to);
         } else if let Some(data) = self.files.remove(&plan.from) {
             self.files.insert(plan.to, data);
         }
-        self.used = (self.used as i64 + plan.used_delta) as u64;
-        Ok(())
+        self.charge_signed(plan.used_delta)
     }
 
     /// Sum of (new key length - old key length) over every entry a
-    /// directory rename re-keys, the directory itself included. Refuses
-    /// re-keyed paths past the length cap before any mutation.
+    /// directory rename re-keys, the directory itself included, for
+    /// growth of either sign - shrinking keys frees quota, and the usage
+    /// must follow. Re-keyed paths past the length cap are refused before
+    /// any mutation, but only when the keys actually grow.
     fn subtree_key_growth(&self, from: &str, to: &str) -> FsResult<i64> {
         let growth = to.len() as i64 - from.len() as i64;
-        if growth <= 0 {
-            return Ok(0);
-        }
         let prefix = child_prefix(from);
         let mut count = 1; // `from` itself is re-keyed to `to`
         let keys = self
@@ -553,7 +585,7 @@ impl RamFs {
             }
             count += 1;
         }
-        Ok(growth * count)
+        Ok(growth.saturating_mul(count))
     }
 
     /// Re-keys a directory subtree under a new path.
@@ -575,10 +607,12 @@ impl RamFs {
     /// Restores a snapshot, merging into the current state. All-or-nothing:
     /// a snapshot that would break the caps or the quota, or that clashes
     /// with existing entries, changes nothing. With a quota set, a payload
-    /// larger than four quotas plus 1 MiB is rejected before parsing, so a
-    /// hostile snapshot cannot make the host allocate unboundedly.
+    /// larger than six quotas plus 1 MiB is rejected before parsing: JSON
+    /// escapes control characters to six bytes each, so a snapshot of a
+    /// full-quota filesystem always fits under the gate, while a hostile
+    /// payload still cannot make the host allocate unboundedly.
     pub(crate) fn restore(&mut self, json: &str) -> FsResult<()> {
-        if self.quota != 0 && json.len() as u64 > self.quota.saturating_mul(4).saturating_add(1 << 20)
+        if self.quota != 0 && json.len() as u64 > self.quota.saturating_mul(6).saturating_add(1 << 20)
         {
             return Err(format!(
                 "snapshot too large for the quota ({} bytes)",
@@ -601,8 +635,7 @@ impl RamFs {
         for (p, bytes) in snap.files {
             self.files.insert(p, bytes);
         }
-        self.used = (self.used as i64 + plan.used_delta) as u64;
-        Ok(())
+        self.charge_signed(plan.used_delta)
     }
 
     /// The delta a restore would apply: new directories, replaced and
@@ -673,9 +706,7 @@ mod tests {
         assert_eq!(normalize("a/b").unwrap_err(), "path must be absolute: a/b");
         assert_eq!(normalize("///").unwrap(), "/");
         assert!(normalize("/a/\0").unwrap_err().starts_with("path contains NUL"));
-        assert!(normalize("/a/\u{fffd}")
-            .unwrap_err()
-            .starts_with("path contains U+FFFD"));
+        assert_eq!(normalize("/a/\u{fffd}").unwrap(), "/a/\u{fffd}");
     }
 
     #[test]
@@ -1003,32 +1034,71 @@ mod tests {
         let mut f = RamFs::new(1024);
         let big = format!(
             "{{\"version\":2,\"files\":{{\"/x\":{{\"b64\":\"{}\"}}}}}}",
-            "A".repeat(4 * 1024 + (1 << 20) + 8)
+            "A".repeat(6 * 1024 + (1 << 20) + 8)
         );
         let err = f.restore(&big).unwrap_err();
         assert!(err.starts_with("snapshot too large for the quota"), "{}", err);
         assert!(f.list("/").unwrap().is_empty());
         // just under the wire parses, then fails on the content quota
-        let edge = "A".repeat(4 * 1024 + (1 << 20) - 128);
+        let edge = "A".repeat(6 * 1024 + (1 << 20) - 128);
         let snap = format!("{{\"version\":2,\"files\":{{\"/x\":{{\"b64\":\"{}\"}}}}}}", edge);
         assert_eq!(f.restore(&snap).unwrap_err(), "fs quota exceeded");
     }
 
     #[test]
-    fn restore_enforces_the_entry_cap_while_walking() {
-        let mut files = String::from("{\"version\":2,\"files\":{");
-        for i in 0..=MAX_ENTRIES {
-            files.push_str(&format!(
-                "\"/f{}\":{{\"text\":\"\"}}{}",
-                i,
-                if i == MAX_ENTRIES { "" } else { "," }
-            ));
+    fn restore_rejects_snapshots_past_the_entry_cap_at_parse_time() {
+        // One deliberately broken entry sorts first: if the count were
+        // not taken up front, walking would fail with a path error
+        // instead of the entry limit.
+        let mut files = String::from("{\"version\":2,\"files\":{\"!!relative!!\":{\"text\":\"\"},");
+        for i in 0..MAX_ENTRIES {
+            files.push_str(&format!("\"/f{}\":{{\"text\":\"\"}},", i));
         }
-        files.push_str("},\"dirs\":[]}");
+        files.push_str("\"/last\":{\"text\":\"\"}},\"dirs\":[]}");
         let mut f = fs();
         let err = f.restore(&files).unwrap_err();
         assert!(err.contains("fs entry limit exceeded"), "{}", err);
         assert!(f.list("/").unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_normalized_keys() {
+        let mut f = RamFs::new(1000);
+        f.write("/a", vec![0u8; 900]).unwrap();
+        // Two spellings of one path must not double-charge or shrink /a.
+        let dup = r#"{"version":2,"files":{"/a":{"text":"y"},"//a":{"text":"z"}}}"#;
+        assert_eq!(f.restore(dup).unwrap_err(), "duplicate path in snapshot: /a");
+        assert_eq!(f.read_bytes("/a").unwrap().len(), 900); // unchanged
+        assert_eq!(f.used, usage(&f.files, &f.dirs));
+        // legacy duplicates collide after relative prefixing, too
+        assert_eq!(
+            f.restore(r#"{"b":"1","/b":"2"}"#).unwrap_err(),
+            "duplicate path in snapshot: /b"
+        );
+        // a file and a dir spelling the same path are duplicates as well
+        assert_eq!(
+            f.restore(r#"{"version":2,"files":{"/c":{"text":"1"}},"dirs":["//c"]}"#)
+                .unwrap_err(),
+            "duplicate path in snapshot: /c"
+        );
+        assert_eq!(f.used, usage(&f.files, &f.dirs));
+    }
+
+    #[test]
+    fn rename_cycles_do_not_drift_the_usage() {
+        let mut f = fs();
+        let long = format!("/{}", "a".repeat(2000));
+        f.mkdir(&long, true).unwrap();
+        for i in 0..20 {
+            f.write(&format!("{}/f{}", long, i), Vec::new()).unwrap();
+        }
+        // Shrinking must free key bytes, growing must charge them back.
+        for _ in 0..50 {
+            f.rename(&long, "/b").unwrap();
+            assert_eq!(f.used, usage(&f.files, &f.dirs));
+            f.rename("/b", &long).unwrap();
+            assert_eq!(f.used, usage(&f.files, &f.dirs));
+        }
     }
 
     #[test]

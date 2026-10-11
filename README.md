@@ -26,6 +26,8 @@ repo.
     make check   # build, then scripted smoke checks over the examples
     make ci      # test, then clippy, then check, in that order; stops at the first failure
                  # CI runs make ci CARGOFLAGS=--locked (.github/workflows/ci.yml)
+    make test-heavy # the #[ignore]d memory-heavy tests (multi-hundred-megabyte
+                 # guests probing V8's string limit); not part of ci
 
 Environment overrides: CARGO selects the cargo binary (default cargo), and
 CARGO_TARGET_DIR relocates all build output (default target; set it as an
@@ -46,6 +48,8 @@ and is not set by this repo.
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
 - uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
+- "--dump" failure (snapshot too large, or the file cannot be written)
+  exits 74 when the guest itself exited 0; a failed guest keeps its own code
 
 ## Library API
 
@@ -93,15 +97,16 @@ WebAssembly, Intl/ICU, and all of ES2023 are available.
 A RAM-only tree of directories and byte-valued files. Paths are
 normalized (`.`, `..`, duplicate and trailing slashes collapse) and must
 be absolute; a path that would climb out of the root throws, and
-`exists` just returns false for it. Paths containing U+FFFD are rejected
-(lone UTF-16 surrogates convert to U+FFFD, so allowing the character
-would let two distinct guest strings name one file). If a path argument's
-`toString` throws, that exception propagates. Writing a file creates its
-missing parent directories.
+`exists` just returns false for it. Paths containing lone UTF-16
+surrogates throw "path contains lone surrogates" (Rust cannot represent
+them, and silently converting to U+FFFD would let two distinct guest
+strings name one file); a genuinely typed U+FFFD character is a legal
+path byte. If a path argument's `toString` throws, that exception
+propagates. Writing a file creates its missing parent directories.
 
 | API | Description |
 |---|---|
-| vm.fs.write(path, data) | write a file; data is a string, an ArrayBuffer (shared buffers included), or a typed array / DataView (a view stores only the bytes it can see; detached buffers and views left out of bounds by a resize throw); an existing file is replaced wholesale; the length of buffer data is checked against the quota before anything is copied |
+| vm.fs.write(path, data) | write a file; data is a string, an ArrayBuffer (shared buffers included), or a typed array / DataView; an existing file is replaced wholesale. The data's length (UTF-8 length for strings) is checked against the quota before anything is copied. A detached buffer or view throws; a view left out of bounds by a resizable-buffer shrink behaves exactly as JS shows it (length zero) and writes an empty file |
 | vm.fs.read(path) | read as a string; bytes that are not valid UTF-8 come back as U+FFFD; files larger than V8's string limit throw |
 | vm.fs.readBytes(path) | read as a Uint8Array |
 | vm.fs.list(dir) | recursive listing of file paths under dir, full paths, sorted; directories are not listed |
@@ -134,11 +139,17 @@ root-relative, and keys that then escape the root or break the path cap
 fail naming the key — so --preload files written by earlier versions
 keep working; restore materializes parent directories of every restored
 entry and never replaces an existing file with a directory or vice
-versa. A snapshot naming any other `version` fails with "unsupported
-snapshot version <v>". When a quota is set, restore refuses a payload
-larger than four quotas plus 1 MiB before parsing it. Version 2 dumps
-are not loadable by older v8vm versions, which would see files named
-"version", "files" and "dirs".
+versa, and two spellings of one path in a single snapshot ("/a" and
+"//a", or a legacy "b" and "/b") fail with "duplicate path in snapshot".
+A snapshot naming any other `version` fails with "unsupported snapshot
+version <v>". When a quota is set, restore refuses a payload larger than
+six quotas plus 1 MiB before parsing it (JSON escapes control characters
+to six bytes each, so a full-quota filesystem of them still restores
+from its own snapshot). Version 2 dumps are not loadable by older v8vm
+versions, which would see files named "version", "files" and "dirs" -
+and for the same reason a legacy flat map that contains a file literally
+named "version" parses as a versioned snapshot here, not as a file
+list. Legacy-key errors show the "/"-prefixed key.
 
 ## HTTP bridge
 
