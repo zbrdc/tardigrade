@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 autobins = true
 autoexamples = false
-autotests = false
 
 [dependencies]
 v8 = "0.106.0"

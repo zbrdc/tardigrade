@@ -1,66 +1,141 @@
 //! Tests for `--sandbox`. This target has no libtest harness (`harness =
 //! false`): `sandbox::apply` refuses to run once any thread exists and libtest
 //! always runs tests on a worker thread, so each probe re-executes this same
-//! binary as a single-threaded child with a mode argument:
+//! binary as a single-threaded child.
+//!
+//! Test selection follows libtest where it matters. Positional arguments are
+//! substring filters (`--exact` makes them whole names), `--skip <name>`
+//! removes cases, `--list` prints the case names and exits 0, and every other
+//! `-` flag (`--nocapture`, `--test-threads=1`) is ignored. A filter that
+//! matches nothing is not an error and exits 0 with a "0 run" line: cargo
+//! hands `cargo test <name>` to every test target, so the name of a test in
+//! another target must not fail this one. Only an unfiltered run in which
+//! nothing ran fails.
+//!
+//! Probe modes are children of this binary started as
+//! `--probe-mode=<mode> [args]`. The prefix keeps them from colliding with
+//! test-name filters (a bare `x32` filter once selected the mode that kills
+//! the process):
 //!
 //!   probe <dump> <escape_dir>   full sandbox, then probe syscalls
 //!   landlock-only <dump> <dir>  Landlock layer alone
 //!   seccomp-only <dump> <dir>   seccomp layer alone
 //!   late-thread | late-v8       apply too late (refused)
 //!   no-landlock | no-seccomp    kernel feature missing (refused)
+//!   x32 | int80 | int80-bare    foreign-ABI syscall (killed / host check)
+//!   old-kernel <case>...        run cases on a kernel without Landlock
 //!
 //! Probe output is "PROBE|<name>|<outcome>" with outcome `ok`, `skipped`, or
 //! `errno=<n>` (the raw errno, so a test can tell Landlock's EACCES from
 //! seccomp's EPERM).
+//!
+//! Kernel support: cases that need the full Landlock ABI 6 print "SKIPPED
+//! (kernel lacks Landlock ABI 6): <case>" on stderr and pass when the kernel
+//! lacks it. The fail-closed cases fake the missing feature themselves and
+//! run everywhere. V8VM_REQUIRE_SANDBOX=1 turns every such skip into a
+//! failure.
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod common;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod run {
+    use crate::common;
     use std::collections::BTreeMap;
     use std::convert::TryInto;
     use std::ffi::CString;
-    use std::path::{Path, PathBuf};
     use std::os::unix::process::ExitStatusExt;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::time::{Duration, Instant};
+    use v8vm::sandbox::{apply_layer, Layer};
+
+    const PROBE_PREFIX: &str = "--probe-mode=";
+    /// Set on the children the harness case spawns, so they do not run the
+    /// harness case again (the process chain would never end).
+    const HARNESS_CHILD: &str = "V8VM_SANDBOX_HARNESS_CHILD";
 
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if !dispatch_mode(&args) {
-            // cargo forwards libtest-style flags (--nocapture,
-            // --test-threads=1) to every test target; they are not filters.
-            let filter = args.iter().find(|a| !a.starts_with('-')).map(String::as_str);
-            std::process::exit(run_tests(filter));
+        match args.first().and_then(|a| a.strip_prefix(PROBE_PREFIX)) {
+            Some(mode) => run_probe_mode(mode, &args[1..]),
+            None => std::process::exit(run_tests(&Options::parse(&args))),
+        }
+    }
+
+    // ---- test selection ----
+
+    /// Flags that take a separate value in libtest; the value is not a filter.
+    const VALUE_FLAGS: [&str; 5] = ["--test-threads", "--format", "--color", "--logfile", "--shuffle-seed"];
+
+    #[derive(Default)]
+    struct Options {
+        list: bool,
+        exact: bool,
+        filters: Vec<String>,
+        skips: Vec<String>,
+    }
+
+    impl Options {
+        fn parse(args: &[String]) -> Options {
+            let mut opts = Options::default();
+            let mut rest = args.iter();
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--list" => opts.list = true,
+                    "--exact" => opts.exact = true,
+                    "--skip" => opts.skips.extend(rest.next().cloned()),
+                    flag if VALUE_FLAGS.contains(&flag) => {
+                        rest.next();
+                    }
+                    flag if flag.starts_with("--skip=") => opts.skips.push(flag[7..].to_string()),
+                    flag if flag.starts_with('-') => {}
+                    filter => opts.filters.push(filter.to_string()),
+                }
+            }
+            opts
+        }
+
+        fn selects(&self, name: &str) -> bool {
+            let hit = |pattern: &String| {
+                if self.exact {
+                    name == pattern
+                } else {
+                    name.contains(pattern.as_str())
+                }
+            };
+            (self.filters.is_empty() || self.filters.iter().any(hit)) && !self.skips.iter().any(hit)
         }
     }
 
     // ---- probe modes (run in a fresh, single-threaded child) ----
 
-    fn dispatch_mode(args: &[String]) -> bool {
-        let mode = match args.first() {
-            Some(m) => m.as_str(),
-            None => return false,
-        };
-        let path = |i: usize| PathBuf::from(&args[i]);
+    fn run_probe_mode(mode: &str, rest: &[String]) {
+        let path = |i: usize| PathBuf::from(&rest[i]);
         match mode {
-            "probe" => mode_apply(None, path(1), path(2)),
-            "landlock-only" => mode_apply(Some(v8vm::sandbox::Layer::Landlock), path(1), path(2)),
-            "seccomp-only" => mode_apply(Some(v8vm::sandbox::Layer::Seccomp), path(1), path(2)),
+            "probe" => mode_apply(None, path(0), path(1)),
+            "landlock-only" => mode_apply(Some(Layer::Landlock), path(0), path(1)),
+            "seccomp-only" => mode_apply(Some(Layer::Seccomp), path(0), path(1)),
             "late-thread" => mode_late_thread(),
             "late-v8" => mode_late_v8(),
             "no-landlock" => mode_missing("no-landlock", libc::SYS_landlock_create_ruleset),
             "no-seccomp" => mode_missing("no-seccomp", libc::SYS_seccomp),
-            "x32" => mode_foreign_abi(AbiCall::X32),
-            "int80" => mode_foreign_abi(AbiCall::Int80),
-            _ => return false,
+            "x32" => mode_x32(),
+            "int80" => mode_int80(),
+            "int80-bare" => mode_int80_bare(),
+            "old-kernel" => std::process::exit(mode_old_kernel(rest)),
+            other => {
+                eprintln!("unknown probe mode {:?}", other);
+                std::process::exit(2);
+            }
         }
-        true
     }
 
-    fn mode_apply(layer: Option<v8vm::sandbox::Layer>, dump: PathBuf, escape_dir: PathBuf) {
+    fn mode_apply(layer: Option<Layer>, dump: PathBuf, escape_dir: PathBuf) {
         println!("PROBE|threads|{}", thread_count());
         let applied = match layer {
             None => v8vm::sandbox::apply(Some(&dump)),
-            Some(layer) => v8vm::sandbox::apply_layer(layer, Some(&dump)),
+            Some(layer) => apply_layer(layer, Some(&dump)),
         };
         if let Err(e) = applied {
             println!("PROBE|apply|refused:{}", e);
@@ -74,49 +149,57 @@ mod run {
         report("thr-", &in_thread);
     }
 
-    /// Which foreign syscall ABI the mode should invoke after apply. Both
-    /// must kill the process with SIGSYS through the stacked x32 guard:
-    /// seccomp acts before syscall dispatch, so this is testable even on a
-    /// host whose kernel would otherwise reject the call.
-    enum AbiCall {
-        X32,
-        Int80,
+    /// A syscall number in the x32 range (nr | 0x40000000) must be killed by
+    /// the stacked guard with SIGSYS. Seccomp acts before syscall dispatch,
+    /// so this is testable even on a host whose kernel would reject the call.
+    fn mode_x32() {
+        apply_seccomp_only("abi-x32-dump.json");
+        println!("PROBE|x32|armed");
+        let rv = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
+        println!("PROBE|x32-getpid-survived|{}", raw(rv));
     }
 
-    fn mode_foreign_abi(call: AbiCall) {
-        let dump = scratch("abi-dump.json");
-        v8vm::sandbox::apply(Some(&dump)).expect("apply before the foreign-abi call");
-        match call {
-            AbiCall::X32 => {
-                println!("PROBE|x32|armed");
-                // A syscall number in the x32 range (nr | 0x40000000).
-                let rv = unsafe { libc::syscall(0x4000_0000 | libc::SYS_getpid) };
-                println!("PROBE|x32-getpid-survived|{}", raw(rv as libc::c_int));
-            }
-            AbiCall::Int80 => {
-                println!("PROBE|int80|armed");
-                // int 0x80 arrives with the i386 arch value; eax=20 is
-                // getpid. rbx cannot be an inline-asm operand on x86_64, so
-                // the caller-saved registers are preserved by hand.
-                unsafe {
-                    std::arch::asm!(
-                        "push rbx",
-                        "push rcx",
-                        "push rdx",
-                        "push rsi",
-                        "push rdi",
-                        "int $$0x80",
-                        "pop rdi",
-                        "pop rsi",
-                        "pop rdx",
-                        "pop rcx",
-                        "pop rbx",
-                        in("eax") 20u32,
-                        lateout("eax") _,
-                    );
-                }
-                println!("PROBE|int80-survived|ok");
-            }
+    /// `int 0x80` arrives with the i386 arch value and must be killed with
+    /// SIGSYS the same way, where the kernel delivers it to seccomp at all.
+    fn mode_int80() {
+        apply_seccomp_only("abi-int80-dump.json");
+        println!("PROBE|int80|armed");
+        int80_getpid();
+        println!("PROBE|int80-survived|ok");
+    }
+
+    /// The same call with no sandbox: tells the test whether this host's
+    /// kernel accepts `int 0x80` (ia32 emulation) in the first place.
+    fn mode_int80_bare() {
+        int80_getpid();
+        println!("PROBE|int80-bare|survived");
+    }
+
+    /// Only the x32 guard is under test, so the seccomp layer alone is
+    /// enough and the mode does not depend on Landlock support.
+    fn apply_seccomp_only(dump_name: &str) {
+        apply_layer(Layer::Seccomp, Some(&scratch(dump_name))).expect("apply before the foreign-abi call");
+    }
+
+    /// int 0x80 with eax=20 (i386 getpid). rbx cannot be an inline-asm
+    /// operand on x86_64, so the caller-saved registers are preserved by hand.
+    fn int80_getpid() {
+        unsafe {
+            std::arch::asm!(
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "int $$0x80",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                in("eax") 20u32,
+                lateout("eax") _,
+            );
         }
     }
 
@@ -139,7 +222,23 @@ mod run {
     /// with ENOSYS before apply runs, which must refuse, not run.
     fn mode_missing(name: &str, nr: libc::c_long) {
         install_errno_filter(nr, libc::ENOSYS);
-        report_apply(name, v8vm::sandbox::apply(None));
+        let applied = if name == "no-seccomp" && !common::kernel_supports_sandbox() {
+            // A full apply would stop at Landlock first on this kernel and
+            // hide the seccomp refusal under test.
+            apply_layer(Layer::Seccomp, None)
+        } else {
+            v8vm::sandbox::apply(None)
+        };
+        report_apply(name, applied);
+    }
+
+    /// Runs the named cases on a simulated kernel without Landlock: every
+    /// child it spawns inherits the ENOSYS filter too.
+    fn mode_old_kernel(case_names: &[String]) -> i32 {
+        install_errno_filter(libc::SYS_landlock_create_ruleset, libc::ENOSYS);
+        let mut args = vec!["--exact".to_string()];
+        args.extend(case_names.iter().cloned());
+        run_tests(&Options::parse(&args))
     }
 
     fn report_apply(name: &str, applied: Result<(), v8vm::sandbox::SandboxError>) {
@@ -167,142 +266,319 @@ mod run {
 
     // ---- probes ----
 
-    fn probe_all(dump: &Path, escape_dir: &Path) -> Vec<(String, String)> {
+    type Probe = (String, String);
+    /// A named call with no target, and one aimed at a pid.
+    type SelfProbe = (&'static str, fn() -> String);
+    type PidProbe = (&'static str, fn(i32) -> String);
+
+    fn probe(name: &str, outcome: String) -> Probe {
+        (name.to_string(), outcome)
+    }
+
+    fn probe_all(dump: &Path, escape_dir: &Path) -> Vec<Probe> {
         let parent = std::env::var("PROBE_PARENT").ok().and_then(|p| p.parse().ok());
-        let mut probes = vec![
-            ("read-etc-passwd".into(), io(std::fs::File::open("/etc/passwd").map(|_| ()))),
-            ("read-urandom".into(), io(std::fs::File::open("/dev/urandom").map(|_| ()))),
-            ("write-existing".into(), io(std::fs::write(escape_dir.join("escape.txt"), "x"))),
-            ("write-new".into(), io(std::fs::write(escape_dir.join("new.txt"), "x"))),
-            ("write-dump".into(), io(std::fs::write(dump, "{\"probe\":1}"))),
-            ("read-dump".into(), io(std::fs::File::open(dump).map(|_| ()))),
-            ("socket".into(), raw(unsafe {
-                libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0)
-            })),
-            ("exec".into(), probe_execve()),
-            ("fork".into(), syscall_outcome(unsafe { libc::fork() as libc::c_long })),
-            (
-                "clone-newuser".into(),
-                probe_clone((libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong),
-            ),
-            ("clone3".into(), probe_clone3()),
-            ("thread-spawn".into(), probe_thread()),
-            ("kill-self".into(), raw(unsafe { libc::kill(libc::getpid(), 0) })),
-            ("kill-parent".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => raw(unsafe { libc::kill(pid, 0) }),
-            }),
-            ("tgkill-parent".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => raw(unsafe { libc::tgkill(pid, pid, 0) }),
-            }),
-            (
-                "ioctl-tiocsti".into(),
-                raw(unsafe { libc::ioctl(0, libc::TIOCSTI as libc::c_ulong, b'x' as *const u8) }),
-            ),
-            (
-                // The kernel ignores the high 32 bits of an ioctl request, so
-                // the deny must compare the low dword only.
-                "ioctl-tiocsti-hibit".into(),
-                raw(unsafe {
-                    libc::ioctl(0, (libc::TIOCSTI as libc::c_ulong) | 1 << 32, b'x' as *const u8)
-                }),
-            ),
-            (
-                "fcntl-setown-other".into(),
-                match parent {
-                    None => "skipped".to_string(),
-                    Some(pid) => raw(unsafe {
-                        libc::fcntl(pipe_w(), libc::F_SETOWN, pid)
-                    }),
-                },
-            ),
-            ("sigqueue-parent".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => {
-                    // seccomp denies on the pid argument before the kernel
-                    // ever validates the siginfo, so its content is moot.
-                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                    info.si_code = libc::SI_QUEUE;
-                    raw(unsafe {
-                        libc::syscall(libc::SYS_rt_sigqueueinfo, pid, 0, &info) as libc::c_int
-                    })
-                }
-            }),
-            ("rt-tgsigqueue-parent".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => {
-                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                    info.si_code = libc::SI_QUEUE;
-                    raw(unsafe {
-                        libc::syscall(libc::SYS_rt_tgsigqueueinfo, pid, pid, 0, &info) as libc::c_int
-                    })
-                }
-            }),
-            ("prlimit-parent".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => {
-                    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
-                    raw(unsafe {
-                        libc::syscall(libc::SYS_prlimit64, pid, libc::RLIMIT_NOFILE, 0, &mut rl)
-                            as libc::c_int
-                    })
-                }
-            }),
-            (
-                "prlimit-self".into(),
-                raw(unsafe {
-                    let mut rl: libc::rlimit = std::mem::zeroed();
-                    libc::syscall(libc::SYS_prlimit64, 0, libc::RLIMIT_NOFILE, 0, &mut rl)
-                        as libc::c_int
-                }),
-            ),
-            ("setpriority-other".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => raw(unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::c_uint, 5) }),
-            }),
-            ("sched-setaffinity-other".into(), match parent {
-                None => "skipped".to_string(),
-                Some(pid) => {
-                    let set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-                    raw(unsafe {
-                        libc::syscall(
-                            libc::SYS_sched_setaffinity,
-                            pid,
-                            std::mem::size_of::<libc::cpu_set_t>(),
-                            &set,
-                        ) as libc::c_int
-                    })
-                }
-            }),
-            (
-                "inotify-init".into(),
-                raw(unsafe { libc::inotify_init1(0) }),
-            ),
-            (
-                "inotify-watch".into(),
-                raw(unsafe { libc::inotify_add_watch(-1, c"/home".as_ptr(), 0xfff) }),
-            ),
-        ];
-        // clone shapes: a thread that also creates a namespace, and the
-        // vfork/CLONE_VM forms used to start another program.
-        let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as libc::c_ulong;
-        for (name, flag) in NAMESPACE_PROBE_FLAGS {
-            probes.push((
-                format!("clone-thread+{}", name),
-                probe_clone(thread | flag),
-            ));
+        let own_pid = unsafe { libc::getpid() };
+        let mut probes = fs_probes(dump, escape_dir);
+        for (name, call) in SELF_PROBES {
+            probes.push(probe(name, call()));
         }
-        probes.push((
-            "clone-vfork".into(),
-            probe_clone((libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as libc::c_ulong),
-        ));
-        probes.push((
-            "clone-vm-nothread".into(),
-            probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong),
-        ));
+        for (name, call) in PARENT_PROBES {
+            probes.push(probe(name, with_parent(parent, *call)));
+        }
+        // Process-scoped calls: allowed on the caller (as 0 and as its own
+        // pid), denied on another process.
+        for (name, call) in TARGET_PROBES {
+            probes.push(probe(&format!("{}-self-0", name), call(0)));
+            probes.push(probe(&format!("{}-self-pid", name), call(own_pid)));
+            probes.push(probe(&format!("{}-parent", name), with_parent(parent, *call)));
+        }
+        probes.extend(clone_probes());
         probes
     }
+
+    /// Probes aimed at the test process that spawned this child. Without a
+    /// parent pid they report `skipped`, which no expectation accepts.
+    fn with_parent(parent: Option<i32>, aim: fn(i32) -> String) -> String {
+        parent.map_or_else(|| "skipped".to_string(), aim)
+    }
+
+    fn fs_probes(dump: &Path, escape_dir: &Path) -> Vec<Probe> {
+        vec![
+            probe("read-etc-passwd", io(std::fs::File::open("/etc/passwd").map(|_| ()))),
+            probe("read-urandom", io(std::fs::File::open("/dev/urandom").map(|_| ()))),
+            probe("write-existing", io(std::fs::write(escape_dir.join("escape.txt"), "x"))),
+            probe("write-new", io(std::fs::write(escape_dir.join("new.txt"), "x"))),
+            probe("write-dump", io(std::fs::write(dump, "{\"probe\":1}"))),
+            probe("read-dump", io(std::fs::File::open(dump).map(|_| ()))),
+        ]
+    }
+
+    /// Probes that need no other process. Argument-less denials are exercised
+    /// with arguments that name nothing real, so a missing rule shows up as
+    /// a different errno (EBADF, ESRCH, ENOENT) rather than as damage.
+    const SELF_PROBES: &[SelfProbe] = &[
+        ("socket", || raw(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) })),
+        ("exec", probe_execve),
+        ("fork", || syscall_outcome(unsafe { libc::fork() as libc::c_long })),
+        ("sys-fork", || probe_raw_process(libc::SYS_fork)),
+        ("sys-vfork", || probe_raw_process(libc::SYS_vfork)),
+        ("clone-newuser", || probe_clone((libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong)),
+        ("clone3", probe_clone3),
+        ("thread-spawn", probe_thread),
+        ("kill-self", || raw(unsafe { libc::kill(libc::getpid(), 0) })),
+        ("ioctl-tiocsti", || raw(unsafe { libc::ioctl(0, libc::TIOCSTI as libc::c_ulong, b'x' as *const u8) })),
+        // The kernel ignores the high 32 bits of an ioctl request, so the
+        // deny must compare the low dword only.
+        ("ioctl-tiocsti-hibit", || {
+            raw(unsafe { libc::ioctl(0, (libc::TIOCSTI as libc::c_ulong) | 1 << 32, b'x' as *const u8) })
+        }),
+        ("fcntl-setsig", || on_pipe(|fd| raw(unsafe { libc::fcntl(fd, F_SETSIG, libc::SIGUSR1) }))),
+        ("inotify-init", || raw(unsafe { libc::inotify_init1(0) })),
+        ("inotify-watch", || raw(unsafe { libc::inotify_add_watch(-1, c"/home".as_ptr(), 0xfff) })),
+        ("fanotify-init", || sys(libc::SYS_fanotify_init, [(libc::FAN_CLASS_NOTIF | libc::FAN_REPORT_FID) as _, 0, 0, 0, 0])),
+        ("fanotify-mark", || {
+            let path = addr(c"/".as_ptr());
+            sys(libc::SYS_fanotify_mark, [-1, libc::FAN_MARK_ADD as _, 0, libc::AT_FDCWD as _, path])
+        }),
+        ("mq-open", || sys(libc::SYS_mq_open, [addr(c"/v8vm-probe-none".as_ptr()), libc::O_RDONLY as _, 0, 0, 0])),
+        ("mq-timedsend", || sys(libc::SYS_mq_timedsend, [-1, addr(c"x".as_ptr()), 1, 0, 0])),
+        ("mq-timedreceive", || {
+            let mut buf = [0u8; 8192];
+            sys(libc::SYS_mq_timedreceive, [-1, addr(buf.as_mut_ptr()), buf.len() as _, 0, 0])
+        }),
+        ("mq-notify", || sys(libc::SYS_mq_notify, [-1, 0, 0, 0, 0])),
+        ("mq-getsetattr", || sys(libc::SYS_mq_getsetattr, [-1, 0, 0, 0, 0])),
+        // Group- and user-wide targets that match no process. The group
+        // probes use the caller's own pid as the group id, which passes the
+        // "who" check, so only the "which" check can deny them (and no
+        // group has that id, so a missing rule changes nothing).
+        ("setpriority-pgrp", || {
+            let pgid = unsafe { libc::getpid() } as libc::id_t;
+            raw(unsafe { libc::setpriority(libc::PRIO_PGRP, pgid, current_nice()) })
+        }),
+        ("ioprio-set-pgrp", || {
+            sys(libc::SYS_ioprio_set, [IOPRIO_WHO_PGRP, unsafe { libc::getpid() } as _, 0, 0, 0])
+        }),
+        ("setpriority-user", || {
+            raw(unsafe { libc::setpriority(libc::PRIO_USER, UNUSED_ID, current_nice()) })
+        }),
+        ("ioprio-set-user", || sys(libc::SYS_ioprio_set, [IOPRIO_WHO_USER, UNUSED_ID as _, 0, 0, 0])),
+    ];
+
+    /// An id (pgid or uid) that no process has.
+    const UNUSED_ID: libc::id_t = 4_000_000_000;
+    /// linux/ioprio.h: `which` values for ioprio_set.
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_WHO_PGRP: libc::c_long = 2;
+    const IOPRIO_WHO_USER: libc::c_long = 3;
+    /// fcntl(2) values libc does not define for x86_64 Linux.
+    const F_SETSIG: libc::c_int = 10;
+    const F_SETOWN_EX: libc::c_int = 15;
+    const F_OWNER_PID: libc::c_int = 1;
+    /// ioctl spellings of F_SETOWN (linux/sockios.h, asm-generic/ioctls.h).
+    const FIOSETOWN: libc::c_ulong = 0x8901;
+    const SIOCSPGRP: libc::c_ulong = 0x8902;
+
+    /// Probes aimed at the parent test process, which seccomp must refuse and
+    /// which the Landlock scopes refuse too (SCOPED_PARENT).
+    const PARENT_PROBES: &[PidProbe] = &[
+        ("kill-parent", |pid| raw(unsafe { libc::kill(pid, 0) })),
+        ("tgkill-parent", |pid| raw(unsafe { libc::tgkill(pid, pid, 0) })),
+        ("tkill-parent", |pid| sys(libc::SYS_tkill, [pid as _, 0, 0, 0, 0])),
+        // Seccomp denies on the pid argument before the kernel validates the
+        // siginfo, so its content is moot.
+        ("sigqueue-parent", |pid| {
+            let info = queue_info();
+            sys(libc::SYS_rt_sigqueueinfo, [pid as _, 0, addr(&info), 0, 0])
+        }),
+        ("rt-tgsigqueue-parent", |pid| {
+            let info = queue_info();
+            sys(libc::SYS_rt_tgsigqueueinfo, [pid as _, pid as _, 0, addr(&info), 0])
+        }),
+        ("fcntl-setown-parent", |pid| on_pipe(|fd| raw(unsafe { libc::fcntl(fd, libc::F_SETOWN, pid) }))),
+        ("fcntl-setown-ex-parent", |pid| {
+            let owner = [F_OWNER_PID, pid]; // struct f_owner_ex { int type; pid_t pid; }
+            on_pipe(|fd| raw(unsafe { libc::fcntl(fd, F_SETOWN_EX, owner.as_ptr()) }))
+        }),
+        ("ioctl-fiosetown-parent", |pid| on_pipe(|fd| raw(unsafe { libc::ioctl(fd, FIOSETOWN, &pid) }))),
+        ("ioctl-siocspgrp-parent", |pid| on_pipe(|fd| raw(unsafe { libc::ioctl(fd, SIOCSPGRP, &pid) }))),
+        ("mq-unlink-parent", |pid| {
+            // The raw syscall takes the name without its leading slash, and
+            // glibc's mq_unlink would turn EPERM into EACCES.
+            let name = CString::new(fixture_queue_name(pid)).expect("queue name");
+            sys(libc::SYS_mq_unlink, [addr(name.as_ptr().wrapping_add(1)), 0, 0, 0, 0])
+        }),
+        ("connect-abstract-parent", |pid| {
+            let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            if sock < 0 {
+                return errno_last();
+            }
+            let (address, len) = abstract_addr(pid);
+            let rv = unsafe { libc::connect(sock, &address as *const _ as *const libc::sockaddr, len) };
+            let outcome = raw(rv);
+            unsafe { libc::close(sock) };
+            outcome
+        }),
+    ];
+
+    /// Process-scoped calls: they must work on the caller and be refused for
+    /// another process. Each takes the target pid.
+    const TARGET_PROBES: &[PidProbe] = &[
+        ("prlimit", prlimit),
+        ("sched-setscheduler", sched_setscheduler),
+        ("sched-setattr", sched_setattr),
+        ("sched-setparam", sched_setparam),
+        ("sched-setaffinity", sched_setaffinity),
+        ("setpriority", |pid| {
+            raw(unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, current_nice()) })
+        }),
+        ("ioprio-set", |pid| sys(libc::SYS_ioprio_set, [IOPRIO_WHO_PROCESS, pid as _, 0, 0, 0])),
+    ];
+
+    /// A raw syscall with up to five integer arguments (pointers as
+    /// addresses); the kernel ignores the ones a call does not use.
+    fn sys(nr: libc::c_long, args: [libc::c_long; 5]) -> String {
+        raw(unsafe { libc::syscall(nr, args[0], args[1], args[2], args[3], args[4]) })
+    }
+
+    fn addr<T>(pointer: *const T) -> libc::c_long {
+        pointer as libc::c_long
+    }
+
+    fn queue_info() -> libc::siginfo_t {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_code = libc::SI_QUEUE;
+        info
+    }
+
+    /// The current nice value, so a priority call that is allowed never
+    /// lowers it (raising priority needs privilege) and never touches the
+    /// harness when a missing rule lets it reach the parent.
+    fn current_nice() -> libc::c_int {
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+    }
+
+    fn prlimit(pid: i32) -> String {
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        sys(libc::SYS_prlimit64, [pid as _, libc::RLIMIT_NOFILE as _, 0, addr(std::ptr::addr_of_mut!(limit)), 0])
+    }
+
+    fn sched_setscheduler(pid: i32) -> String {
+        let param = libc::sched_param { sched_priority: 0 };
+        sys(libc::SYS_sched_setscheduler, [pid as _, libc::SCHED_OTHER as _, addr(&param), 0, 0])
+    }
+
+    fn sched_setparam(pid: i32) -> String {
+        let param = libc::sched_param { sched_priority: 0 };
+        sys(libc::SYS_sched_setparam, [pid as _, addr(&param), 0, 0, 0])
+    }
+
+    /// struct sched_attr at its original (version 0) size.
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        policy: u32,
+        flags: u64,
+        nice: i32,
+        priority: u32,
+        runtime: u64,
+        deadline: u64,
+        period: u64,
+    }
+
+    fn sched_setattr(pid: i32) -> String {
+        let attr = SchedAttr {
+            size: std::mem::size_of::<SchedAttr>() as u32,
+            policy: libc::SCHED_OTHER as u32,
+            flags: 0,
+            nice: current_nice(),
+            priority: 0,
+            runtime: 0,
+            deadline: 0,
+            period: 0,
+        };
+        sys(libc::SYS_sched_setattr, [pid as _, addr(&attr), 0, 0, 0])
+    }
+
+    /// Re-applies the caller's own affinity mask, a no-op where allowed.
+    fn sched_setaffinity(pid: i32) -> String {
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        unsafe { libc::sched_getaffinity(0, size, &mut set) };
+        sys(libc::SYS_sched_setaffinity, [pid as _, size as _, addr(&set), 0, 0])
+    }
+
+    /// Runs `aim` on a fresh pipe write end (fd 0 is not a pipe), then closes it.
+    fn on_pipe(aim: impl FnOnce(libc::c_int) -> String) -> String {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return errno_last();
+        }
+        let outcome = aim(fds[1]);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        outcome
+    }
+
+    // ---- fixtures the probes aim at in the parent ----
+
+    fn fixture_queue_name(owner: i32) -> String {
+        format!("/v8vm-probe-{}", owner)
+    }
+
+    /// Abstract unix socket address named after its owner's pid.
+    fn abstract_addr(owner: i32) -> (libc::sockaddr_un, libc::socklen_t) {
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let name = format!("v8vm-probe-{}", owner);
+        for (slot, byte) in address.sun_path[1..].iter_mut().zip(name.bytes()) {
+            *slot = byte as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sa_family_t>() + 1 + name.len();
+        (address, len as libc::socklen_t)
+    }
+
+    /// What the probes aim at, owned by the test process: a POSIX message
+    /// queue (mq_unlink must not destroy it) and a listening abstract unix
+    /// socket (the Landlock scope must stop connections to it). Both are
+    /// named after this pid and removed on drop.
+    struct Fixtures {
+        listener: libc::c_int,
+        queue: CString,
+    }
+
+    impl Fixtures {
+        fn create() -> Fixtures {
+            let owner = std::process::id() as i32;
+            let listener = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            let (address, len) = abstract_addr(owner);
+            let bound = unsafe { libc::bind(listener, &address as *const _ as *const libc::sockaddr, len) };
+            let listening = unsafe { libc::listen(listener, 4) };
+            assert!(listener >= 0 && bound == 0 && listening == 0, "abstract socket fixture: {}", errno_last());
+            let queue = CString::new(fixture_queue_name(owner)).expect("queue name");
+            // Best effort: where queues cannot be created, mq_unlink still
+            // differs observably (ENOENT instead of the sandbox's EPERM).
+            let mode = 0o600 as libc::mode_t;
+            let mq = unsafe { libc::mq_open(queue.as_ptr(), libc::O_CREAT | libc::O_RDWR, mode, std::ptr::null::<libc::mq_attr>()) };
+            if mq != -1 {
+                unsafe { libc::mq_close(mq) };
+            }
+            Fixtures { listener, queue }
+        }
+    }
+
+    impl Drop for Fixtures {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.listener);
+                libc::mq_unlink(self.queue.as_ptr());
+            }
+        }
+    }
+
+    // ---- process-creation probes ----
 
     /// (name, CLONE_NEW* flag) pairs probed on top of a thread clone.
     const NAMESPACE_PROBE_FLAGS: [(&str, libc::c_ulong); 8] = [
@@ -316,28 +592,45 @@ mod run {
         ("newtime", libc::CLONE_NEWTIME as libc::c_ulong),
     ];
 
+    /// Clone shapes: a thread that also creates a namespace, and the
+    /// vfork/CLONE_VM forms used to start another program.
+    fn clone_probes() -> Vec<Probe> {
+        let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as libc::c_ulong;
+        let mut probes: Vec<Probe> = NAMESPACE_PROBE_FLAGS
+            .iter()
+            .map(|(name, flag)| probe(&format!("clone-thread+{}", name), probe_clone(thread | flag)))
+            .collect();
+        let vfork = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as libc::c_ulong;
+        probes.push(probe("clone-vfork", probe_clone(vfork)));
+        probes.push(probe("clone-vm-nothread", probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong)));
+        probes
+    }
+
+    fn clone_probe_names() -> Vec<String> {
+        let mut names: Vec<String> =
+            NAMESPACE_PROBE_FLAGS.iter().map(|(name, _)| format!("clone-thread+{}", name)).collect();
+        names.extend(["clone-vfork", "clone-vm-nothread"].map(String::from));
+        names
+    }
+
     /// A direct execve: the only way to attribute the errno to seccomp rather
     /// than to std::process' clone-based spawn path.
     fn probe_execve() -> String {
         let path = CString::new("/bin/true").unwrap();
         let argv = [path.as_ptr(), std::ptr::null()];
         let envp: [*const libc::c_char; 1] = [std::ptr::null()];
-        let rv = unsafe {
-            libc::syscall(libc::SYS_execve, path.as_ptr(), argv.as_ptr(), envp.as_ptr())
-        };
+        let rv = unsafe { libc::syscall(libc::SYS_execve, path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
         // execve only returns when it fails; success would replace the child.
         assert_eq!(rv, -1, "execve unexpectedly returned {}", rv);
         errno_last()
     }
 
-    /// Raw clone with the child handled entirely in asm: returning through
-    /// libc's syscall wrapper would use the parent's frame on the child's
-    /// new stack (garbage), so the child exits before any Rust runs.
-    fn probe_clone(flags: libc::c_ulong) -> String {
-        let stack = clone_stack();
-        if stack.is_null() {
-            return "skipped".to_string();
-        }
+    /// A raw process-creating syscall with the child handled entirely in
+    /// asm: returning through libc's syscall wrapper would use the parent's
+    /// frame on the child's new stack (garbage), so a child that is ever
+    /// created exits through SYS_exit before any Rust runs. `nr` is clone
+    /// (which uses `flags` and `stack`), fork or vfork (which ignore both).
+    fn raw_process_syscall(nr: libc::c_long, flags: libc::c_ulong, stack: *mut libc::c_void) -> String {
         let rv: i64;
         unsafe {
             std::arch::asm!(
@@ -348,7 +641,7 @@ mod run {
                 "xor edi, edi",
                 "syscall",
                 "2:",
-                inlateout("rax") libc::SYS_clone => rv,
+                inlateout("rax") nr => rv,
                 in("rdi") flags,
                 in("rsi") stack,
                 in("rdx") 0_i64,
@@ -359,7 +652,29 @@ mod run {
                 options(nostack)
             );
         }
-        syscall_outcome(rv)
+        asm_outcome(rv)
+    }
+
+    fn probe_raw_process(nr: libc::c_long) -> String {
+        raw_process_syscall(nr, 0, std::ptr::null_mut())
+    }
+
+    fn probe_clone(flags: libc::c_ulong) -> String {
+        let stack = clone_stack();
+        if stack.is_null() {
+            return "skipped".to_string();
+        }
+        raw_process_syscall(libc::SYS_clone, flags, stack)
+    }
+
+    /// Raw syscalls return -errno in rax; anything else is a created child
+    /// (already gone, see above) to reap.
+    fn asm_outcome(rv: i64) -> String {
+        if (-4095..0).contains(&rv) {
+            return format!("errno={}", -rv);
+        }
+        unsafe { libc::waitpid(rv as libc::c_int, std::ptr::null_mut(), 0) };
+        "ok".to_string()
     }
 
     /// A mapped stack, as CLONE_VM shapes require; the child never runs
@@ -395,6 +710,7 @@ mod run {
         }
     }
 
+    /// Outcome of libc's fork/clone3 wrappers (-1 plus errno on failure).
     fn syscall_outcome(rv: libc::c_long) -> String {
         if rv == -1 {
             return errno_last();
@@ -408,8 +724,8 @@ mod run {
         "ok".to_string()
     }
 
-    fn raw(rv: libc::c_int) -> String {
-        if rv == -1 {
+    fn raw<T: Into<i64>>(rv: T) -> String {
+        if rv.into() == -1 {
             errno_last()
         } else {
             "ok".to_string()
@@ -426,16 +742,6 @@ mod run {
         }
     }
 
-    /// A fresh pipe write end for the F_SETOWN probe (fd 0 is not a pipe).
-    fn pipe_w() -> libc::c_int {
-        let mut fds = [0 as libc::c_int; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return -1;
-        }
-        unsafe { libc::close(fds[0]) };
-        fds[1]
-    }
-
     fn errno_last() -> String {
         format!("errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
     }
@@ -444,90 +750,275 @@ mod run {
         std::fs::read_dir("/proc/self/task").map(|tasks| tasks.count()).unwrap_or(0)
     }
 
-    fn report(prefix: &str, probes: &[(String, String)]) {
+    fn report(prefix: &str, probes: &[Probe]) {
         for (name, outcome) in probes {
             println!("PROBE|{}{}|{}", prefix, name, outcome);
         }
     }
 
-    // ---- the test cases (run when no mode argument is given) ----
+    // ---- what each mode must report ----
+
+    /// Parent-aimed probes that Landlock's Signal and abstract-socket scopes
+    /// stop without any seccomp rule.
+    const SCOPED_PARENT: &[&str] = &[
+        "kill-parent",
+        "tgkill-parent",
+        "tkill-parent",
+        "sigqueue-parent",
+        "rt-tgsigqueue-parent",
+        "connect-abstract-parent",
+    ];
+
+    /// Probes with no scope behind them: only a seccomp rule stops these.
+    const SECCOMP_ONLY: &[&str] = &[
+        "socket",
+        "exec",
+        "fork",
+        "sys-fork",
+        "sys-vfork",
+        "clone-newuser",
+        "ioctl-tiocsti",
+        "ioctl-tiocsti-hibit",
+        "ioctl-fiosetown-parent",
+        "ioctl-siocspgrp-parent",
+        "fcntl-setsig",
+        "fcntl-setown-parent",
+        "fcntl-setown-ex-parent",
+        "inotify-init",
+        "inotify-watch",
+        "fanotify-init",
+        "fanotify-mark",
+        "mq-open",
+        "mq-timedsend",
+        "mq-timedreceive",
+        "mq-notify",
+        "mq-getsetattr",
+        "mq-unlink-parent",
+        "setpriority-pgrp",
+        "setpriority-user",
+        "ioprio-set-pgrp",
+        "ioprio-set-user",
+    ];
+
+    /// Every probe that fails with EPERM once the seccomp layer is in.
+    fn seccomp_denied() -> Vec<String> {
+        let mut names: Vec<String> = SECCOMP_ONLY.iter().chain(SCOPED_PARENT).map(|n| n.to_string()).collect();
+        names.extend(TARGET_PROBES.iter().map(|(name, _)| format!("{}-parent", name)));
+        names.extend(clone_probe_names());
+        names
+    }
+
+    /// Calls that must keep working under every layer.
+    fn always_ok() -> Vec<String> {
+        let mut names: Vec<String> =
+            ["read-urandom", "kill-self", "thread-spawn", "write-dump"].map(String::from).to_vec();
+        for (name, _) in TARGET_PROBES {
+            names.push(format!("{}-self-0", name));
+            names.push(format!("{}-self-pid", name));
+        }
+        names
+    }
+
+    const FS_DENIED: [&str; 4] = ["read-etc-passwd", "write-existing", "write-new", "read-dump"];
+
+    type Expected = Vec<(String, String)>;
+
+    fn expect(names: impl IntoIterator<Item = impl AsRef<str>>, outcome: &str) -> Expected {
+        names.into_iter().map(|n| (n.as_ref().to_string(), outcome.to_string())).collect()
+    }
+
+    fn errno_str(errno: libc::c_int) -> String {
+        format!("errno={}", errno)
+    }
+
+    /// Both layers: filesystem denied by Landlock, the rest by seccomp.
+    fn full_expectations() -> Expected {
+        let mut all = expect(FS_DENIED, &errno_str(libc::EACCES));
+        all.extend(expect(seccomp_denied(), &errno_str(libc::EPERM)));
+        all.extend(expect(["clone3"], &errno_str(libc::ENOSYS)));
+        all.extend(expect(always_ok(), "ok"));
+        all
+    }
+
+    fn check(lines: &[String], prefix: &str, expected: &Expected) {
+        for (name, outcome) in expected {
+            let key = format!("{}{}", prefix, name);
+            assert_eq!(result(lines, &key), outcome, "{} outcome", key);
+        }
+    }
+
+    // ---- the test cases (run when no probe mode is given) ----
 
     struct Case {
         name: &'static str,
         run: fn(),
+        /// Needs the real kernel layers (Landlock ABI 6). Cases that fake a
+        /// missing feature, or use only seccomp, run on any kernel.
+        needs_kernel: bool,
     }
 
     const CASES: &[Case] = &[
-        Case { name: "full_sandbox_denies_exec_network_process_and_signals", run: full_sandbox_denies },
-        Case { name: "full_sandbox_writes_only_the_dump_file", run: full_sandbox_dump_only },
-        Case { name: "sandbox_restrictions_reach_threads_spawned_after_apply", run: threads_inherit },
-        Case { name: "seccomp_layer_alone_denies_exec_network_process_creation", run: seccomp_alone },
-        Case { name: "landlock_layer_alone_denies_filesystem", run: landlock_alone },
-        Case { name: "sandbox_refuses_when_other_threads_already_run", run: refuses_late_thread },
-        Case { name: "sandbox_refuses_when_v8_is_already_initialized", run: refuses_late_v8 },
-        Case { name: "sandbox_refuses_when_landlock_is_missing", run: refuses_no_landlock },
-        Case { name: "sandbox_refuses_when_seccomp_is_missing", run: refuses_no_seccomp },
-        Case { name: "foreign_abi_x32_call_is_killed", run: x32_call_killed },
-        Case { name: "foreign_abi_int80_call_is_killed", run: int80_call_killed },
-        Case { name: "clone_thread_namespace_shapes_are_denied", run: clone_shapes_denied },
-        Case { name: "live_run_threads_all_restricted", run: live_threads_restricted },
-        Case { name: "dump_not_truncated_before_the_snapshot", run: dump_not_truncated_early },
-        Case { name: "harness_ignores_libtest_flags_and_fails_on_empty_filters", run: harness_args },
+        Case { name: "full_sandbox_denies_exec_network_process_and_signals", run: full_sandbox_denies, needs_kernel: true },
+        Case { name: "full_sandbox_writes_only_the_dump_file", run: full_sandbox_dump_only, needs_kernel: true },
+        Case { name: "sandbox_restrictions_reach_threads_spawned_after_apply", run: threads_inherit, needs_kernel: true },
+        Case { name: "seccomp_layer_alone_denies_exec_network_process_creation", run: seccomp_alone, needs_kernel: false },
+        Case { name: "landlock_layer_alone_denies_filesystem_and_scopes", run: landlock_alone, needs_kernel: true },
+        Case { name: "sandbox_refuses_when_other_threads_already_run", run: refuses_late_thread, needs_kernel: false },
+        Case { name: "sandbox_refuses_when_v8_is_already_initialized", run: refuses_late_v8, needs_kernel: false },
+        Case { name: "sandbox_refuses_when_landlock_is_missing", run: refuses_no_landlock, needs_kernel: false },
+        Case { name: "sandbox_refuses_when_seccomp_is_missing", run: refuses_no_seccomp, needs_kernel: false },
+        Case { name: "foreign_abi_x32_call_is_killed", run: x32_call_killed, needs_kernel: false },
+        Case { name: "foreign_abi_int80_call_is_killed", run: int80_call_killed, needs_kernel: false },
+        Case { name: "live_run_threads_all_restricted", run: live_threads_restricted, needs_kernel: true },
+        Case { name: "dump_not_truncated_before_the_snapshot", run: dump_not_truncated_early, needs_kernel: true },
+        Case { name: "harness_selection_flags_list_skip_and_exact", run: harness_selection, needs_kernel: false },
+        Case { name: "harness_skips_cases_on_a_kernel_without_landlock", run: harness_old_kernel, needs_kernel: false },
     ];
 
-    fn run_tests(filter: Option<&str>) -> i32 {
-        let (mut ran, mut failed) = (0, 0);
-        // A child spawned by the harness case must not run that case again,
-        // or the process chain would never end.
-        let harness_child = std::env::var_os("V8VM_SANDBOX_HARNESS_CHILD").is_some();
-        for case in CASES {
-            if harness_child && case.name.starts_with("harness_") {
-                continue;
-            }
-            if let Some(f) = filter {
-                if !case.name.contains(f) {
-                    continue;
-                }
-            }
-            ran += 1;
-            let ok = std::panic::catch_unwind(case.run).is_ok();
-            println!("test {} ... {}", case.name, if ok { "ok" } else { "FAILED" });
-            failed += usize::from(!ok);
-        }
-        // A filter that matches nothing must not look like a pass.
-        if ran == 0 {
-            eprintln!("no sandbox test matched filter {:?}", filter);
-            return 1;
-        }
-        println!("sandbox test result: {} run; {} failed", ran, failed);
-        failed as i32
+    enum Outcome {
+        Passed,
+        Failed,
+        Skipped,
     }
 
-    /// cargo forwards libtest-style flags to every test target: they must
-    /// not be mistaken for filters, and a filter matching nothing must not
-    /// look like a pass. The child is marked so it skips this case (it would
-    /// otherwise re-run every case, including this one, forever).
-    fn harness_args() {
-        if std::env::var_os("V8VM_SANDBOX_HARNESS_CHILD").is_some() {
-            return;
+    fn run_tests(opts: &Options) -> i32 {
+        let guarded = std::env::var_os(HARNESS_CHILD).is_some();
+        let selected: Vec<&Case> = CASES
+            .iter()
+            .filter(|case| !(guarded && case.name.starts_with("harness_")))
+            .filter(|case| opts.selects(case.name))
+            .collect();
+        if opts.list {
+            for case in selected {
+                println!("{}: test", case.name);
+            }
+            return 0;
         }
-        let mut flagged = Command::new(std::env::current_exe().expect("test binary path"));
-        flagged
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env("V8VM_SANDBOX_HARNESS_CHILD", "1");
-        let flagged = run_bounded(&mut flagged);
-        assert!(flagged.status.success(), "flags must not skip the tests");
-        let out = String::from_utf8_lossy(&flagged.stdout);
-        let expected = format!("sandbox test result: {} run;", CASES.len() - 1);
-        assert!(out.contains(&expected), "expected the other cases to run: {}", out);
-        assert!(!out.contains("test harness_ignores"), "child must skip this case: {}", out);
+        let (mut ran, mut failed, mut skipped) = (0, 0, 0);
+        for case in selected {
+            match run_case(case) {
+                Outcome::Passed => ran += 1,
+                Outcome::Failed => {
+                    ran += 1;
+                    failed += 1;
+                }
+                Outcome::Skipped => skipped += 1,
+            }
+        }
+        println!("sandbox test result: {} run; {} failed; {} skipped", ran, failed, skipped);
+        // A filter that matches nothing is fine (see the module comment); an
+        // unfiltered run that ran nothing must not look like a pass.
+        if ran + skipped == 0 && opts.filters.is_empty() {
+            eprintln!("no sandbox tests ran");
+            return 1;
+        }
+        if failed > 0 {
+            101
+        } else {
+            0
+        }
+    }
 
-        let mut empty = Command::new(std::env::current_exe().expect("test binary path"));
-        empty.arg("no-such-test-name").env("V8VM_SANDBOX_HARNESS_CHILD", "1");
-        let empty = run_bounded(&mut empty);
-        assert!(!empty.status.success(), "an empty filter must fail, not pass");
-        assert!(String::from_utf8_lossy(&empty.stderr).contains("no sandbox test matched"));
+    fn run_case(case: &Case) -> Outcome {
+        if case.needs_kernel && !common::kernel_supports_sandbox() {
+            if common::sandbox_required() {
+                println!(
+                    "test {} ... FAILED (kernel lacks Landlock ABI {} and V8VM_REQUIRE_SANDBOX=1)",
+                    case.name,
+                    common::REQUIRED_LANDLOCK_ABI
+                );
+                return Outcome::Failed;
+            }
+            common::skipped(case.name);
+            println!("test {} ... skipped", case.name);
+            return Outcome::Skipped;
+        }
+        let passed = std::panic::catch_unwind(case.run).is_ok();
+        println!("test {} ... {}", case.name, if passed { "ok" } else { "FAILED" });
+        if passed {
+            Outcome::Passed
+        } else {
+            Outcome::Failed
+        }
+    }
+
+    /// The harness's own argument handling, driven through cheap or listing
+    /// invocations of this binary. Each child is marked so it skips the
+    /// harness cases (they would otherwise respawn themselves forever).
+    fn harness_selection() {
+        let case_names: Vec<&str> = CASES
+            .iter()
+            .map(|c| c.name)
+            .filter(|name| !name.starts_with("harness_"))
+            .collect();
+
+        // libtest flags are ignored, not taken for filters.
+        let out = harness_run(&["--list", "--nocapture", "--test-threads=1", "--test-threads", "1"]);
+        assert!(out.status.success(), "flags must not break --list");
+        let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+        for name in &case_names {
+            assert!(listed.contains(&format!("{}: test", name)), "--list misses {}: {}", name, listed);
+        }
+
+        // Probe-mode names are plain filters now, not modes: `x32` lists the
+        // case and must not run (or die in) the x32 probe.
+        let out = harness_run(&["--list", "x32"]);
+        assert!(out.status.success(), "x32 filter: {:?}", out.status);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "foreign_abi_x32_call_is_killed: test");
+
+        // --skip removes cases, in both spellings.
+        let out = harness_run(&["--list", "--skip", "refuses", "--skip=foreign_abi"]);
+        let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(!listed.contains("refuses") && !listed.contains("foreign_abi"), "skip ignored: {}", listed);
+        assert!(listed.contains("full_sandbox_denies"), "skip removed too much: {}", listed);
+
+        // --exact needs the whole name.
+        let whole = "sandbox_refuses_when_other_threads_already_run";
+        assert!(String::from_utf8_lossy(&harness_run(&["--list", "--exact", "refuses_when_other"]).stdout).is_empty());
+        let out = harness_run(&["--list", "--exact", whole]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("{}: test", whole));
+
+        // A filter that matches nothing passes with "0 run" (cargo passes
+        // another target's test name to this one); an unfiltered run in
+        // which nothing ran does not.
+        let out = harness_run(&["no-such-test-name"]);
+        assert!(out.status.success(), "unmatched filter must pass: {:?}", out.status);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("0 run"));
+        let out = harness_run(&["--skip", "_"]);
+        assert!(!out.status.success(), "an unfiltered run of nothing must fail");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no sandbox tests ran"));
+    }
+
+    fn harness_run(args: &[&str]) -> Output {
+        run_bounded(harness_command().args(args))
+    }
+
+    fn harness_command() -> Command {
+        let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
+        cmd.env(HARNESS_CHILD, "1");
+        cmd
+    }
+
+    /// On a kernel without Landlock, cases that need it print SKIPPED and
+    /// pass, the fail-closed case still runs, and V8VM_REQUIRE_SANDBOX=1
+    /// turns the skip into a failure.
+    fn harness_old_kernel() {
+        let needs_kernel = "full_sandbox_denies_exec_network_process_and_signals";
+        let fail_closed = "sandbox_refuses_when_seccomp_is_missing";
+        let mut cmd = harness_command();
+        cmd.arg(format!("{}old-kernel", PROBE_PREFIX)).args([needs_kernel, fail_closed]);
+
+        let lenient = run_bounded(cmd.env_remove("V8VM_REQUIRE_SANDBOX"));
+        let stdout = String::from_utf8_lossy(&lenient.stdout);
+        let stderr = String::from_utf8_lossy(&lenient.stderr);
+        assert!(lenient.status.success(), "skip must pass: {} {}", stdout, stderr);
+        let notice = format!("SKIPPED (kernel lacks Landlock ABI 6): {}", needs_kernel);
+        assert!(stderr.contains(&notice), "missing skip notice: {}", stderr);
+        assert!(stdout.contains("1 run; 0 failed; 1 skipped"), "fail-closed case must run: {}", stdout);
+
+        let strict = run_bounded(cmd.env("V8VM_REQUIRE_SANDBOX", "1"));
+        assert!(!strict.status.success(), "V8VM_REQUIRE_SANDBOX=1 must fail the skip");
+        assert!(String::from_utf8_lossy(&strict.stdout).contains("FAILED (kernel lacks Landlock"));
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -571,16 +1062,16 @@ mod run {
 
     fn self_exec(mode: &str) -> Command {
         let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
-        cmd.arg(mode).env("PROBE_PARENT", std::process::id().to_string());
+        cmd.arg(format!("{}{}", PROBE_PREFIX, mode)).env("PROBE_PARENT", std::process::id().to_string());
         cmd
     }
 
-    fn run_probe(args: &[String]) -> Vec<String> {
-        let mut cmd = self_exec(&args[0]);
-        let out = run_bounded(cmd.args(&args[1..]));
+    fn run_probe(mode: &str, args: &[String]) -> Vec<String> {
+        let out = run_bounded(self_exec(mode).args(args));
         assert!(
             out.status.success(),
-            "probe child {:?} failed: {}",
+            "probe child {} {:?} failed: {}",
+            mode,
             args,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -599,20 +1090,11 @@ mod run {
             .unwrap_or_else(|| panic!("no result for {} in {:?}", name, lines))
     }
 
-    fn errno_is(lines: &[String], name: &str, expected: libc::c_int) {
-        assert_eq!(
-            result(lines, name),
-            format!("errno={}", expected),
-            "{} must fail with {}",
-            name,
-            expected
-        );
-    }
-
+    /// Runs a layer mode against fresh fixtures in this process.
     fn layer_mode(mode: &str, setup: &str) -> Vec<String> {
+        let _fixtures = Fixtures::create();
         let (dump, escape) = probe_setup(setup);
-        let args = [mode.to_string(), path_string(&dump), path_string(&escape)];
-        run_probe(&args)
+        run_probe(mode, &[path_string(&dump), path_string(&escape)])
     }
 
     fn path_string(path: &Path) -> String {
@@ -622,193 +1104,105 @@ mod run {
     fn full_sandbox_denies() {
         let lines = layer_mode("probe", "deny");
         assert_eq!(result(&lines, "threads"), "1", "apply starts from one thread");
-        for (name, errno) in [
-            ("read-etc-passwd", libc::EACCES),
-            ("write-existing", libc::EACCES),
-            ("write-new", libc::EACCES),
-            ("read-dump", libc::EACCES),
-            ("socket", libc::EPERM),
-            ("exec", libc::EPERM),
-            ("fork", libc::EPERM),
-            ("clone-newuser", libc::EPERM),
-            ("clone3", libc::ENOSYS),
-            ("kill-parent", libc::EPERM),
-            ("tgkill-parent", libc::EPERM),
-            ("ioctl-tiocsti", libc::EPERM),
-            ("ioctl-tiocsti-hibit", libc::EPERM),
-            ("fcntl-setown-other", libc::EPERM),
-            ("sigqueue-parent", libc::EPERM),
-            ("rt-tgsigqueue-parent", libc::EPERM),
-            ("prlimit-parent", libc::EPERM),
-            ("setpriority-other", libc::EPERM),
-            ("sched-setaffinity-other", libc::EPERM),
-            ("inotify-init", libc::EPERM),
-            ("inotify-watch", libc::EPERM),
-        ] {
-            errno_is(&lines, name, errno);
-        }
-        for name in ["read-urandom", "kill-self", "thread-spawn", "write-dump", "prlimit-self"] {
-            assert_eq!(result(&lines, name), "ok", "{} must keep working", name);
-        }
-    }
-
-    /// Every CLONE_THREAD + CLONE_NEW* shape, and the vfork/CLONE_VM forms,
-    /// must fail with EPERM (seccomp runs before the kernel could reject or
-    /// allow the flags itself).
-    fn clone_shapes_denied() {
-        let lines = layer_mode("probe", "clone-shapes");
-        let mut names: Vec<String> = NAMESPACE_PROBE_FLAGS
-            .iter()
-            .map(|(name, _)| format!("clone-thread+{}", name))
-            .collect();
-        names.extend(["clone-vfork", "clone-vm-nothread", "clone-newuser", "fork"].map(String::from));
-        for name in names {
-            errno_is(&lines, &name, libc::EPERM);
-        }
+        check(&lines, "", &full_expectations());
     }
 
     fn full_sandbox_dump_only() {
         let lines = layer_mode("probe", "dump-only");
         assert_eq!(result(&lines, "write-dump"), "ok", "the dump write must pass");
-        errno_is(&lines, "read-dump", libc::EACCES);
-        errno_is(&lines, "write-existing", libc::EACCES);
-        errno_is(&lines, "write-new", libc::EACCES);
+        check(&lines, "", &expect(["read-dump", "write-existing", "write-new"], &errno_str(libc::EACCES)));
         let content = std::fs::read_to_string(scratch("dump-only-dump.json")).expect("dump file");
         assert_eq!(content, "{\"probe\":1}");
     }
 
+    /// Everything a thread spawned after apply does must be denied exactly
+    /// like the main thread's own calls.
     fn threads_inherit() {
         let lines = layer_mode("probe", "thr");
-        for (name, errno) in [
-            ("thr-read-etc-passwd", libc::EACCES),
-            ("thr-write-existing", libc::EACCES),
-            ("thr-write-new", libc::EACCES),
-            ("thr-read-dump", libc::EACCES),
-            ("thr-socket", libc::EPERM),
-            ("thr-exec", libc::EPERM),
-            ("thr-fork", libc::EPERM),
-            ("thr-clone-newuser", libc::EPERM),
-            ("thr-clone3", libc::ENOSYS),
-            ("thr-kill-parent", libc::EPERM),
-        ] {
-            errno_is(&lines, name, errno);
-        }
-        for name in ["thr-write-dump", "thr-read-urandom", "thr-thread-spawn"] {
-            assert_eq!(result(&lines, name), "ok", "{} must keep working", name);
-        }
+        check(&lines, "thr-", &full_expectations());
     }
 
-    /// seccomp alone, so the exec/network/process denials are provably from
-    /// the seccomp rules and not from Landlock's Execute/Write rights.
+    /// seccomp alone, so every denial here is provably from a seccomp rule
+    /// and not from Landlock's rights or scopes.
     fn seccomp_alone() {
         let lines = layer_mode("seccomp-only", "seccomp");
-        for (name, errno) in [
-            ("exec", libc::EPERM),
-            ("socket", libc::EPERM),
-            ("fork", libc::EPERM),
-            ("clone-newuser", libc::EPERM),
-            ("clone3", libc::ENOSYS),
-            ("kill-parent", libc::EPERM),
-            ("ioctl-tiocsti", libc::EPERM),
-            ("fcntl-setown-other", libc::EPERM),
-            ("sigqueue-parent", libc::EPERM),
-            ("prlimit-parent", libc::EPERM),
-            ("setpriority-other", libc::EPERM),
-            ("inotify-init", libc::EPERM),
-        ] {
-            errno_is(&lines, name, errno);
-        }
+        let mut expected = expect(seccomp_denied(), &errno_str(libc::EPERM));
+        expected.extend(expect(["clone3"], &errno_str(libc::ENOSYS)));
+        expected.extend(expect(always_ok(), "ok"));
         // Landlock is absent in this mode: these succeed, proving the layer
         // isolation works in the other direction too.
-        for name in ["read-etc-passwd", "write-new", "write-dump", "thread-spawn"] {
-            assert_eq!(result(&lines, name), "ok", "{} needs only Landlock", name);
-        }
+        expected.extend(expect(FS_DENIED.iter().chain(&["write-dump"]), "ok"));
+        check(&lines, "", &expected);
     }
 
     fn landlock_alone() {
         let lines = layer_mode("landlock-only", "landlock");
-        for (name, errno) in [
-            ("read-etc-passwd", libc::EACCES),
-            ("write-existing", libc::EACCES),
-            ("write-new", libc::EACCES),
-            ("read-dump", libc::EACCES),
-            // Execute is a Landlock right too: this is exactly why the exec
-            // denial has to be asserted in the seccomp-only run above.
-            ("exec", libc::EACCES),
-        ] {
-            errno_is(&lines, name, errno);
-        }
-        for name in ["write-dump", "read-urandom", "thread-spawn", "clone3"] {
-            assert_eq!(result(&lines, name), "ok", "{} needs no Landlock right", name);
-        }
-        // The Signal scope is the Landlock side of the signalling fix: even
-        // with seccomp absent, neither a queued signal nor a plain kill
-        // reaches another process. fcntl F_SETOWN stays allowed here
-        // (seccomp owns that rule).
-        errno_is(&lines, "sigqueue-parent", libc::EPERM);
-        errno_is(&lines, "kill-parent", libc::EPERM);
-        errno_is(&lines, "tgkill-parent", libc::EPERM);
-        assert_eq!(result(&lines, "fcntl-setown-other"), "ok", "F_SETOWN is seccomp's job");
+        // Execute is a Landlock right too: this is exactly why the exec
+        // denial has to be asserted in the seccomp-only run above.
+        let mut expected = expect(FS_DENIED.iter().chain(&["exec"]), &errno_str(libc::EACCES));
+        // The Signal and abstract-socket scopes stop what seccomp would
+        // otherwise be the only wall for.
+        expected.extend(expect(SCOPED_PARENT, &errno_str(libc::EPERM)));
+        // Everything else is seccomp's job: with it absent these succeed.
+        expected.extend(expect(["fcntl-setown-parent", "clone3"], "ok"));
+        expected.extend(expect(always_ok(), "ok"));
+        check(&lines, "", &expected);
+    }
+
+    /// Runs a refusal mode and checks the refusal names `needle`.
+    fn assert_refused(mode: &str, needle: &str) {
+        let lines = run_probe(mode, &[]);
+        let outcome = result(&lines, mode);
+        assert!(outcome.starts_with("refused:"), "apply must refuse: {:?}", lines);
+        assert!(outcome.contains(needle), "refusal must name {:?}: {:?}", needle, lines);
     }
 
     fn refuses_late_thread() {
-        let lines = run_probe(&["late-thread".to_string()]);
-        let r = result(&lines, "late-thread");
-        assert!(r.starts_with("refused:"), "apply must refuse: {:?}", lines);
-        assert!(r.contains("thread"), "message must name threads: {:?}", lines);
+        assert_refused("late-thread", "thread");
     }
 
     fn refuses_late_v8() {
-        let lines = run_probe(&["late-v8".to_string()]);
-        let r = result(&lines, "late-v8");
-        assert!(r.starts_with("refused:"), "apply must refuse: {:?}", lines);
-        assert!(r.contains("run()/serve()"), "message must name the ordering: {:?}", lines);
+        assert_refused("late-v8", "run()/serve()");
     }
 
     fn refuses_no_landlock() {
-        let lines = run_probe(&["no-landlock".to_string()]);
-        let r = result(&lines, "no-landlock");
-        assert!(r.starts_with("refused:"), "{:?}", lines);
-        assert!(r.contains("Landlock"), "refusal must name the layer: {:?}", lines);
+        assert_refused("no-landlock", "Landlock");
     }
 
     fn refuses_no_seccomp() {
-        let lines = run_probe(&["no-seccomp".to_string()]);
-        let r = result(&lines, "no-seccomp");
-        assert!(r.starts_with("refused:"), "{:?}", lines);
-        assert!(r.contains("seccomp"), "refusal must name the layer: {:?}", lines);
+        assert_refused("no-seccomp", "seccomp");
     }
 
-    /// A syscall number in the x32 range must be killed by the stacked guard
-    /// with SIGSYS, not returned from.
     fn x32_call_killed() {
-        let out = spawn_abi_mode("x32");
-        assert!(out.0, "armed marker missing: {}", out.1);
-        assert_eq!(out.1, libc::SIGSYS.to_string(), "must die with SIGSYS");
+        assert_killed_by("x32", libc::SIGSYS);
     }
 
-    /// An int 0x80 call arrives with the i386 arch value and must be killed
-    /// with SIGSYS the same way.
+    /// Where the kernel delivers `int 0x80` to seccomp it dies with SIGSYS.
+    /// With ia32 emulation off (CONFIG_IA32_EMULATION_DEFAULT_DISABLED or
+    /// ia32_emulation=off on the command line) the kernel kills it with
+    /// SIGSEGV first, before seccomp can see it; the unsandboxed
+    /// `int80-bare` mode tells the two hosts apart.
     fn int80_call_killed() {
-        let out = spawn_abi_mode("int80");
-        assert!(out.0, "armed marker missing: {}", out.1);
-        assert_eq!(out.1, libc::SIGSYS.to_string(), "must die with SIGSYS");
+        let bare = run_bounded(&mut self_exec("int80-bare"));
+        let expected = match bare.status.signal() {
+            None => libc::SIGSYS,
+            Some(libc::SIGSEGV) => {
+                println!("int80: ia32 emulation is disabled on this host; accepting SIGSEGV instead of SIGSYS");
+                libc::SIGSEGV
+            }
+            Some(other) => panic!("bare int 0x80 died with unexpected signal {}", other),
+        };
+        assert_killed_by("int80", expected);
     }
 
-    /// (marker seen, terminating signal name) for a foreign-abi probe mode.
-    fn spawn_abi_mode(mode: &str) -> (bool, String) {
+    /// A foreign-ABI mode must announce itself, never return from the call,
+    /// and die with `signal`.
+    fn assert_killed_by(mode: &str, signal: i32) {
         let out = run_bounded(&mut self_exec(mode));
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let marker = format!("PROBE|{}|armed", mode);
-        let seen = stdout.lines().any(|l| l == marker);
-        let survived = stdout.contains("survived");
-        let signal = out
-            .status
-            .signal()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("exit-{:?}", out.status.code()));
-        assert!(!survived, "foreign-abi call returned instead of dying: {}", stdout);
-        (seen, signal)
+        assert!(stdout.lines().any(|l| l == format!("PROBE|{}|armed", mode)), "armed marker missing: {}", stdout);
+        assert!(!stdout.contains("survived"), "foreign-abi call returned instead of dying: {}", stdout);
+        assert_eq!(out.status.signal(), Some(signal), "{} must die with signal {}: {:?}", mode, signal, out.status);
     }
 
     /// The real binary under --sandbox: every thread it creates (V8's worker
@@ -829,12 +1223,11 @@ mod run {
         for status in &statuses {
             assert!(status.contains("Seccomp:\t2"), "no seccomp filter: {}", first_lines(status));
             assert!(status.contains("NoNewPrivs:\t1"), "no no_new_privs: {}", first_lines(status));
-            // Three filters are installed (clone3 ENOSYS, the x32 guard and
-            // the deny list). Not every kernel reports the field; this one
-            // (6.17) does.
-            if let Some(count) = seccomp_filters(status) {
-                assert_eq!(count, 3, "filter count: {}", first_lines(status));
-            }
+            // Three filters are installed: clone3 ENOSYS, the x32 guard and
+            // the deny list. The field exists since Linux 6.8 and the
+            // sandbox needs 6.12, so its absence is a failure.
+            let count = seccomp_filters(status).expect("Seccomp_filters field in /proc/<pid>/task/<tid>/status");
+            assert_eq!(count, 3, "filter count: {}", first_lines(status));
         }
         drop(child.stdin.take()); // release stdin so the guest can finish
         while child.try_wait().expect("poll v8vm").is_none() {

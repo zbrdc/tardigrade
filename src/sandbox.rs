@@ -31,6 +31,9 @@ pub enum SandboxError {
     ThreadsActive(usize),
     /// The `--dump` file cannot be prepared before the restrictions apply.
     Dump(std::path::PathBuf, std::io::Error),
+    /// `--dump` names something other than a regular file (a pipe, a tty):
+    /// Landlock can anchor a write rule only on a file or directory inode.
+    DumpNotRegular(std::path::PathBuf),
     /// The kernel lacks Landlock or seccomp, or a setup step failed.
     Kernel(String),
 }
@@ -46,6 +49,9 @@ impl std::fmt::Display for SandboxError {
                 write!(f, "{} threads already exist; apply the sandbox before any thread", n)
             }
             SandboxError::Dump(path, e) => write!(f, "cannot prepare dump {:?}: {}", path, e),
+            SandboxError::DumpNotRegular(path) => {
+                write!(f, "--dump must be a regular file: {:?}", path)
+            }
             SandboxError::Kernel(msg) => write!(f, "kernel refused the restrictions: {}", msg),
         }
     }
@@ -67,7 +73,7 @@ impl std::error::Error for SandboxError {}
 /// (`close_range`): descriptors inherited from the caller's environment
 /// (a socket, a log file) would be a channel out of the sandbox.
 pub fn apply(dump: Option<&Path>) -> Result<(), SandboxError> {
-    imp::apply(dump, None)
+    imp::apply(dump)
 }
 
 /// Which kernel layer [`apply_layer`] installs.
@@ -90,13 +96,11 @@ pub enum Layer {
 #[cfg(feature = "test-layers")]
 #[doc(hidden)]
 pub fn apply_layer(layer: Layer, dump: Option<&Path>) -> Result<(), SandboxError> {
-    let selector = match layer {
-        Layer::Landlock => imp::Selector::Landlock,
-        Layer::Seccomp => imp::Selector::Seccomp,
-    };
-    imp::apply(dump, Some(selector))
+    imp::apply_layer(layer, dump)
 }
 
+/// Stand-in for every target the layers are not verified on: the same
+/// signatures as the real module, but nothing is ever restricted.
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod imp {
     use super::SandboxError;
@@ -104,6 +108,23 @@ mod imp {
 
     pub fn apply(_dump: Option<&Path>) -> Result<(), SandboxError> {
         Err(SandboxError::Unsupported)
+    }
+
+    #[cfg(feature = "test-layers")]
+    pub fn apply_layer(_layer: super::Layer, _dump: Option<&Path>) -> Result<(), SandboxError> {
+        Err(SandboxError::Unsupported)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn apply_refuses_with_the_platform_message() {
+            let err = apply(None).expect_err("no layer is available here");
+            assert!(matches!(err, SandboxError::Unsupported));
+            assert_eq!(err.to_string(), "--sandbox is only supported on Linux x86_64");
+        }
     }
 }
 
@@ -122,17 +143,28 @@ mod imp {
     /// here, the only arch this module builds for).
     type Rules = BTreeMap<libc::c_long, Vec<SeccompRule>>;
 
-    /// Internal single-layer selector; the public test-only one maps onto it
-    /// so this signature does not depend on the `test-layers` feature.
-    #[derive(Clone, Copy, PartialEq)]
-    pub(super) enum Selector {
-        Landlock,
-        Seccomp,
+    /// Both layers, filesystem first and seccomp last: seccomp is the most
+    /// irreversible, and its deny list refuses the seccomp syscall itself.
+    pub fn apply(dump: Option<&Path>) -> Result<(), SandboxError> {
+        let anchor = prepare(dump)?;
+        landlock_restrict(anchor.as_ref())?;
+        seccomp_restrict()
     }
 
-    pub fn apply(dump: Option<&Path>, layer: Option<Selector>) -> Result<(), SandboxError> {
-        // Refuse late application before doing any work, then restrict from
-        // the broadest layer (filesystem) to the most irreversible (seccomp).
+    /// One layer alone, sharing every precondition with [`apply`].
+    #[cfg(feature = "test-layers")]
+    pub fn apply_layer(layer: super::Layer, dump: Option<&Path>) -> Result<(), SandboxError> {
+        let anchor = prepare(dump)?;
+        match layer {
+            super::Layer::Landlock => landlock_restrict(anchor.as_ref()),
+            super::Layer::Seccomp => seccomp_restrict(),
+        }
+    }
+
+    /// Everything that must hold before any restriction is installed:
+    /// refuse late application, then ready the descriptors. Returns the dump
+    /// anchor for the Landlock rule.
+    fn prepare(dump: Option<&Path>) -> Result<Option<landlock::PathFd>, SandboxError> {
         if crate::host::engine_started() {
             return Err(SandboxError::EngineStarted);
         }
@@ -145,13 +177,7 @@ mod imp {
         close_inherited_fds()?;
         let dump_file = prepare_dump(dump)?;
         set_no_new_privs()?;
-        if layer != Some(Selector::Seccomp) {
-            landlock_restrict(dump_file.as_ref())?;
-        }
-        if layer != Some(Selector::Landlock) {
-            seccomp_restrict()?;
-        }
-        Ok(())
+        Ok(dump_file)
     }
 
     /// Threads created after this call inherit both layers, so there must be
@@ -179,6 +205,12 @@ mod imp {
                 .truncate(false)
                 .open(path)
                 .map_err(|e| SandboxError::Dump(path.to_path_buf(), e))?;
+            // Without this, a pipe or tty (--dump=/dev/stdout) reaches the
+            // Landlock rule below and fails there with an opaque EBADFD.
+            let regular = file.metadata().map(|m| m.is_file());
+            if !regular.map_err(|e| SandboxError::Dump(path.to_path_buf(), e))? {
+                return Err(SandboxError::DumpNotRegular(path.to_path_buf()));
+            }
             let anchor = landlock::PathFd::new(path).map_err(kernel)?;
             match (inode_of(&file), inode_of(&anchor)) {
                 (Some(a), Some(b)) if a == b => Ok(anchor),
@@ -229,11 +261,16 @@ mod imp {
         landlock::Scope::from_all(landlock::ABI::V6)
     }
 
-    /// fcntl requests libc does not define on x86_64 (fcntl(2) values):
+    /// Request and selector values libc does not define for x86_64 Linux.
     /// F_SETSIG chooses the signal delivered for async fd events, and
-    /// F_SETOWN_EX aims them at a thread or process.
+    /// F_SETOWN_EX aims them at a thread or process (fcntl(2)).
     const F_SETSIG: libc::c_int = 10;
     const F_SETOWN_EX: libc::c_int = 15;
+    /// ioctl spellings of F_SETOWN (linux/sockios.h, asm-generic/ioctls.h).
+    const FIOSETOWN: u64 = 0x8901;
+    const SIOCSPGRP: u64 = 0x8902;
+    /// ioprio_set `which` selecting a single process (linux/ioprio.h).
+    const IOPRIO_WHO_PROCESS: u64 = 1;
 
     fn landlock_restrict(dump: Option<&landlock::PathFd>) -> Result<(), SandboxError> {
         use landlock::{
@@ -347,33 +384,30 @@ mod imp {
             libc::SYS_sched_setaffinity,
             libc::SYS_sched_setscheduler,
             libc::SYS_sched_setattr,
+            libc::SYS_sched_setparam,
         ] {
             rules.insert(nr, vec![foreign(0, pid)]);
         }
-        rules.insert(libc::SYS_setpriority, setpriority_rules(pid));
+        rules.insert(libc::SYS_setpriority, priority_rules(libc::PRIO_PROCESS as u64, pid));
+        rules.insert(libc::SYS_ioprio_set, priority_rules(IOPRIO_WHO_PROCESS, pid));
         rules
     }
 
     /// Denies an argument that is neither 0 (calling process) nor this
     /// process: both `Ne` conditions must hold, so self-targeted calls pass.
     fn foreign(arg: usize, pid: u64) -> SeccompRule {
-        rule2(
-            arg,
-            SeccompCmpOp::Ne,
-            0,
-            arg,
-            SeccompCmpOp::Ne,
-            pid,
-        )
+        let differs_from = |value| {
+            SeccompCondition::new(arg as u8, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, value)
+                .expect("valid condition")
+        };
+        SeccompRule::new(vec![differs_from(0), differs_from(pid)]).expect("valid rule")
     }
 
-    /// setpriority(which, who, prio): only PRIO_PROCESS with the caller (0)
-    /// or this process; a user- or group-wide target is denied.
-    fn setpriority_rules(pid: u64) -> Vec<SeccompRule> {
-        vec![
-            condition(0, SeccompCmpOp::Ne, libc::PRIO_PROCESS as u64),
-            foreign(1, pid),
-        ]
+    /// `which`/`who` calls (setpriority, ioprio_set): only the
+    /// process-scoped `which` value, and only for the caller (0) or this
+    /// process; a user- or group-wide target is denied.
+    fn priority_rules(which_process: u64, pid: u64) -> Vec<SeccompRule> {
+        vec![condition(0, SeccompCmpOp::Ne, which_process), foreign(1, pid)]
     }
 
     /// fcntl: aiming async-signal delivery at another process (F_SETOWN,
@@ -403,12 +437,15 @@ mod imp {
         rule(0, SeccompCmpArgLen::Qword, SeccompCmpOp::MaskedEq(mask), value)
     }
 
-    /// ioctl is denied only for the terminal input injection requests; the
-    /// rest (isatty, window size on already-open fds) stays available.
+    /// ioctl is denied only for the terminal input injection requests and
+    /// the ioctl forms of F_SETOWN; the rest (isatty, window size on
+    /// already-open fds) stays available.
     fn ioctl_rules() -> Vec<SeccompRule> {
         vec![
             condition(1, SeccompCmpOp::Eq, libc::TIOCSTI),
             condition(1, SeccompCmpOp::Eq, libc::TIOCLINUX),
+            condition(1, SeccompCmpOp::Eq, FIOSETOWN),
+            condition(1, SeccompCmpOp::Eq, SIOCSPGRP),
         ]
     }
 
@@ -420,15 +457,6 @@ mod imp {
         // Constructors only reject an argument index above 5.
         SeccompRule::new(vec![SeccompCondition::new(arg, len, op, value).expect("valid condition")])
             .expect("valid rule")
-    }
-
-    /// Two and-bound dword conditions; `foreign` needs a pair on one argument.
-    fn rule2(arg_a: usize, op_a: SeccompCmpOp, value_a: u64, arg_b: usize, op_b: SeccompCmpOp, value_b: u64) -> SeccompRule {
-        let a = SeccompCondition::new(arg_a as u8, SeccompCmpArgLen::Dword, op_a, value_a)
-            .expect("valid condition");
-        let b = SeccompCondition::new(arg_b as u8, SeccompCmpArgLen::Dword, op_b, value_b)
-            .expect("valid condition");
-        SeccompRule::new(vec![a, b]).expect("valid rule")
     }
 
     /// Namespace-creating clone flags (see clone(2)); each gets its own rule.
@@ -601,6 +629,11 @@ mod imp {
         libc::SYS_semtimedop,
         libc::SYS_semctl,
         libc::SYS_mq_open,
+        libc::SYS_mq_unlink,
+        libc::SYS_mq_timedsend,
+        libc::SYS_mq_timedreceive,
+        libc::SYS_mq_notify,
+        libc::SYS_mq_getsetattr,
         // metadata mutation and reads (Landlock covers open/create/remove,
         // not setattr or xattr; stat/access/readlink stay observable)
         libc::SYS_chmod,
@@ -644,6 +677,8 @@ mod imp {
         libc::SYS_uselib,
     ];
 
+    // The deny rules are exercised at runtime by tests/sandbox.rs; only
+    // logic with no runtime counterpart is checked here.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -654,97 +689,6 @@ mod imp {
             assert!(enforce_status(RulesetStatus::FullyEnforced).is_ok());
             assert!(enforce_status(RulesetStatus::PartiallyEnforced).is_err());
             assert!(enforce_status(RulesetStatus::NotEnforced).is_err());
-        }
-
-        #[test]
-        fn clone_rules_deny_non_threads_and_namespace_creators() {
-            let expected: Vec<SeccompRule> = std::iter::once(masked(libc::CLONE_THREAD as u64, 0))
-                .chain(NAMESPACE_FLAGS.iter().copied().map(|f| masked(f, f)))
-                .collect();
-            assert_eq!(clone_rules(), expected);
-            assert_eq!(clone_rules().len(), 1 + NAMESPACE_FLAGS.len());
-        }
-
-        #[test]
-        fn fcntl_rules_deny_only_async_signal_ownership() {
-            let expected = vec![
-                condition(1, SeccompCmpOp::Eq, libc::F_SETOWN as u64),
-                condition(1, SeccompCmpOp::Eq, F_SETSIG as u64),
-                condition(1, SeccompCmpOp::Eq, F_SETOWN_EX as u64),
-            ];
-            assert_eq!(fcntl_rules(), expected);
-        }
-
-        #[test]
-        fn process_rules_allow_only_this_process() {
-            let pid = unsafe { libc::getpid() } as u64;
-            let rules = filter_rules();
-            // signals (kill family) deny everything but this pid
-            for nr in [
-                libc::SYS_kill,
-                libc::SYS_tgkill,
-                libc::SYS_rt_sigqueueinfo,
-                libc::SYS_rt_tgsigqueueinfo,
-            ] {
-                assert_eq!(rules.get(&nr), Some(&vec![condition(0, SeccompCmpOp::Ne, pid)]));
-            }
-            // resources and scheduling allow 0 (caller) or this pid
-            let foreign = vec![rule2(0, SeccompCmpOp::Ne, 0, 0, SeccompCmpOp::Ne, pid)];
-            for nr in [
-                libc::SYS_prlimit64,
-                libc::SYS_sched_setaffinity,
-                libc::SYS_sched_setscheduler,
-                libc::SYS_sched_setattr,
-            ] {
-                assert_eq!(rules.get(&nr), Some(&foreign), "self-only {}", nr);
-            }
-            // setpriority: only PRIO_PROCESS, and only for self
-            assert_eq!(
-                rules.get(&libc::SYS_setpriority),
-                Some(&vec![
-                    condition(0, SeccompCmpOp::Ne, libc::PRIO_PROCESS as u64),
-                    rule2(1, SeccompCmpOp::Ne, 0, 1, SeccompCmpOp::Ne, pid),
-                ])
-            );
-        }
-
-        #[test]
-        fn scopes_cover_signals_and_abstract_sockets() {
-            use landlock::Access;
-            assert_eq!(scopes(), landlock::Scope::from_all(landlock::ABI::V6));
-            assert!(scopes().contains(landlock::Scope::Signal));
-            assert!(scopes().contains(landlock::Scope::AbstractUnixSocket));
-        }
-
-        #[test]
-        fn ioctl_rules_deny_only_terminal_injection() {
-            let expected = vec![
-                condition(1, SeccompCmpOp::Eq, libc::TIOCSTI),
-                condition(1, SeccompCmpOp::Eq, libc::TIOCLINUX),
-            ];
-            assert_eq!(ioctl_rules(), expected);
-        }
-
-        #[test]
-        fn signal_rules_target_only_this_process() {
-            let pid = unsafe { libc::getpid() } as u64;
-            let rules = filter_rules();
-            let deny = |nr: libc::c_long| rules.get(&nr).expect("rule present");
-            assert_eq!(deny(libc::SYS_kill), &vec![condition(0, SeccompCmpOp::Ne, pid)]);
-            assert_eq!(deny(libc::SYS_tgkill), &vec![condition(0, SeccompCmpOp::Ne, pid)]);
-            assert_eq!(deny(libc::SYS_tkill), &Vec::new());
-        }
-
-        #[test]
-        fn exec_and_network_are_denied_unconditionally() {
-            let rules = filter_rules();
-            for nr in [libc::SYS_execve, libc::SYS_execveat, libc::SYS_socket, libc::SYS_connect]
-            {
-                assert_eq!(rules.get(&nr), Some(&Vec::new()), "raw deny for {}", nr);
-            }
-            // the argument-filtered syscalls must be present too
-            assert_eq!(rules.get(&libc::SYS_ioctl), Some(&ioctl_rules()));
-            assert_eq!(rules.get(&libc::SYS_clone), Some(&clone_rules()));
         }
 
         #[test]

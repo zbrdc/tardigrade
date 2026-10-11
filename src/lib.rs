@@ -54,8 +54,9 @@ pub struct Config {
     /// True when the entry source was read from stdin, so guest stdin is
     /// already at EOF.
     pub stdin_consumed: bool,
-    /// Pre-read contents of `preload`, for hosts that read it before applying
-    /// [`sandbox::apply`] (which then denies re-opening the file).
+    /// Snapshot JSON to seed vm.fs from, for hosts that read the preload file
+    /// before applying [`sandbox::apply`] (which then denies re-opening it).
+    /// Used instead of reading `preload`, and works without it.
     pub preload_data: Option<String>,
 }
 
@@ -146,19 +147,19 @@ fn eval_prelude(scope: &mut v8::HandleScope) -> bool {
 
 /// Seeds vm.fs from a snapshot dump; Some(code) aborts the run.
 fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
-    let preload = cfg.preload.as_ref()?;
     // preload_data is the file the host already read before it applied the
-    // sandbox; the sandbox denies re-opening the path.
-    let loaded = match &cfg.preload_data {
-        Some(data) => Some(data.clone()),
-        None => read_path(preload),
-    };
-    let state = match loaded {
-        Some(state) => state,
-        None => {
-            eprintln!("v8vm: cannot open preload {:?}", preload);
-            return Some(2);
-        }
+    // sandbox (the sandbox denies re-opening the path), so it wins over, and
+    // works without, the path.
+    let state = match (&cfg.preload_data, &cfg.preload) {
+        (Some(data), _) => data.clone(),
+        (None, Some(path)) => match read_path(path) {
+            Some(state) => state,
+            None => {
+                eprintln!("v8vm: cannot open preload {:?}", path);
+                return Some(2);
+            }
+        },
+        (None, None) => return None,
     };
     let key = v8::String::new(scope, "__PRELOAD__").unwrap();
     let val = v8::String::new_from_utf8(scope, state.as_bytes(), v8::NewStringType::Normal).unwrap();

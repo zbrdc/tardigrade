@@ -114,3 +114,15 @@ fn early_vm_exit_stays_per_run_while_another_guest_is_pending() {
     assert_eq!(join_bounded(quick, 30), 31, "early exit code belongs to its own run");
     assert_eq!(join_bounded(slow, 30), 0, "naturally-finished guest sees no leaked exit code");
 }
+
+#[test]
+fn preload_data_alone_seeds_the_filesystem() {
+    // A host that pre-read the snapshot (sandboxed runs) sets no preload path.
+    let cfg = Config {
+        preload_data: Some(r#"{"/k":"v"}"#.to_string()),
+        stdin_consumed: true,
+        ..Config::new()
+    };
+    let guest = "if (vm.fs.read('/k') !== 'v') vm.exit(9);";
+    assert_eq!(v8vm::run(guest, "preload-data.js", &cfg), 0);
+}
