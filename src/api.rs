@@ -2,7 +2,9 @@
 
 use crate::console::{console_err, console_log};
 use crate::exit::vm_exit;
-use crate::fs::{fs_list, fs_read, fs_remove, fs_write};
+use crate::fs::{
+    fs_exists, fs_list, fs_mkdir, fs_read, fs_readdir, fs_remove, fs_rename, fs_stat, fs_write,
+};
 use crate::net::{net_close, net_listen, net_port, net_send};
 use crate::stdin::stdin_read;
 use crate::timers::{clear_timer, set_interval, set_timeout};
@@ -64,6 +66,11 @@ pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
     put_fn(fs, scope, "write", fs_write);
     put_fn(fs, scope, "list", fs_list);
     put_fn(fs, scope, "remove", fs_remove);
+    put_fn(fs, scope, "mkdir", fs_mkdir);
+    put_fn(fs, scope, "exists", fs_exists);
+    put_fn(fs, scope, "stat", fs_stat);
+    put_fn(fs, scope, "readdir", fs_readdir);
+    put_fn(fs, scope, "rename", fs_rename);
     set(vm, scope, "fs", fs.into());
 
     let net = v8::Object::new(scope);

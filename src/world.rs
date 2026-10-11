@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
+use crate::fs::RamFs;
 use crate::stdin::StdinSub;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
@@ -29,7 +30,7 @@ pub(crate) struct NetMsg {
 /// slot (see [world_mut]); one JS thread touches it, and the watchdog thread
 /// only ever calls Isolate::terminate_execution().
 pub(crate) struct World {
-    pub(crate) fs: BTreeMap<String, String>,
+    pub(crate) fs: RamFs,
     pub(crate) timers: Vec<Timer>,
     pub(crate) next_timer_id: u64,
     pub(crate) net: VecDeque<NetMsg>,
@@ -50,7 +51,7 @@ pub(crate) struct World {
 impl World {
     pub(crate) fn new() -> Self {
         World {
-            fs: BTreeMap::new(),
+            fs: RamFs::new(),
             timers: Vec::new(),
             next_timer_id: 1,
             net: VecDeque::new(),
