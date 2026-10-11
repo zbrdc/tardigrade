@@ -47,9 +47,9 @@ and is not set by this repo.
 - "--memory=<mb>" V8 heap cap in MB (default 256)
 - "--fs-quota=<mb>" RAM filesystem quota in MB (default 64, 0 disables)
 - "--seed=<u64>" deterministic Math.random: two runs with the same seed
-  draw identical sequences, different seeds differ. Without it Math.random
-  is V8's own (seeded from the OS). The seed overrides Math.random for that
-  run only, so several runs in one process each keep their own sequence
+  draw identical sequences, different seeds differ, and concurrent seeded
+  runs each keep their own sequence. Without it Math.random is V8's own
+  (seeded from the OS)
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write the snapshot to a file when the run ends: normal
   exit, vm.exit (also from a timer, microtask or stdin read), uncaught
@@ -144,30 +144,55 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | vm.net.send(fromPort, toPort, payload) | queue a message; throws if no listener |
 | vm.net.close(port) | stop listening |
 | vm.stdin.read() | Promise of the next stdin chunk; "" at EOF |
-| TextEncoder() | encode / encodeInto, UTF-8 only. Unpaired surrogates
- encode as U+FFFD (EF BF BD); encodeInto fills a Uint8Array (its window,
- not the whole buffer), returns {read, written} and never writes a partial
- code point; a detached destination has zero capacity |
-| TextDecoder([label][, {fatal, ignoreBOM}]) | decode, UTF-8 only (utf-8/
- utf8/unicode-1-1-utf-8 labels; anything else throws RangeError). Invalid
- bytes become U+FFFD, one per maximal ill-formed subsequence; fatal makes
- them a TypeError; a leading U+FEFF BOM is stripped unless ignoreBOM, also
- when it arrives split across stream:true chunks; {stream: true} carries
- an incomplete trailing sequence (or a possible BOM prefix) to the next
- call; a throwing decode leaves the state as it was before the call |
-| atob / btoa | Latin-1 base64 per spec: btoa accepts code units 0..0xFF
- only, atob decodes forgiving-base64 (ASCII whitespace ignored, padding
- only at the end); both throw Errors named InvalidCharacterError |
-| structuredClone(value[, options]) | V8's own structured clone (Map, Set,
- Date, RegExp, typed arrays, cycles, shared references inside the clone).
- Functions, symbols and WebAssembly.Module throw DataCloneError; there is
- no transfer list ({transfer: [...]} throws DataCloneError),
- SharedArrayBuffer is not cloneable here, and symbol-keyed properties are
- dropped, as the spec's clone algorithm dictates |
-| performance.now() | milliseconds since process start on the real clock
- (a monotonic Instant); values are comparable across runs in one process |
-| Math.random under --seed | splitmix64 draws, 53 bits scaled to [0, 1),
- per run (see --seed above) |
+| TextEncoder() | encode / encodeInto, UTF-8 only |
+| TextDecoder([label][, options]) | decode, UTF-8 only |
+| atob / btoa | Latin-1 base64 per spec |
+| structuredClone(value[, options]) | V8's own structured clone |
+| performance.now() | monotonic ms since the run started |
+| Math.random under --seed | splitmix64 draws, 53 bits in [0, 1), per run |
+
+Details and limits of the web APIs above:
+
+- TextEncoder.encode returns a Uint8Array; unpaired surrogates encode as
+  U+FFFD (EF BF BD). encodeInto fills a Uint8Array (its window, not the
+  whole buffer), returns {read, written} and never writes a partial code
+  point; a detached destination has zero capacity. TextEncoder has the
+  `encoding` getter ("utf-8") and a Symbol.toStringTag.
+- TextDecoder accepts only the UTF-8 labels ("utf-8", "utf8",
+  "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8",
+  "x-unicode20utf8", case-insensitive, ASCII-whitespace-trimmed);
+  anything else throws RangeError. Invalid bytes become U+FFFD, one per
+  maximal ill-formed subsequence; {fatal: true} makes them a TypeError.
+  A leading U+FEFF BOM is stripped unless {ignoreBOM: true}, also when it
+  arrives split across {stream: true} chunks, and {stream: true} carries
+  an incomplete trailing sequence to the next call. A non-stream decode
+  ends the stream: the next call starts fresh (new BOM decision, no
+  carry), also after a throwing one. Options convert like a WebIDL
+  dictionary (null is empty, non-objects throw TypeError, getters may
+  throw). Per-instance state lives in #private fields (nothing enumerable
+  on instances).
+- atob / btoa: btoa accepts code units 0..0xFF only; atob decodes
+  forgiving-base64 (ASCII whitespace ignored, padding only at the end,
+  trailing bits unchecked). Both throw Errors named
+  InvalidCharacterError, require their argument, and throw RangeError
+  when the result cannot be allocated or exceeds V8's string limit.
+- structuredClone handles Map, Set, Date, RegExp, typed arrays and their
+  views, ArrayBuffers, cycles and shared references inside one clone.
+  Functions, symbols, WebAssembly modules and SharedArrayBuffers throw
+  an Error named DataCloneError; there is no transfer list ({transfer:
+  [...]} throws DataCloneError, a non-array transfer a TypeError), and
+  symbol-keyed properties are dropped, as the clone algorithm dictates.
+- performance.now() reports milliseconds on the real clock (a monotonic
+  Instant) with the start of the run as its zero point, so values begin
+  near zero in every run and never go backwards within one.
+- All of these decode/encode paths bound their Rust-side allocations
+  (decode reads the input from its backing store in 64 KiB pieces, and
+  every output buffer grows through try_reserve): a memory-constrained
+  embedder sees a guest RangeError instead of a process abort. What
+  stays outside that rule is V8's own memory: cloning a buffer larger
+  than the process can hold still dies with V8's fatal out-of-memory
+  report, like the heap cap does.
+
 
 WebAssembly, Intl/ICU, and all of ES2023 are available.
 
