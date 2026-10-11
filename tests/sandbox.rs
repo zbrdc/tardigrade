@@ -1672,7 +1672,7 @@ mod run {
     /// no_new_privs.
     fn live_threads_restricted() {
         const LIMIT: Duration = Duration::from_secs(60);
-        let script = write_guest("alive", "setTimeout(() => console.log('done'), 1500);");
+        let script = write_guest("alive", "vm.stdin.read().then(() => console.log('done'));");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_tardigrade"));
         cmd.args(["--sandbox", script.to_str().unwrap()])
             .stdin(Stdio::piped())
@@ -1680,8 +1680,12 @@ mod run {
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn tardigrade");
         let deadline = Instant::now() + LIMIT;
-        let statuses = wait_for_statuses(child.id(), 8, Duration::from_secs(2));
+        // 5 is a floor, not an exact count: the main, host, guest and watchdog
+        // threads plus the stdin reader that vm.stdin.read() starts. V8 workers
+        // come on top, and their number depends on the CPU count.
+        let statuses = wait_for_statuses(child.id(), 5, Duration::from_secs(20));
         assert!(statuses.len() > 1, "V8 worker threads must exist");
+        assert!(statuses.len() >= 5, "expected the tardigrade main, host, guest and watchdog threads plus V8 workers, saw {}", statuses.len());
         for status in &statuses {
             assert!(status.contains("Seccomp:\t2"), "no seccomp filter: {}", first_lines(status));
             assert!(status.contains("NoNewPrivs:\t1"), "no no_new_privs: {}", first_lines(status));

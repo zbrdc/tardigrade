@@ -3,8 +3,8 @@
 //! Every Config here pins a small heap: the tests run many isolates in
 //! parallel inside one process, and each default-cap isolate reserves
 //! GBs of address space (heap limit plus code range), which can exhaust
-//! a bounded RLIMIT_AS before V8 ever allocates a page (see the README's
-//! Guarantees and limits).
+//! a bounded RLIMIT_AS before V8 ever allocates a page (see
+//! docs/KNOWN_RISKS.md, Process memory use).
 
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
@@ -69,8 +69,8 @@ fn virtual_clock_semantics_hold_through_the_library_api() {
         // A small heap keeps this run's per-isolate reservations modest:
         // the library tests run many isolates in parallel inside one
         // process, and under a bounded address space each extra
-        // default-cap isolate adds GBs of virtual reservations (see the
-        // README's Guarantees and limits).
+        // default-cap isolate adds GBs of virtual reservations (see
+        // docs/KNOWN_RISKS.md, Process memory use).
         heap_mb: 32,
         stdin_consumed: true,
         clock: tardigrade::Clock::Virtual { epoch_ms: 100 },
