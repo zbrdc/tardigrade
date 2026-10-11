@@ -39,7 +39,9 @@ and is not set by this repo.
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
-- "--memory=<mb>" V8 heap cap in MB (default 256); hitting it exits 137
+- "--memory=<mb>" V8 heap cap in MB, minimum 8 (default 256); the CLI
+  rejects smaller values with exit 2, library callers have them clamped up;
+  a guest passing the cap exits 137
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write vm.snapshot() to a file when the run ends
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
@@ -62,7 +64,12 @@ and serve() commands: input a run does not read is kept for the next run,
 and when several consumers read at once the first one receives the chunks.
 Isolation is per isolate within the process: hitting the heap cap ends only
 that run (exit 137), while other V8 fatal errors end the whole process and
-every guest in it.
+every guest in it. The heap cap is enforced below V8's own hard limit
+(the cap plus twice the cap of headroom, at least 32 MiB): a check before
+every garbage collection stops the guest once its used heap passes the
+cap, and a near-heap-limit callback is the second line. Until the guest
+is stopped, the process may transiently commit memory above the cap, up
+to that raised V8 limit.
 
 ## Event loop
 
@@ -122,6 +129,14 @@ tsc-rs at this boundary to let agents write TypeScript.
   omission of host APIs, per isolate inside one ordinary process. A V8
   fatal error ends the whole process and every guest in it. For hostile
   code, run v8vm itself under a container/seccomp profile.
-- Hitting the heap cap terminates the guest: the run exits 137 with a
-  one-line report on stderr; the process and other guests survive.
+- The heap cap terminates the guest, not the process: a check before every
+  garbage collection stops a run whose used heap passed the cap, and the run
+  exits 137 with a one-line report on stderr. The cap is set below V8's own
+  hard limit (cap + 2x cap headroom, minimum 32 MiB) so growth paths pass a
+  GC first; the smallest supported cap is 8 MB.
+- One abort case remains: a single allocation too large to fit under V8's
+  raised limit (for example `new Array(1e9)`) still ends the whole process
+  with V8's fatal out-of-memory report (observed as SIGTRAP, exit 133).
+  Growth that stays within V8's string limits instead fails as an ordinary
+  uncaught exception (`RangeError: Invalid string length`, exit 1).
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

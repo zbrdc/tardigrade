@@ -146,6 +146,91 @@ fn memory_zero_is_a_usage_error() {
 }
 
 #[test]
+fn memory_below_eight_is_a_usage_error() {
+    let path = script("mem-four", "console.log('never runs');");
+    let r = v8vm(&["--memory=4", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("at least 8"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn map_number_growth_reports_137_not_v8s_fatal_oom() {
+    // Table growth never reached the near-heap-limit callback on the old
+    // single-layer design: V8 aborted the process instead. The largest cap
+    // is covered too: with too little headroom below V8's limit, the fatal
+    // path wins the race even with the GC check in place.
+    let path = script("oom-map", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
+    for cap in ["32", "256"] {
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 137, "cap {}: stderr: {}", cap, r.stderr);
+        assert!(
+            r.stderr.contains("v8vm: heap limit exceeded"),
+            "cap {}: stderr: {}",
+            cap,
+            r.stderr
+        );
+    }
+}
+
+#[test]
+fn map_of_objects_growth_reports_137() {
+    let path = script(
+        "oom-map-obj",
+        "const m = new Map(); for (let i = 0;; i++) m.set(i, { a: i, b: 'k' + i });",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn object_key_growth_reports_137() {
+    let path = script("oom-objkeys", "const o = {}; for (let i = 0;; i++) o['k' + i] = { a: i };");
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn string_concat_reports_the_range_error_not_an_abort() {
+    // Cons strings keep the live heap small; the run ends at V8's maximum
+    // string length with an ordinary uncaught RangeError (Node does the
+    // same), not with the heap cap or a fatal abort.
+    let path = script("oom-str", "let s = 'x'; for (;;) s = s + s;");
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("Invalid string length"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn the_smallest_supported_cap_reports_137() {
+    let path = script("oom-cap8", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
+    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded (8 MB)"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn dump_is_skipped_after_an_oom() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("oom-dump.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script("oom-dump", "const a = []; for (;;) a.push(new Array(1e5).fill(1));");
+    let r = v8vm(
+        &[
+            "--memory=32",
+            &format!("--dump={}", dump.display()),
+            path.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("v8vm: dump skipped after heap limit"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert!(!dump.exists(), "no dump may be written from an exhausted heap");
+}
+
+#[test]
 fn heap_cap_oom_exits_137_quickly_without_a_signal() {
     // The run helper unwraps status.code(), so a signal death (V8's own
     // OOM abort, SIGTRAP) fails this test before the code assert runs.

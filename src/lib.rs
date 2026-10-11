@@ -42,7 +42,8 @@ use world::{world_mut, World};
 pub struct Config {
     /// Wall-clock cap in ms; 0 disables. Default 60000.
     pub timeout_ms: u64,
-    /// V8 heap cap in MB. Default 256.
+    /// V8 heap cap in MB. Values below 8 are clamped up to 8 (V8 cannot
+    /// sustain a smaller heap). Default 256.
     pub heap_mb: usize,
     /// Arguments exposed to the guest as vm.args.
     pub args: Vec<String>,
@@ -177,7 +178,7 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
     }
     if tc.is_execution_terminating() {
         tc.cancel_terminate_execution();
-        return world_mut(&mut tc).terminated_exit();
+        return world_mut(&mut tc).take_terminated_exit();
     }
     report(&mut tc);
     1
@@ -218,7 +219,11 @@ fn execute_inner(
         return code;
     }
 
-    let watchdog = Watchdog::new(handle.clone(), spec.cfg.timeout_ms);
+    let watchdog = Watchdog::new(
+        handle.clone(),
+        spec.cfg.timeout_ms,
+        world_mut(scope).term.clone(),
+    );
 
     let mut code = eval_entry(scope, spec);
     if code == 0 {
@@ -230,7 +235,13 @@ fn execute_inner(
     drop(watchdog);
 
     if let Some(dump) = &spec.cfg.dump {
-        write_dump(scope, dump);
+        if world_mut(scope).heap_oom_happened {
+            // The heap is past its cap; evaluating vm.snapshot() there could
+            // itself push V8 into its fatal out-of-memory path.
+            eprintln!("v8vm: dump skipped after heap limit");
+        } else {
+            write_dump(scope, dump);
+        }
     }
     code
 }
@@ -244,17 +255,39 @@ fn execute(
     let mut world = World::new();
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
-    world.heap_mb = cfg.heap_mb.max(1);
 
-    // V8 dies at isolate creation (a check failure, SIGTRAP) when the
-    // initial heap exceeds the cap, so the initial size is clamped to it;
-    // a 0 MB cap from library callers is clamped to 1 MB the same way.
-    let cap_mb = cfg.heap_mb.max(1);
-    let params = v8::CreateParams::default().heap_limits(cap_mb.min(64) << 20, cap_mb << 20);
+    // The user cap is enforced below V8's own hard limit: V8 may grow into
+    // the headroom so allocation paths that never reach the near-heap-limit
+    // callback still pass a GC first and are stopped by the prologue check.
+    // The headroom is twice the cap (at least 32 MiB): shapes that grow by
+    // doubling (tables) request their next size while still under the cap,
+    // and a smaller margin lets that request hit V8's fatal path first.
+    // Caps below 8 MB cannot sustain V8 and are clamped up.
+    let cap_mb = cfg.heap_mb.max(8);
+    let v8_max_mb = cap_mb + (2 * cap_mb).max(32);
+    world.heap_mb = cap_mb;
+    let term = world.term.clone();
+    // A large explicit initial heap makes this V8 saturate the old
+    // generation near that size ("reduce" GCs, then its fatal OOM) well
+    // below the raised max, so the heap starts small and grows instead.
+    let params = v8::CreateParams::default().heap_limits(0, v8_max_mb << 20);
+
+    // The guard must outlive the isolate even on a panic unwind (drop
+    // order is reverse declaration), because isolate teardown runs GC that
+    // calls back in through the guard's data pointer.
+    let mut guard_slot: Option<Box<heap::HeapGuard>> = None;
     let mut isolate = v8::Isolate::new(params);
     let handle = isolate.thread_safe_handle();
-    let mut guard = Box::new(heap::HeapGuard::new(handle.clone(), world.heap_oom.clone()));
-    isolate.add_near_heap_limit_callback(heap::on_near_heap_limit, guard.callback_data());
+    {
+        let guard = guard_slot.insert(Box::new(heap::HeapGuard::new(
+            handle.clone(),
+            term.clone(),
+            cap_mb << 20,
+        )));
+        let data = guard.callback_data();
+        isolate.add_near_heap_limit_callback(heap::on_near_heap_limit, data);
+        isolate.add_gc_prologue_callback(heap::before_gc, data, v8::GCType::ALL);
+    }
     // The isolate owns the world through its embedder slot. On isolate
     // teardown the annex nulls its isolate pointer before the slots are
     // dropped, so the slot's Global handles see a disposed isolate and skip
@@ -269,10 +302,10 @@ fn execute(
         let mut scope = v8::ContextScope::new(&mut hs, context);
         execute_inner(&mut scope, &handle, &spec, replies)
     };
-    // The isolate is torn down while the guard is still alive: teardown can
-    // run GC, and the near-heap-limit callback would otherwise read freed
-    // memory through its data pointer. The guard drops after this point.
-    drop(isolate);
+    // The run has concluded: heap callbacks for the teardown GC stay
+    // inert from here on. The guard (declared above the isolate) drops
+    // last, after the isolate is gone.
+    term.finish();
     code
 }
 

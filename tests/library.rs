@@ -31,6 +31,17 @@ fn heap_cap_oom_returns_137_and_later_runs_still_work() {
     assert_eq!(v8vm::run("1 + 1", "after.js", &Config::new()), 0);
 }
 
+#[test]
+fn a_library_cap_below_the_minimum_is_clamped_up() {
+    let cfg = v8vm::Config {
+        heap_mb: 4,
+        stdin_consumed: true,
+        ..Config::new()
+    };
+    let src = "const m = new Map(); for (let i = 0;; i++) m.set(i, i);";
+    assert_eq!(v8vm::run(src, "clamped.js", &cfg), 137);
+}
+
 /// Joins a guest thread with a bound, so a guest whose watchdog never fires
 /// fails the test instead of hanging it.
 fn join_bounded(handle: std::thread::JoinHandle<i32>, secs: u64) -> i32 {

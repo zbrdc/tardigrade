@@ -2,8 +2,9 @@
 //! one process without seeing each other.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,8 +32,73 @@ pub(crate) struct NetMsg {
 /// checkpoint decides whether the run fails (Node semantics: attaching a
 /// handler late in the same tick, or in a microtask, is not a failure).
 pub(crate) struct PendingRejection {
+    /// Insertion order, so the first rejection can still be found across
+    /// the identity-hash buckets.
+    pub(crate) seq: u64,
     pub(crate) promise: v8::Global<v8::Promise>,
     pub(crate) value: Option<v8::Global<v8::Value>>,
+}
+
+/// Why a run was terminated from outside guest code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TermReason {
+    Timeout,
+    Oom,
+}
+
+/// Shared termination state: the watchdog thread and the heap callbacks
+/// mark the reason before calling terminate_execution, and the JS thread
+/// reads it at turn boundaries. V8's own termination flag can be swallowed
+/// inside microtask checkpoints and GC callbacks, so the flag, not
+/// is_execution_terminating(), is the reliable signal. `finished` silences
+/// the heap callbacks for teardown GCs once the run has concluded.
+pub(crate) struct Termination {
+    reason: AtomicU8,
+    finished: AtomicBool,
+}
+
+impl Termination {
+    pub(crate) fn new() -> Self {
+        Termination {
+            reason: AtomicU8::new(0),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    /// Marks why the run is being terminated; the first marker wins (an
+    /// OOM found before a late watchdog firing still reports as OOM).
+    pub(crate) fn mark(&self, reason: TermReason) {
+        let code = match reason {
+            TermReason::Timeout => 1,
+            TermReason::Oom => 2,
+        };
+        let _ = self.reason.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    pub(crate) fn reason(&self) -> Option<TermReason> {
+        match self.reason.load(Ordering::SeqCst) {
+            1 => Some(TermReason::Timeout),
+            2 => Some(TermReason::Oom),
+            _ => None,
+        }
+    }
+
+    /// Reads and clears the reason: exactly one caller concludes a run.
+    pub(crate) fn take_reason(&self) -> Option<TermReason> {
+        let reason = self.reason();
+        self.reason.store(0, Ordering::SeqCst);
+        reason
+    }
+
+    /// True once the run has concluded, so heap callbacks for teardown GCs
+    /// must not mark or terminate any more.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
 }
 
 /// All guest world state for one run. The isolate owns it through an embedder
@@ -53,14 +119,19 @@ pub(crate) struct World {
     /// The timer whose callback is on the stack, if any.
     pub(crate) running_timer: RunningTimer,
     exit_code: AtomicI32,
-    /// Set by V8's near-heap-limit callback (through the shared Arc it
-    /// holds; the callback gets no isolate reference to reach this slot).
-    pub(crate) heap_oom: Arc<AtomicBool>,
-    /// The configured cap, for the OOM report.
+    /// Termination reason shared with the watchdog thread and the heap
+    /// callbacks (they get no isolate reference, only this Arc).
+    pub(crate) term: Arc<Termination>,
+    /// The effective cap, for the OOM report.
     pub(crate) heap_mb: usize,
-    /// Rejections awaiting the next microtask checkpoint; first one still
-    /// unhandled when the checkpoint ends fails the run.
-    pub(crate) pending_rejections: Vec<PendingRejection>,
+    /// Sticky: an OOM concluded this run (the reason itself is consumed by
+    /// the single take that decides the exit code).
+    pub(crate) heap_oom_happened: bool,
+    /// Rejections awaiting the next microtask checkpoint, bucketed by the
+    /// rejecting promise's identity hash so a mass catch does not scan
+    /// every remembered rejection.
+    pub(crate) pending_rejections: HashMap<i32, Vec<PendingRejection>>,
+    pub(crate) next_rejection_seq: u64,
 }
 
 impl World {
@@ -77,25 +148,31 @@ impl World {
             stdin_sub: None,
             running_timer: RunningTimer::new(),
             exit_code: AtomicI32::new(-1),
-            heap_oom: Arc::new(AtomicBool::new(false)),
+            term: Arc::new(Termination::new()),
             heap_mb: 0,
-            pending_rejections: Vec::new(),
+            heap_oom_happened: false,
+            pending_rejections: HashMap::new(),
+            next_rejection_seq: 0,
         }
     }
 
-    /// Exit code for a cancelled execution termination: a guest vm.exit()
-    /// code wins, then the heap cap (137, with a one-line report), then the
-    /// wall-clock watchdog.
-    pub(crate) fn terminated_exit(&self) -> i32 {
+    /// Concludes a terminated run: a guest vm.exit() code wins, then the
+    /// heap cap (137, reported once on stderr), then the watchdog (124).
+    /// Exactly one caller concludes the run; `take` makes a stray second
+    /// call visibly wrong (124) instead of double-printing the report.
+    pub(crate) fn take_terminated_exit(&mut self) -> i32 {
         let code = self.exit_code();
         if code >= 0 {
             return code;
         }
-        if self.heap_oom.load(Ordering::SeqCst) {
-            eprintln!("v8vm: heap limit exceeded ({} MB)", self.heap_mb);
-            return 137;
+        match self.term.take_reason() {
+            Some(TermReason::Oom) => {
+                eprintln!("v8vm: heap limit exceeded ({} MB)", self.heap_mb);
+                self.heap_oom_happened = true;
+                137
+            }
+            _ => 124,
         }
-        124
     }
 
     pub(crate) fn exit_code(&self) -> i32 {

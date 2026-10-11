@@ -16,10 +16,10 @@ enum Outcome {
 
 /// Terminated means guest-requested vm.exit() if set, else the heap cap
 /// (137) or the watchdog (124).
-fn stop_code(world: &World, oc: Outcome) -> Option<i32> {
+fn stop_code(world: &mut World, oc: Outcome) -> Option<i32> {
     match oc {
         Outcome::Ok => None,
-        Outcome::Terminated => Some(world.terminated_exit()),
+        Outcome::Terminated => Some(world.take_terminated_exit()),
         Outcome::Exception => Some(1),
     }
 }
@@ -118,7 +118,7 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
         return check_unhandled(scope);
     }
     scope.cancel_terminate_execution();
-    Some(world_mut(scope).terminated_exit())
+    Some(world_mut(scope).take_terminated_exit())
 }
 
 // ---- unhandled rejections ----
@@ -126,12 +126,20 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
 /// Removes the remembered rejection for `msg`'s promise, if any: a handler
 /// attached before the next checkpoint un-fails the run.
 fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
-    // The list is taken out because matching opens each stored Global
-    // through the scope, which the world borrow would otherwise hold.
-    let mut pending = std::mem::take(&mut world_mut(scope).pending_rejections);
     let promise = msg.get_promise();
-    pending.retain(|e| e.promise.open(scope) != &*promise);
-    world_mut(scope).pending_rejections = pending;
+    let hash = promise.get_identity_hash().get();
+    // Bucketed by identity hash so a mass catch does not scan every
+    // remembered rejection; identity is confirmed with == inside the
+    // bucket (hashes are stable but not unique).
+    let mut bucket = match world_mut(scope).pending_rejections.remove(&hash) {
+        Some(b) => b,
+        None => return,
+    };
+    bucket.retain(|e| e.promise.open(scope) != &*promise);
+    let world = world_mut(scope);
+    if !bucket.is_empty() {
+        world.pending_rejections.insert(hash, bucket);
+    }
 }
 
 pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
@@ -143,24 +151,40 @@ pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) 
         PromiseRejectWithNoHandler => {
             let promise = v8::Global::new(scope, msg.get_promise());
             let value = msg.get_value().map(|v| v8::Global::new(scope, v));
-            world_mut(scope)
+            let hash = msg.get_promise().get_identity_hash().get();
+            let world = world_mut(scope);
+            let seq = world.next_rejection_seq;
+            world.next_rejection_seq += 1;
+            world
                 .pending_rejections
-                .push(crate::world::PendingRejection { promise, value });
+                .entry(hash)
+                .or_default()
+                .push(crate::world::PendingRejection { seq, promise, value });
         }
         PromiseHandlerAddedAfterReject => forget_rejection(scope, &msg),
         _ => {}
     }
 }
 
-/// After a microtask checkpoint: the first rejection still missing a
-/// handler fails the run with 1.
+/// After a microtask checkpoint: the first (lowest seq) rejection still
+/// missing a handler fails the run with 1.
 fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
     let first = {
         let world = world_mut(scope);
-        if world.pending_rejections.is_empty() {
-            return None;
+        // Buckets keep insertion order, so each bucket's front is its
+        // earliest rejection; the minimum over the fronts is the first.
+        let hash = world
+            .pending_rejections
+            .iter()
+            .filter(|(_, b)| !b.is_empty())
+            .min_by_key(|(_, b)| b[0].seq)
+            .map(|(h, _)| *h)?;
+        let bucket = world.pending_rejections.get_mut(&hash).unwrap();
+        let first = bucket.remove(0);
+        if bucket.is_empty() {
+            world.pending_rejections.remove(&hash);
         }
-        world.pending_rejections.remove(0)
+        first
     };
     let text = match &first.value {
         Some(v) => {
@@ -177,7 +201,7 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     loop {
         if scope.is_execution_terminating() {
             scope.cancel_terminate_execution();
-            return world_mut(scope).terminated_exit();
+            return world_mut(scope).take_terminated_exit();
         }
         if let Some(c) = run_net(scope) {
             return c;
