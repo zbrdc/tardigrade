@@ -46,6 +46,22 @@ fn run_js(name: &str, source: &str) -> Run {
     v8vm(&[path.to_str().unwrap()], b"")
 }
 
+/// Waits for a child with a bound, so a guest that ignores its termination
+/// fails the test instead of hanging it. stdin must already be taken (and
+/// held) by the caller before calling this.
+fn wait_within(mut child: std::process::Child, secs: u64) -> std::process::Output {
+    child.stdin.take(); // never close the pipe: the guest idles on it
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => panic!("wait failed: {}", e),
+        Err(_) => panic!("guest did not exit within {} s", secs),
+    }
+}
+
 #[test]
 fn console_log_and_error_use_separate_streams() {
     let r = run_js("console", "console.log('out', 1); console.error('err');");
@@ -110,6 +126,98 @@ fn rejection_handled_after_a_timer_fails() {
     );
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("unhandled promise rejection: 1"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn a_zero_ms_timer_cannot_rescue_a_rejection() {
+    // The end-of-script checkpoint decides before any timer turn runs,
+    // matching Node (the busy-wait keeps the timer from firing in-script).
+    let r = run_js(
+        "rej-zero-timer",
+        "const p = Promise.reject(1);
+         setTimeout(() => p.catch(() => console.log('late-caught')), 0);
+         const t = Date.now(); while (Date.now() - t < 10) {}",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unhandled promise rejection: 1"), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "");
+}
+
+#[test]
+fn a_catch_in_a_later_timer_cannot_rescue_within_the_turn() {
+    // Both timers are due in the same turn; the checkpoint after the first
+    // callback decides before the second one runs.
+    let r = run_js(
+        "rej-two-timers",
+        "let p;
+         setTimeout(() => { p = Promise.reject(new Error('r2')); }, 5);
+         setTimeout(() => { p.catch(() => console.log('late-caught')); }, 5);
+         const t = Date.now(); while (Date.now() - t < 20) {}",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unhandled promise rejection: Error: r2"), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "");
+}
+
+#[test]
+fn a_rejection_from_a_stdin_continuation_fails_the_run() {
+    let path = script(
+        "rej-stdin",
+        "vm.stdin.read().then(() => { throw new Error('boom') });",
+    );
+    for input in [b"hi\n" as &[u8], b""] {
+        let r = v8vm(&[path.to_str().unwrap()], input);
+        assert_eq!(r.code, 1, "input {:?}: stderr: {}", input, r.stderr);
+        assert!(r.stderr.contains("unhandled promise rejection: Error: boom"), "stderr: {}", r.stderr);
+    }
+}
+
+#[test]
+fn an_oom_inside_a_microtask_reports_137() {
+    // The termination is swallowed inside the microtask checkpoint, so the
+    // shared reason flag, not V8's state, must conclude the run.
+    let path = script(
+        "oom-microtask",
+        "const a = []; Promise.resolve().then(() => { for (;;) a.push({ x: new Array(1e4).fill(1) }); });",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("heap limit exceeded"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn the_watchdog_reaches_a_microtask_that_spins() {
+    let path = script("spin-microtask", "Promise.resolve().then(() => { for (;;) {} });");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--timeout=300", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn the_watchdog_reaches_a_guest_idle_on_a_far_timer() {
+    let path = script("idle-timer", "setTimeout(() => {}, 10000);");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--timeout=1000", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn the_watchdog_reaches_a_guest_idle_on_stdin() {
+    let path = script("idle-stdin", "vm.stdin.read().then(() => {});");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(["--timeout=1000", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let _held = child.stdin.take(); // open, never written: the guest idles
+    let start = std::time::Instant::now();
+    let out = wait_within(child, 3);
+    assert_eq!(out.status.code(), Some(124));
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
 }
 
 #[test]
@@ -443,6 +551,33 @@ fn serve_reports_thrown_errors_as_json_and_keeps_going() {
 fn serve_settles_timers_between_commands() {
     let r = serve("serve-timers", "setTimeout(() => { state.n = 9 }, 5)\nstate.n\n");
     assert_eq!(r.stdout, "1\n9\n"); // first line is the timer id
+}
+
+#[test]
+fn an_unhandled_rejection_inside_a_serve_command_fails_the_session() {
+    let path = script("serve-reject", "globalThis.p = null;");
+    let r = v8vm(
+        &["--serve", path.to_str().unwrap()],
+        b"p = Promise.reject('sv')\n42\n",
+    );
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{}\n", "the reply goes out before the boundary decides");
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection: sv"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn an_oom_inside_a_serve_expression_reports_137() {
+    let path = script("serve-oom", "");
+    let r = v8vm(
+        &["--memory=32", "--serve", path.to_str().unwrap()],
+        b"(() => { const a = []; for (;;) a.push(new Array(1e5).fill(1)); })()\n",
+    );
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("heap limit exceeded"), "stderr: {}", r.stderr);
 }
 
 #[test]

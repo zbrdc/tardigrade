@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Sender};
 
 use crate::diag::{report, to_rust_string};
-use crate::event_loop::event_loop;
+use crate::event_loop::{event_loop, stopped};
 use crate::eval_src;
 use crate::stdin::{self, StdinSub};
 use crate::world::world_mut;
@@ -130,7 +130,10 @@ pub(crate) fn serve_loop(scope: &mut v8::HandleScope, replies: &ReplySink) -> i3
     if exit >= 0 {
         exit
     } else {
-        0
+        // A termination that landed as the last command's work wound down
+        // (the reason flag, not V8's possibly swallowed state) still ends
+        // the session instead of falling through to a clean exit.
+        stopped(scope).unwrap_or(0)
     }
 }
 

@@ -33,7 +33,7 @@ use std::sync::mpsc;
 
 use api::install;
 use diag::report;
-use event_loop::{event_loop, promise_reject_callback};
+use event_loop::{event_loop, promise_reject_callback, stopped};
 use watchdog::Watchdog;
 use world::{world_mut, World};
 
@@ -173,15 +173,26 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
         return 0;
     }
     let mut tc = v8::TryCatch::new(scope);
-    if eval_src(&mut tc, spec.source, spec.entry).is_some() {
-        return 0;
-    }
+    let result = eval_src(&mut tc, spec.source, spec.entry);
     if tc.is_execution_terminating() {
         tc.cancel_terminate_execution();
         return world_mut(&mut tc).take_terminated_exit();
     }
-    report(&mut tc);
-    1
+    match result {
+        Some(_) => {
+            drop(tc);
+            // End of the entry tick: V8 has drained the script's
+            // microtasks, so the checkpoint decision applies now, before
+            // any timer or network turn can rescue a rejection.
+            stopped(scope)
+                .or_else(|| event_loop::check_unhandled(scope))
+                .unwrap_or(0)
+        }
+        None => {
+            report(&mut tc);
+            1
+        }
+    }
 }
 
 fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
