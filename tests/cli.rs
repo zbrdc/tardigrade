@@ -2621,13 +2621,17 @@ fn ts_smoke_skips_loudly_without_a_toolchain() {
     let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-smoke-empty-home");
     std::fs::create_dir_all(&home).expect("create fake home");
     // /bin/bash, not "bash": the emptied child PATH is applied before the
-    // exec, so a PATH lookup for the shell itself would fail.
+    // exec, so a PATH lookup for the shell itself would fail. The require
+    // flag is scrubbed: this test owns it, and an inherited
+    // TARDIGRADE_REQUIRE_TS=1 (the documented strict mode) would turn the
+    // skip into exit 1 and make strict mode unable to ever pass.
     let out = Command::new("/bin/bash")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
         .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
         .env("BUN", "")
         .env("HOME", &home)
         .env("PATH", "")
+        .env_remove("TARDIGRADE_REQUIRE_TS")
         .output()
         .expect("run ts-smoke");
     let stdout = String::from_utf8(out.stdout).unwrap();
