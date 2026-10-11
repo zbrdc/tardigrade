@@ -1,7 +1,8 @@
-# CI for v8vm. The v8 crate downloads a prebuilt static V8 library on the
-# first build (into the target directory, under release/gn_out/), so the
-# first uncached run is slow; Swatinem/rust-cache caches target/ and the
-# cargo registry between runs, which includes that archive.
+# CI for v8vm. The v8 crate downloads a prebuilt static V8 into
+# target/release/gn_out on its first build, so the first uncached run is
+# slow. The workflow caches that directory explicitly with cache-directories
+# on Swatinem/rust-cache, because rust-cache's target cleanup would otherwise
+# drop it. Verify on the second CI run that the download is skipped.
 name: CI
 
 on:
@@ -15,7 +16,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
@@ -28,6 +29,8 @@ jobs:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          cache-directories: target/release/gn_out
       - name: Test, clippy and smoke checks
         # make ci = cargo test, cargo clippy (warnings denied), then make check
         # (build + scripted checks that drive the example programs end to end).
