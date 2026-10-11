@@ -1736,10 +1736,9 @@ fn serve_survives_a_command_that_fails_to_compile() {
     assert_eq!(lines.next(), Some("42"), "the session continues");
     assert_eq!(lines.next(), None);
 }
-
 #[test]
 fn serve_names_thrown_errors_and_thrown_strings() {
-    let r = serve("serve-thrown", "null.f()\nthrow 'str'\n3\n");
+    let r = serve("serve-thrown", "null.f()\n(() => { throw 'str' })()\n3\n");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     let mut lines = r.stdout.lines();
     let named = lines.next().unwrap();
@@ -1756,6 +1755,37 @@ fn serve_awaits_promises_and_prints_the_settled_value() {
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "42\n7\n\"tick\"\n");
+}
+
+#[test]
+fn an_unencodable_promise_value_is_an_error_reply_not_a_session_end() {
+    // The ok handler's own failure (BigInt, circular) must be caught and
+    // answered, not rejected down the chain as an unhandled rejection.
+    let path = script("serve-unencodable", "globalThis.o = {}; globalThis.o.self = globalThis.o;");
+    let r = v8vm(
+        &["--serve", path.to_str().unwrap()],
+        b"Promise.resolve(1n)\n(async () => 1n)()\nPromise.resolve(o)\n(async () => o)()\n5\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut lines = r.stdout.lines();
+    for expected in [
+        "TypeError: Do not know how to serialize a BigInt",
+        "TypeError: Do not know how to serialize a BigInt",
+        "TypeError: Converting circular structure to JSON",
+        "TypeError: Converting circular structure to JSON",
+    ] {
+        let line = lines.next().unwrap();
+        assert!(line.contains("$error") && line.contains(expected), "{}", line);
+    }
+    assert_eq!(lines.next(), Some("5"), "the session continues");
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn a_custom_thenable_is_awaited_through_promise_adoption() {
+    let r = serve("serve-thenable", "({ then(f) { f('custom') } })\n3\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "\"custom\"\n3\n");
 }
 
 #[test]
@@ -1780,11 +1810,86 @@ fn serve_command_timeout_bounds_a_never_settling_promise() {
 }
 
 #[test]
+fn a_shorter_run_timeout_fires_during_the_command_timeout_wait() {
+    // The idle wait for the command deadline must sit on the termination
+    // condvar, not sleep the whole budget: --timeout has to land on time.
+    // The 3 s bound fails the test outright if the wait overshoots.
+    let path = script("serve-two-clocks", "globalThis.state = { n: 0 };");
+    let r = v8vm_bounded(
+        &["--timeout=500", "--command-timeout=4000", "--serve", path.to_str().unwrap()],
+        b"new Promise(() => {})\n",
+        std::time::Duration::from_secs(3),
+    );
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "", "the run ended before any reply was owed");
+}
+
+#[test]
+fn the_command_timeout_bounds_the_post_reply_settling() {
+    // A spinning timer scheduled by the command spins the boundary loop
+    // after the reply: the deadline must stop it, say so on stderr once,
+    // and leave the session usable.
+    let r = serve_with(
+        &["--command-timeout=400"],
+        "serve-post-spin",
+        "setTimeout(() => { for(;;){} }, 0), 1\n2\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n2\n");
+    assert_eq!(r.stderr.matches("timed out after its reply").count(), 1, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn the_command_timeout_bounds_a_repeating_timer() {
+    // A repeating timer keeps the boundary loop alive forever (without a
+    // deadline the session never returns to its commands - pre-existing);
+    // with one, each command's settling ends at its deadline.
+    let r = serve_with(
+        &["--command-timeout=400"],
+        "serve-interval",
+        "setInterval(() => {}, 10), 1\n2\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n2\n");
+    assert!(r.stderr.contains("timed out after its reply"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn vm_exit_wins_over_the_command_timeout() {
+    let r = serve_with(&["--command-timeout=100000"], "serve-exit-cmd", "vm.exit(7)\n");
+    assert_eq!(r.code, 7, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "", "the session ends, no reply is owed");
+}
+
+#[test]
+fn the_heap_cap_wins_over_the_command_timeout() {
+    let path = script("serve-oom-cmd", "");
+    let r = v8vm_bounded(
+        &["--memory=32", "--command-timeout=60000", "--serve", path.to_str().unwrap()],
+        b"(() => { const a = []; for (;;) a.push(new Array(1e5).fill(1)); })()\n",
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("heap limit exceeded"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn a_run_level_timeout_ends_a_serve_session_with_124() {
+    let path = script("serve-run-timeout", "globalThis.state = { n: 0 };");
+    let r = v8vm_bounded(
+        &["--timeout=300", "--command-timeout=5000", "--serve", path.to_str().unwrap()],
+        b"(function () { for (;;) {} })()\n",
+        std::time::Duration::from_secs(10),
+    );
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+}
+
+#[test]
 fn serve_command_timeout_breaks_an_infinite_loop_and_state_survives() {
     let r = serve_with(
         &["--command-timeout=400"],
         "serve-spin-cmd",
-        "state.n = 5\nfor(;;){}\nstate.n\n",
+        "state.n = 5\n(function () { for (;;) {} })()\nstate.n\n",
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "5\n{\"$error\":\"command timed out\"}\n5\n");
@@ -1801,6 +1906,32 @@ fn serve_command_timeout_breaks_a_spinning_await_and_state_survives() {
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "6\n{\"$error\":\"command timed out\"}\n6\n");
+}
+
+#[test]
+fn a_command_finishing_at_its_deadline_does_not_poison_the_next() {
+    // Each command spins exactly its budget, so the watchdog fires right
+    // as the command finishes: the pending terminate request must be
+    // cancelled (a request is invisible to is_execution_terminating until
+    // processed), or the next command dies with no reply and exit 124.
+    let mut commands = String::new();
+    for i in 0..300 {
+        commands.push_str(&format!(
+            "(function(){{var t=performance.now();while(performance.now()-t<2);return {i}}})()\n"
+        ));
+    }
+    let r = v8vm_bounded(
+        &["--command-timeout=2", "--serve", script("serve-edge", "globalThis.state = { n: 0 };").to_str().unwrap()],
+        commands.as_bytes(),
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines.len(), 300, "every command answered");
+    for (i, line) in lines.iter().enumerate() {
+        let ok = *line == format!("{i}") || *line == "{\"$error\":\"command timed out\"}";
+        assert!(ok, "line {}: {}", i, line);
+    }
 }
 
 #[test]
@@ -1835,18 +1966,66 @@ fn a_bad_command_timeout_flag_is_a_usage_error() {
 
 #[test]
 fn an_unhandled_rejection_inside_a_serve_command_fails_the_session() {
+    // The command's own value is fine; the rejection belongs to another
+    // promise nobody handles, so the run's boundary decides as usual.
     let path = script("serve-reject", "globalThis.p = null;");
     let r = v8vm(
         &["--serve", path.to_str().unwrap()],
-        b"p = Promise.reject('sv')\n42\n",
+        b"(void Promise.reject('sv'), 42)\n99\n",
     );
     assert_eq!(r.code, 1, "stderr: {}", r.stderr);
-    assert_eq!(r.stdout, "{}\n", "the reply goes out before the boundary decides");
+    assert_eq!(r.stdout, "42\n", "the reply goes out before the boundary decides");
     assert!(
         r.stderr.contains("v8vm: unhandled promise rejection: sv"),
         "stderr: {}",
         r.stderr
     );
+}
+
+#[test]
+fn a_rejection_of_the_command_value_is_an_error_reply_and_the_session_continues() {
+    let r = serve(
+        "serve-return-reject",
+        "Promise.reject('sv')\n(async () => { throw new Error('fast') })()\n7\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{\"$error\":\"sv\"}\n{\"$error\":\"fast\"}\n7\n");
+}
+
+#[test]
+fn serve_answers_object_literal_commands_as_one_expression() {
+    let r = serve("serve-object", "{a: 1}\n{\"a\": 1}\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{\"a\":1}\n{\"a\":1}\n");
+}
+
+#[test]
+fn a_statement_command_is_a_syntax_error_reply() {
+    let r = serve("serve-statement", "let x = 1\n40 + 2\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut lines = r.stdout.lines();
+    let first = lines.next().unwrap();
+    assert!(first.contains("SyntaxError"), "{}", first);
+    assert_eq!(lines.next(), Some("42"), "the session continues");
+}
+
+#[test]
+fn a_replaced_eval_does_not_reach_later_commands() {
+    let r = serve("serve-eval-hijack", "globalThis.eval = 42\n1 + 1\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "42\n2\n");
+}
+
+#[test]
+fn serve_leaves_no_host_globals_behind() {
+    // The check runs as a second command: a scratch global left by the
+    // first would be visible by then.
+    let r = serve(
+        "serve-no-scratch",
+        "1 + 1\nObject.keys(globalThis).filter((k) => k.indexOf('__v8vm') === 0)\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "2\n[]\n");
 }
 
 #[test]

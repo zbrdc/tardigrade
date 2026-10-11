@@ -287,52 +287,59 @@ a versioned snapshot here, not as a file list. Legacy-key errors show the
 
 ## Console protocol (--serve)
 
-Input: one JS expression per line, compiled and run in the global scope
-of one long-lived guest, so state (`var`s, globals, timers, files)
-persists across commands. Empty lines are skipped. One trailing CR is
-stripped, so "cmd", "cmd\r\n" and a final unterminated "cmd\r" are one
-command. A line that is not valid UTF-8 ends the session with exit 0
-(like the old read error); bytes pulled after it are kept for the next
-reader.
+Input: one JS expression per line - exactly one expression, as on the
+command line's wrapper: `let x = 1` or two statements on a line are a
+SyntaxError reply, not commands. Each line is compiled as its own
+wrapper in one long-lived guest, so state (globals, timers, files)
+persists across commands and no host value ever sits in a guest-visible
+global (replacing globalThis.eval or JSON touches only what the guest
+itself reads). Empty lines are skipped. One trailing CR is stripped, so
+"cmd", "cmd\r\n" and a final unterminated "cmd\r" are one command. A
+line that is not valid UTF-8 ends the session with exit 0 (like the old
+read error); bytes pulled after it are kept for the next reader.
 
 Output: one JSON line per command, the value through JSON.stringify
-(undefined and functions become null). A command that fails to compile
-or throws is a reply, not the end of the session:
+(undefined and functions become null). A command that fails to compile,
+throws, or produces a value JSON cannot encode (a BigInt, a circular
+structure) is a reply, not the end of the session:
 
-- {"$error":"<message>"} for a compile error, a thrown value, or a value
-  whose stringification throws (a circular structure). The message is
-  the Error's own for plain Errors, "Name: message" for named ones
-  (SyntaxError, TypeError, ...), and String(value) for anything else - a
-  thrown string says itself
-- a native Promise value that is pending or fulfilled when the
-  expression returns is the async result: the encoders are attached and
-  the event loop runs until it settles; the reply is the fulfillment
-  value as JSON, or {"$error":...} on rejection. The await counts as a
-  handler, so such a rejection is not an unhandled one. Custom thenables
-  are not awaited (they stringify as objects)
-- a promise still sitting unhandled in the run's rejection map when the
-  expression returns - a synchronous Promise.reject(...) with no catch,
-  including an async function that throws before its first await - is
-  left to the run's unhandled-rejection boundary: the reply is {}, and
-  the session fails with exit 1 at the next microtask checkpoint, as
-  before. A rejected promise with a handler attached by the command is
-  awaited like any other
+- {"$error":"<message>"}. The message is the Error's own for plain
+  Errors, "Name: message" for named ones (SyntaxError, TypeError,
+  ...), and String(value) for anything else - a thrown string says
+  itself
+- a thenable value (anything with a callable then; every Promise) is
+  awaited: it is adopted by Promise.resolve and the event loop runs
+  until it settles; the reply is the fulfillment value as JSON, or
+  {"$error":...} on rejection. The await is a handler, so a rejection of
+  the command's own value - a bare Promise.reject(...), an async
+  function that throws before its first await - is answered as an
+  $error and the session continues
+- unhandled rejections of other promises still fail the session as
+  always: `(void Promise.reject(1), 2)` replies 2, then the run ends
+  with exit 1 and one stderr line at the microtask checkpoint
 - a promise nothing can settle any more (the event loop is idle with
   the promise still pending) replies {"$error":"promise never settled"};
   with --command-timeout it replies {"$error":"command timed out"} when
   the deadline fires instead
-- --command-timeout=<ms> bounds each command's wall clock. On expiry
-  the reply above is printed, V8's pending termination is cancelled, and
-  the session continues with its state intact. The watchdog enforcing
-  it is per command and is settled (joined) before the cancel, so a late
-  terminate cannot poison the next command; a run-level reason (vm.exit,
-  --timeout, the heap cap) that races it still ends the session with its
-  own code
+- --command-timeout=<ms> bounds each command's whole life: its
+  evaluation and, after the reply, the settling of the work it left
+  pending. On expiry the command replies {"$error":"command timed
+  out"} (or, if the reply already went out, prints one stderr line
+  "v8vm: command timed out after its reply"), V8's pending termination
+  is cancelled, and the session continues with its state intact. The
+  watchdog enforcing it is per command and is settled (joined) before
+  the cancel - which is unconditional, because a terminate request
+  still pending is invisible to the engine's own flag - so neither a
+  late terminate nor an unprocessed request can poison the next
+  command; a run-level reason (vm.exit, --timeout, the heap cap) that
+  races it still ends the session with its own code. Without the flag,
+  work a command leaves pending (a repeating timer) can hold the
+  session between commands indefinitely, as before
 
 Replies rendezvous with the caller's writer, so a reply is on stdout
 before anything the guest prints after it; output the command's own
-microtasks print still comes first, like before. Between commands the
-event loop settles timers, network messages and microtasks.
+microtasks print still comes first. Between commands the event loop
+settles timers, network messages and microtasks.
 
 Only host-level failure ends the session: a stdin I/O error (invalid
 UTF-8), vm.exit (its code), the whole-run --timeout (124), the heap cap

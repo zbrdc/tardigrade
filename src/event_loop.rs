@@ -154,10 +154,10 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
 
 // ---- unhandled rejections ----
 
-/// Removes the remembered rejection for `msg`'s promise, if any: a handler
-/// attached before the next checkpoint un-fails the run.
-fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
-    let promise = msg.get_promise();
+/// Drops the remembered rejection for `promise`, as an attached handler
+/// would: the host itself consumed the rejection (the serve console
+/// answers with it), so it must not fail the run at the next checkpoint.
+pub(crate) fn forget_rejection_of(scope: &mut v8::Isolate, promise: &v8::Promise) {
     let hash = promise.get_identity_hash().get();
     // Bucketed by identity hash so a mass catch does not scan every
     // remembered rejection; identity is confirmed with == inside the
@@ -166,11 +166,17 @@ fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessag
         Some(b) => b,
         None => return,
     };
-    bucket.retain(|e| e.promise.open(scope) != &*promise);
+    bucket.retain(|e| e.promise.open(scope) != promise);
     let world = world_mut(scope);
     if !bucket.is_empty() {
         world.pending_rejections.insert(hash, bucket);
     }
+}
+
+/// Removes the remembered rejection for `msg`'s promise, if any: a handler
+/// attached before the next checkpoint un-fails the run.
+fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
+    forget_rejection_of(scope, &msg.get_promise());
 }
 
 pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {

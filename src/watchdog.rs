@@ -100,10 +100,11 @@ pub(crate) struct CommandWatchdog {
 }
 
 struct Guard {
-    /// True once the command is over (normally or by recovery): the
-    /// thread exits its park or its re-request loop on it.
+    /// The spawned thread, when the spawn worked; None leaves the command
+    /// without a deadline (a spawn failure must not panic here - it is the
+    /// same failure it would be guarding).
     stop: Arc<(Mutex<bool>, Condvar)>,
-    thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CommandWatchdog {
@@ -113,8 +114,9 @@ impl CommandWatchdog {
         term: Arc<Termination>,
         deadline: Option<Instant>,
     ) -> Self {
-        let guard = deadline.map(|d| spawn_guard(iso, term, d));
-        CommandWatchdog { guard }
+        CommandWatchdog {
+            guard: deadline.map(|d| spawn_guard(iso, term, d)),
+        }
     }
 
     /// Ends the thread and waits for it: after settle() returns, no
@@ -126,7 +128,9 @@ impl CommandWatchdog {
         if let Some(g) = self.guard.take() {
             *g.stop.0.lock().unwrap() = true;
             g.stop.1.notify_all();
-            let _ = g.thread.join();
+            if let Some(t) = g.thread {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -137,19 +141,24 @@ impl Drop for CommandWatchdog {
     }
 }
 
-/// A spawn failure here only disables the deadline for one command (like
+/// A spawn failure only disables the deadline for one command (like
 /// a run without --command-timeout); the session itself is unaffected.
 fn spawn_guard(iso: v8::IsolateHandle, term: Arc<Termination>, deadline: Instant) -> Guard {
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let parked = stop.clone();
     let thread = std::thread::Builder::new()
         .name("v8vm-command-watchdog".to_string())
-        .spawn(move || command_thread(iso, term, parked, deadline))
-        .unwrap_or_else(|e| {
+        .spawn(move || command_thread(iso, term, parked, deadline));
+    match thread {
+        Ok(t) => Guard {
+            stop,
+            thread: Some(t),
+        },
+        Err(e) => {
             eprintln!("v8vm: cannot spawn command watchdog: {}", e);
-            std::thread::spawn(|| {})
-        });
-    Guard { stop, thread }
+            Guard { stop, thread: None }
+        }
+    }
 }
 
 /// Parks until `deadline` (false) or a stop (true). Pure condvar state,
