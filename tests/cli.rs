@@ -1755,7 +1755,9 @@ fn thread_cpu_ticks(pid: u32, comm: &str) -> Option<u64> {
 /// so the run watchdog wakes with the CommandTimeout reason again and
 /// again while serve recovers. It must yield between wakes, not spin:
 /// the measured 2 ms busy-spin per recovery accumulated ~20 ticks in
-/// ~1.3 s; the fixed thread stays under a fraction of that.
+/// ~1.3 s; the fixed thread stays under a fraction of that. The thread
+/// name fits the kernel's 15-character comm limit exactly (see
+/// thread_cpu_ticks).
 #[cfg(target_os = "linux")]
 #[test]
 fn the_run_watchdog_does_not_spin_while_serve_recovers_timeouts() {
@@ -1788,7 +1790,7 @@ fn the_run_watchdog_does_not_spin_while_serve_recovers_timeouts() {
     let start = std::time::Instant::now();
     let ticks = loop {
         assert!(start.elapsed() < std::time::Duration::from_secs(30), "session never ran");
-        if let Some(t) = thread_cpu_ticks(pid, "tardigrade-run-wd") {
+        if let Some(t) = thread_cpu_ticks(pid, "tardigrade-runw") {
             if start.elapsed() >= std::time::Duration::from_millis(1000) {
                 break t;
             }
@@ -1800,6 +1802,32 @@ fn the_run_watchdog_does_not_spin_while_serve_recovers_timeouts() {
     };
     let _ = child.wait().expect("reap tardigrade");
     assert!(ticks <= 5, "run watchdog used {} CPU ticks in ~1 s", ticks);
+}
+
+/// A virtual await settles only at the timer it waits on, even when
+/// other timers are queued further out: the loop must not advance the
+/// clock on its way out once the promise is settled (a tuple match once
+/// evaluated the park decision even for a finished loop, jumping the
+/// clock to the next pending timer).
+#[test]
+fn a_virtual_await_does_not_advance_the_clock_past_its_own_timer() {
+    let path = script("serve-virtual-await", "globalThis.state = { n: 0 };");
+    let args = ["--clock=virtual", "--serve", path.to_str().unwrap()];
+    let r = tardigrade_bounded(
+        &args,
+        b"(setTimeout(() => {}, 50000), new Promise((r) => setTimeout(() => r(1), 0)))\nperformance.now()\n",
+        std::time::Duration::from_secs(10),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n1\n", "the clock stops at the awaited timer");
+
+    let r = tardigrade_bounded(
+        &args,
+        b"(setInterval(() => {}, 7), new Promise((r) => setTimeout(() => r(1), 0)))\nperformance.now()\n",
+        std::time::Duration::from_secs(10),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n1\n", "the clock stops at the awaited timer");
 }
 
 #[test]

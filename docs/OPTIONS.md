@@ -6,6 +6,13 @@
     tardigrade --serve [options] [entry.js]
     tardigrade --sandbox-check
 
+The options, expanded:
+
+    tardigrade [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>]
+               [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual]
+               [--epoch=<ms>] [--preload=<file>] [--dump=<file>]
+               [--serve] [--sandbox] <entry.js | -> [args...]
+
 ## Description
 
 tardigrade runs the JavaScript program `entry.js` in a fresh V8 isolate with a
@@ -38,6 +45,22 @@ blocked in a write to a full stdout or stderr pipe, or one of the V8 aborts
 listed in [KNOWN_RISKS.md](KNOWN_RISKS.md#process-aborts). For hostile
 code, drain or redirect the output and also bound the process from outside
 (for example with `timeout -s KILL`).
+
+### --command-timeout=\<ms\>
+
+Console mode only: wall-clock limit for one command, in milliseconds.
+Default 0, which disables it (also in the library's `Config`). When it
+expires the command replies `{"$error":"command timed out"}`, V8's pending
+termination is cancelled, and the session continues with its state -
+variables, files, timers - intact. Unlike `--timeout`, which ends the whole
+run with 124, a command timeout never ends the session by itself.
+
+The limit covers the command's whole life: its evaluation and, after the
+reply, the settling of the work it left pending. A `vm.exit` always wins,
+even when it lands while the timeout is being recovered; a run-level
+reason (`--timeout`, the heap cap) that races it still ends the session
+with its own code. See [--serve](#--serve) for what a timeout stops and
+what it leaves running.
 
 ### --memory=\<mb\>
 
@@ -99,8 +122,14 @@ Real time still applies in these places:
 - A self-sustaining `vm.net` ping-pong spins at full CPU, without the
   pause between turns that real time takes.
 - Under `--serve` the virtual clock is one timeline for the whole session:
-  it carries across commands, and each command's timers settle at once in
-  the loop turn after it.
+  it carries across commands. A command's awaited promise still jumps the
+  clock to the timer it waits on - and no further. The settling after a
+  reply never jumps the clock: only work already due at the reply's
+  virtual time runs, and because timer deadlines are clamped to at least
+  1 ms, nothing the command scheduled is due at that instant, so leftover
+  timers stay queued until a later command's await moves the clock past
+  them. A leftover repeating timer therefore costs nothing between
+  commands under the virtual clock.
 
 How the virtual clock keeps the host clock out of reach of the guest is
 described in [KNOWN_RISKS.md](KNOWN_RISKS.md#virtual-clock).
@@ -164,32 +193,94 @@ How the file is written:
 
 ### --serve
 
-Console mode. tardigrade runs `entry.js` once (the entry is optional), then
-reads one JavaScript expression per line from stdin and writes one line of
-JSON per expression to stdout:
+Console mode. tardigrade runs `entry.js` once (the entry is optional),
+then reads one JavaScript expression per line from stdin and answers each
+with exactly one line of JSON on stdout. The session shares one guest, so
+globals, timers and files persist across commands; each line is compiled
+as its own expression, so no host value ever sits in a guest-visible
+global (replacing `globalThis.eval` or `JSON` changes only what later
+commands read, never the protocol itself).
 
-- the reply is `JSON.stringify` of the expression's value; `undefined` and
-  functions give `null`, and a promise gives `{}` because it is not
-  awaited;
-- an expression that throws gives `{"$error":"<message>"}`, and the
-  session continues;
-- lines with no characters are skipped (a line of only blanks is a syntax
-  error and ends the session), a trailing carriage return is stripped, a
-  trailing `//` comment is allowed, and a last line without a newline is
-  still a command;
-- pending timers and `vm.net` messages settle after every command;
-- the session ends at the end of stdin; input that is not valid UTF-8 also
-  ends it.
+The reply is `JSON.stringify` of the expression's value (`undefined` and
+functions give `null`), or an error object:
 
-The entry cannot be `-`, because stdin is the command channel; the guest's
-`vm.stdin` is at end of file. There is no per-command time limit:
-`--timeout` defaults to 0 in this mode, and when given it bounds the whole
-session, not each command. A command still running at the deadline is
-stopped at once; a deadline that passes while the session waits for input
-takes effect when the next line or the end of input arrives (exit 124). See
-[MANUAL.md](MANUAL.md#console-mode) for an example, and
-[KNOWN_BUGS.md](KNOWN_BUGS.md#console-mode---serve) for the current limits
-of this mode.
+- a line that fails to compile, or an expression that throws, replies
+  `{"$error":"<message>"}` and the session continues. `let x = 1` or two
+  statements on one line are a syntax error, answered the same way; wrap
+  statements in an expression, for example
+  `(() => { let x = 1; return x })()`. The message is the error's own for
+  plain errors, `Name: message` for named ones (`SyntaxError`,
+  `TypeError`, ...), and `String(value)` for anything else - a thrown
+  string says itself;
+- a value that JSON cannot encode (a `BigInt`, a circular structure)
+  replies `{"$error":"<message>"}` for the same reason;
+- a thenable value (anything with a callable `then`; every promise) is
+  awaited: the event loop runs, turn by turn, until it settles, and the
+  reply is the fulfillment value as JSON, or `{"$error":...}` on
+  rejection. The await counts as a handler, so a rejection of the
+  command's own value is answered, not fatal. Other pending work (a
+  repeating timer) cannot hold the reply hostage, and the work it leaves
+  pending stays scheduled for the next command;
+- a promise nothing can settle any more (the loop is idle with the
+  promise still pending) replies `{"$error":"promise never settled"}`;
+  with `--command-timeout` it replies `{"$error":"command timed out"}`
+  at the deadline instead;
+- if guest-replaced intrinsics hand back text with a newline in it, the
+  fixed reply `{"$error":"<encoding failed>"}` is sent instead: one JSON
+  line per command, whatever the guest does.
+
+Unhandled rejections of promises other than the command's value still
+end the session as in a plain run: `(void Promise.reject(1), 2)` replies
+2, then the session exits 1 at the next microtask checkpoint.
+
+Input details: empty lines are skipped, and a line of only blanks is a
+syntax error like any other; one trailing carriage return is stripped,
+so "cmd", "cmd\r\n" and a final unterminated "cmd\r" are one
+command; a trailing `//` comment is allowed (the line sits between
+newlines in the wrapper); a last line without a newline is still a
+command. A line that is not valid UTF-8 ends the session with exit 0, and
+input the session did not read is kept for the next reader.
+
+Replies rendezvous with the caller's writer: a reply is on stdout before
+anything the guest prints after it, and output the command's own
+microtasks print still comes first. `console.log` output appears on
+stdout between replies (see [KNOWN_BUGS.md](KNOWN_BUGS.md)).
+
+After every command the loop settles the timers, `vm.net` messages and
+microtasks the command left pending, under the same
+[--command-timeout](#--command-timeoutms) deadline; an expiry there
+stops the leftover work, prints one stderr line (`tardigrade: command
+timed out after its reply`) and the session continues. A leftover
+repeating timer means every later command first waits out up to its
+whole `--command-timeout` budget while the timer keeps re-arming, and
+without the flag the session never reaches the next command at all -
+clear timers in handlers that schedule them (`clearInterval`,
+`clearTimeout`) unless they are meant to outlive the command; for
+`serve_bridge` that rule is one request per command timeout. An uncaught
+exception from a leftover timer or listener during that settling ends the
+session with exit 1, as in a plain run.
+
+Under `--clock=virtual` the post-reply settling never jumps the clock
+(see the [--clock=virtual](#--clockvirtual) list): a one-shot `setTimeout`
+left by a command stays queued until a later command's await moves the
+clock past it - a handler that schedules with `setTimeout` and does not
+await will not see it run under virtual time.
+
+Only host-level failure ends the session: input that is not valid UTF-8,
+`vm.exit` (its code), the whole-run `--timeout` (124), the heap cap
+(137), an unhandled rejection still unhandled at a microtask checkpoint
+(1), an uncaught exception from leftover work during the settling (1),
+or the reply consumer going away (0). At the end of stdin (or such an
+end) a `--dump` is written as usual.
+
+The entry cannot be `-`, because stdin is the command channel; the
+guest's `vm.stdin` is at end of file. `--timeout` defaults to 0 in this
+mode and bounds the whole session, not each command; use
+`--command-timeout` for that. A session whose time has run out while it
+waits for input ends with exit 124 when its next line or the end of
+input arrives. See [MANUAL.md](MANUAL.md#console-mode) for an example,
+and [KNOWN_BUGS.md](KNOWN_BUGS.md#console-mode---serve) for the current
+limits of this mode.
 
 ### --sandbox
 

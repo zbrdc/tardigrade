@@ -256,11 +256,19 @@ pub(crate) fn event_loop_until(
     done: &mut dyn FnMut(&mut HandleScope) -> bool,
 ) -> i32 {
     loop {
-        match (turn(scope, done), park_between_turns(scope)) {
-            (Some(c), _) => return c,
-            (None, Park::Done) => break,
-            (None, Park::Spin) => continue,
-            (None, Park::Sleep(wait)) => std::thread::sleep(wait),
+        // The turn first, and the park only when the loop continues: a
+        // tuple match would evaluate park_between_turns even for a
+        // finished loop, and under --clock=virtual that jumps the clock
+        // to the next pending timer - past work the caller never waited
+        // for (an awaited promise settling while a far timer is queued
+        // would leave the clock at the far timer's time).
+        if let Some(c) = turn(scope, done) {
+            return c;
+        }
+        match park_between_turns(scope) {
+            Park::Done => break,
+            Park::Spin => continue,
+            Park::Sleep(wait) => std::thread::sleep(wait),
         }
     }
     sweep(scope)
@@ -327,9 +335,12 @@ pub(crate) fn settle_due(scope: &mut HandleScope) -> i32 {
         if let Some(c) = turn(scope, &mut |_| false) {
             return c;
         }
-        // A timer that came due during this turn (a callback scheduled
-        // another zero-delay timer) still belongs to "now"; anything
-        // later waits for whoever moves the clock.
+        // Work that became due during this turn still belongs to "now"
+        // (a listener answering into the net queue, or a timer whose
+        // deadline was reached while the clock stood still); anything
+        // later waits for whoever moves the clock. Zero-delay timers do
+        // not qualify: their deadlines are clamped to at least 1 ms, so
+        // they are never due at the instant they are scheduled.
         let due = {
             let world = world_mut(scope);
             let now = world.clock.now();

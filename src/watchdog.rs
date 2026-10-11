@@ -34,7 +34,7 @@ impl Watchdog {
     pub(crate) fn new(iso: v8::IsolateHandle, timeout_ms: u64, term: Arc<Termination>) -> Self {
         let term2 = term.clone();
         let spawned = std::thread::Builder::new()
-            .name("tardigrade-run-wd".to_string())
+            .name("tardigrade-runw".to_string())
             .spawn(move || {
                 let deadline = if timeout_ms == 0 {
                     None
