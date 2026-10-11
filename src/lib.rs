@@ -85,6 +85,14 @@ macro_rules! guest_cb {
         pub(crate) extern "C" fn $name(info: *const v8::FunctionCallbackInfo) {
             let info = unsafe { &*info };
             let $scope = unsafe { &mut v8::CallbackScope::new(info) };
+            // Once the run is leaving (vm.exit, timeout, heap cap), guest
+            // callbacks return without side effects: the outcome is decided
+            // and nothing after that may print, write, or schedule. V8 only
+            // observes the termination at its next stack check, so pure JS
+            // may run briefly in between.
+            if crate::world::world_mut($scope).is_leaving() {
+                return;
+            }
             let $args = v8::FunctionCallbackArguments::from_function_callback_info(info);
             let mut $rv = v8::ReturnValue::from_function_callback_info(info);
             $body
@@ -204,6 +212,13 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
 }
 
 fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
+    // A termination that was requested but never observed (vm.exit's is
+    // delivered at V8's next stack check, which a script that ends
+    // immediately may never reach) would silently kill the snapshot;
+    // is_execution_terminating only reports delivered ones, so cancel
+    // unconditionally.
+    scope.cancel_terminate_execution();
+    world_mut(scope).set_dumping(true);
     let mut tc = v8::TryCatch::new(scope);
     match eval_src(&mut tc, "vm.snapshot()", "dump") {
         Some(v) => {
@@ -220,6 +235,8 @@ fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
             eprintln!("v8vm: snapshot failed; dump not written");
         }
     }
+    drop(tc);
+    world_mut(scope).set_dumping(false);
 }
 
 /// Shared body of run() and serve(): returns the guest exit code. Early

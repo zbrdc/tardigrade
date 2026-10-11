@@ -401,6 +401,62 @@ fn retained_arraybuffers_past_the_cap_report_137() {
 }
 
 #[test]
+fn vm_exit_stops_host_effects_immediately() {
+    // The termination V8 needs a stack check to observe; the host must not
+    // run side effects in that window.
+    let r = run_js("exit-freeze", "vm.exit(3); console.log('after');");
+    assert_eq!(r.code, 3);
+    assert_eq!(r.stdout, "");
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn the_first_vm_exit_code_wins() {
+    let r = run_js(
+        "exit-first-wins",
+        "try { vm.exit(3) } catch (e) {} console.log('after'); vm.exit(4);",
+    );
+    assert_eq!(r.code, 3);
+    assert_eq!(r.stdout, "");
+}
+
+#[test]
+fn fs_writes_after_vm_exit_do_not_land_in_the_dump() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("exit-freeze.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script(
+        "exit-fs-freeze",
+        "vm.fs.write('/f', 'x'); vm.exit(0); vm.fs.write('/g', 'y');",
+    );
+    let r = v8vm(
+        &[&format!("--dump={}", dump.display()), path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let json = std::fs::read_to_string(&dump).expect("dump written");
+    assert_eq!(json, "{\"/f\":\"x\"}");
+}
+
+#[test]
+fn vm_exit_inside_a_timer_callback_stops_effects() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("exit-freeze-timer.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script(
+        "exit-timer-freeze",
+        "vm.fs.write('/f', 'x');
+         setTimeout(() => { vm.exit(0); vm.fs.write('/g', 'y'); console.log('after'); }, 5);",
+    );
+    let r = v8vm(
+        &[&format!("--dump={}", dump.display()), path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "");
+    let json = std::fs::read_to_string(&dump).expect("dump written");
+    assert_eq!(json, "{\"/f\":\"x\"}");
+}
+
+#[test]
 fn dump_is_skipped_after_an_oom() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("oom-dump.json");
     let _ = std::fs::remove_file(&dump);

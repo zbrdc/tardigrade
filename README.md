@@ -64,12 +64,15 @@ and serve() commands: input a run does not read is kept for the next run,
 and when several consumers read at once the first one receives the chunks.
 Isolation is per isolate within the process: hitting the heap cap ends only
 that run (exit 137), while other V8 fatal errors end the whole process and
-every guest in it. The heap cap is enforced below V8's own hard limit
-(the cap plus twice the cap of headroom, at least 32 MiB): a check before
-every garbage collection stops the guest once its used heap passes the
-cap, and a near-heap-limit callback is the second line. Until the guest
-is stopped, the process may transiently commit memory above the cap, up
-to that raised V8 limit.
+every guest in it. --memory counts the JS heap and ArrayBuffer memory
+together, judged on what survives a collection: at event-loop checkpoints
+(a collection is forced first when the raw figure is over), at V8's
+maximal collections, when V8's own raised limit is reached (the transient
+working set has hit three times the cap), and from a watch thread for
+ArrayBuffer bytes. Until a memory-hog guest is stopped, the process may
+commit several times the cap (measured: 3-6x for growth shapes, about 2-3x
+for garbage-heavy-but-small guests awaiting a collection; retained
+ArrayBuffers are stopped at the cap itself).
 
 ## Event loop
 
@@ -86,7 +89,7 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | setTimeout/setInterval/clearTimeout/clearInterval | timer id semantics as usual |
 | queueMicrotask(fn) | Promise-based microtask |
 | vm.version / vm.args | engine version, arguments after the entry path |
-| vm.exit(code) | stop the program with code |
+| vm.exit(code) | stop the program with code; all host effects (output, writes, scheduling) stop immediately and the first exit wins - pure JS computation may run briefly until V8 observes the termination |
 | vm.fs.read/write/list/remove | RAM filesystem (throwing read/remove) |
 | vm.snapshot() / vm.restore(json) | whole-filesystem JSON snapshot / restore |
 | vm.run(path) | load-and-eval a file from the RAM fs |
@@ -129,14 +132,23 @@ tsc-rs at this boundary to let agents write TypeScript.
   omission of host APIs, per isolate inside one ordinary process. A V8
   fatal error ends the whole process and every guest in it. For hostile
   code, run v8vm itself under a container/seccomp profile.
-- The heap cap terminates the guest, not the process: a check before every
-  garbage collection stops a run whose used heap passed the cap, and the run
-  exits 137 with a one-line report on stderr. The cap is set below V8's own
-  hard limit (cap + 2x cap headroom, minimum 32 MiB) so growth paths pass a
-  GC first; the smallest supported cap is 8 MB.
-- One abort case remains: a single allocation too large to fit under V8's
-  raised limit (for example `new Array(1e9)`) still ends the whole process
-  with V8's fatal out-of-memory report (observed as SIGTRAP, exit 133).
-  Growth that stays within V8's string limits instead fails as an ordinary
-  uncaught exception (`RangeError: Invalid string length`, exit 1).
+- The heap cap terminates the guest, not the process: --memory counts the
+  JS heap and ArrayBuffer memory together and is judged on what survives a
+  collection (event-loop checkpoints force one when the raw figure is over;
+  V8's maximal collections are judged directly; a guest whose transient
+  working set reaches V8's raised limit, three times the cap, is stopped
+  there with the limit raised so the termination is observed in
+  JavaScript; ArrayBuffer bytes are watched by a thread). A run over the
+  cap exits 137 with a one-line report on stderr. Peak RSS is typically
+  3-6x the cap for growth shapes, about 2-3x for garbage-heavy guests
+  under the cap, and near the cap for retained ArrayBuffers. The smallest
+  supported cap is 8 MB; growth that hits V8's structural limits (Map
+  size, array length) or string limits fails as an ordinary uncaught
+  RangeError (exit 1), as Node does.
+- Guest-reachable process aborts remain (V8 fatal error, observed as
+  SIGTRAP, exit 133): a single allocation too large for V8's raised limit
+  (`new Array(1e9)`, and `new Array(1e8).fill(0)` at any cap), string
+  splitting past V8's maximum string size
+  (`'ab'.repeat(2e8).split('')`), and long native builtins that ignore
+  termination (`a.length = 2**32 - 1; a.fill(0, 0, 2e8)` at small caps).
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

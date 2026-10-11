@@ -132,6 +132,9 @@ pub(crate) struct World {
     /// heap-watch thread (its fields are atomics or immutable) and not
     /// dereferenced after the run concludes.
     pub(crate) heap_guard: *const crate::heap::HeapGuard,
+    /// Set while the end-of-run snapshot is evaluated: its guest-side
+    /// helper only reads, so callbacks stay allowed for it.
+    dumping: bool,
     /// Sticky: an OOM concluded this run (the reason itself is consumed by
     /// the single take that decides the exit code).
     pub(crate) heap_oom_happened: bool,
@@ -161,6 +164,7 @@ impl World {
             heap_cap_bytes: 0,
             external_bytes: Arc::new(AtomicUsize::new(0)),
             heap_guard: std::ptr::null(),
+            dumping: false,
             heap_oom_happened: false,
             pending_rejections: HashMap::new(),
             next_rejection_seq: 0,
@@ -186,12 +190,31 @@ impl World {
         }
     }
 
+    /// True once the run has decided its outcome (a vm.exit code, or an
+    /// outside termination) and guest callbacks must stop having effects.
+    pub(crate) fn is_leaving(&self) -> bool {
+        !self.dumping
+            && (self.exit_code() >= 0
+                || self.term.reason().is_some()
+                || self.term.is_finished())
+    }
+
+    /// Marks the end-of-run snapshot window (read-only callbacks allowed).
+    pub(crate) fn set_dumping(&mut self, dumping: bool) {
+        self.dumping = dumping;
+    }
+
     pub(crate) fn exit_code(&self) -> i32 {
         self.exit_code.load(Ordering::SeqCst)
     }
 
+    /// First exit wins: a later vm.exit during the termination window
+    /// cannot change the code (its callback is blocked anyway, but be
+    /// explicit about the contract).
     pub(crate) fn set_exit_code(&self, code: i32) {
-        self.exit_code.store(code, Ordering::SeqCst);
+        let _ = self
+            .exit_code
+            .compare_exchange(-1, code, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
