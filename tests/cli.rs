@@ -2532,3 +2532,160 @@ fn sandbox_flag_is_refused_on_unsupported_platforms() {
         r.stderr
     );
 }
+
+// --- TypeScript agent loop (examples/agent-loop-ts.sh) ---
+
+/// V8VM_REQUIRE_TS=1 turns a missing TypeScript toolchain from a skip into
+/// a failure, mirroring V8VM_REQUIRE_SANDBOX for the kernel checks.
+fn ts_required() -> bool {
+    std::env::var("V8VM_REQUIRE_TS").is_ok_and(|v| v == "1")
+}
+
+/// A skip notice written straight to stderr, so it survives libtest's
+/// capture and a skipped test is never mistaken for a pass.
+fn ts_skipped(reason: &str, test: &str) {
+    let _ = writeln!(std::io::stderr(), "SKIPPED ({}): {}", reason, test);
+}
+
+/// True when `tool --version` runs successfully: an executable the loop
+/// can use, not just a name on PATH.
+fn runs_on_host(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// bun for the loop: $BUN, then PATH, then the default install location -
+/// the same order examples/ts-smoke.sh probes.
+fn find_bun() -> Option<String> {
+    if let Ok(bun) = std::env::var("BUN") {
+        if runs_on_host(&bun) {
+            return Some(bun);
+        }
+    }
+    if runs_on_host("bun") {
+        return Some("bun".to_string());
+    }
+    let home = std::env::var("HOME").ok()?;
+    let bun = format!("{}/.bun/bin/bun", home.trim_end_matches('/'));
+    runs_on_host(&bun).then_some(bun)
+}
+
+/// The smoke check must skip loudly when the toolchain is missing, never
+/// pass silently. An emptied PATH and HOME make the probes fail even on a
+/// host that has the tools, so the skip path itself is what is tested.
+#[test]
+fn ts_smoke_skips_loudly_without_a_toolchain() {
+    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-smoke-empty-home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    // /bin/bash, not "bash": the emptied child PATH is applied before the
+    // exec, so a PATH lookup for the shell itself would fail.
+    let out = Command::new("/bin/bash")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
+        .env("BUN", "")
+        .env("HOME", &home)
+        .env("PATH", "")
+        .output()
+        .expect("run ts-smoke");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    assert!(
+        stdout.starts_with("SKIPPED (") && stdout.contains("TypeScript agent-loop smoke check"),
+        "the skip must be loud, stdout: {stdout}"
+    );
+}
+
+/// With the toolchain still missing, V8VM_REQUIRE_TS=1 makes that same
+/// skip a failure naming the flag.
+#[test]
+fn ts_smoke_require_flag_fails_when_the_toolchain_is_missing() {
+    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-smoke-empty-home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    let out = Command::new("/bin/bash")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
+        .env("BUN", "")
+        .env("HOME", &home)
+        .env("PATH", "")
+        .env("V8VM_REQUIRE_TS", "1")
+        .output()
+        .expect("run ts-smoke");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("V8VM_REQUIRE_TS=1 but"),
+        "the failure must name the flag, stderr: {stderr}"
+    );
+}
+
+/// Runs a command to completion under a hard wall-clock bound. The child
+/// gets its own process group and a timeout kills the whole group: bun and
+/// npx spawn children of their own, and one left alive would hold the
+/// output pipes open. 180 s covers npx fetching tsc-rs on a cold cache.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let child = cmd.spawn().expect("spawn");
+    let pgid = child.id() as libc::pid_t;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => panic!("wait failed: {e}"),
+        Err(_) => {
+            // libc, not the kill(1) binary: no PATH dependence.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            panic!("command did not exit within {secs} s");
+        }
+    }
+}
+
+/// The full loop against the real tools: the seeded type errors end their
+/// turn as FAIL with the checker's lines and the checker named, the
+/// type-correct-but-wrong app FAILs through the driver, and the fixed app
+/// prints PASS.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
+    let test = "agent_loop_ts_type_errors_fail_then_fixed_app_passes";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    if !runs_on_host("npx") && !runs_on_host("tsc") {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but no type checker");
+        ts_skipped("no type checker: npx and tsc are both missing", test);
+        return;
+    }
+    let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts-ws.json");
+    let _ = std::fs::remove_file(&ws);
+    let mut cmd = Command::new("bash");
+    cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
+        .env("WS", &ws)
+        .env("BUN", bun);
+    let out = output_within(cmd, 180);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("FAIL: TypeScript type errors"), "stdout: {stdout}");
+    assert!(stdout.contains("error TS"), "stdout: {stdout}");
+    assert!(stdout.contains("checker: "), "stdout: {stdout}");
+    assert!(
+        stdout.contains("FAIL: sum([1,2,3]) returned -6, want 6"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
+}

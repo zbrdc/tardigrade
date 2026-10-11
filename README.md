@@ -25,6 +25,8 @@ repo.
                  # (cli, webapi, library, stdin_hub, sandbox)
     make clippy  # cargo clippy --release --all-targets, warnings denied
     make check   # build, then scripted smoke checks over the examples
+    make check-ts # the TypeScript agent loop; skips loudly when bun or
+                 # every type checker is missing (V8VM_REQUIRE_TS=1 fails)
     make ci      # test, then clippy, then check, in that order; stops at the
                  # first failure. CI runs make ci CARGOFLAGS=--locked
                  # (.github/workflows/ci.yml)
@@ -357,8 +359,45 @@ The guest keeps its zero-syscall guarantee: it never sees a socket.
 
 examples/agent-loop.sh shows the just-bash-style harness: seed a workspace
 with --dump, run the driver contract (PASS/FAIL/exit code), let an agent (swap
-the canned edit for your LLM call) patch the workspace, rerun. Swap in
-tsc-rs at this boundary to let agents write TypeScript.
+the canned edit for your LLM call) patch the workspace, rerun.
+examples/agent-loop-ts.sh is the same loop for a TypeScript app; see
+TypeScript below.
+
+## TypeScript
+
+v8vm itself runs plain JavaScript and gains no dependency for TypeScript:
+the support lives at the agent-loop boundary, on the host. Two external
+tools do the work (both are development tools of the loop, never v8vm
+runtime dependencies, and the guest never sees them):
+
+- bun (1.3.5 tested) bundles the app with
+  `bun build <entry> --target=browser --format=iife`. v8vm has no ES module
+  resolution, so a multi-file project must become one IIFE before it can
+  run: bundling is required, not an optimization. bun does not type-check.
+- tsc-rs (pinned 0.3.0, fetched by npx) type-checks the sources with
+  `--noEmit` through a generated strict tsconfig. tsc-rs is an experimental
+  Rust port of the TypeScript 7 compiler (it reports 7.1.0-dev and moves
+  fast); when it is unavailable or crashes, the loop falls back to
+  `tsc --noEmit`, and its output names which checker decided.
+
+examples/agent-loop-ts.sh runs the whole cycle against the same driver
+contract as agent-loop.sh: the app is TypeScript in the RAM workspace
+(/app/app.ts and its imports); each turn extracts the sources from the
+workspace (a tiny guest run reads them out - the host cannot read the RAM
+fs), type-checks them, bundles the entry, loads the bundle back into the
+workspace as /app/app.js, and runs the driver. A type error ends its turn
+with a FAIL line exactly like a failing test - it is the agent's signal
+to fix the sources - and a project that type-checks is what gets bundled
+and run.
+
+`make check-ts` smoke-tests the loop: it skips with a printed reason when
+bun (required) or every checker (npx for tsc-rs, or tsc) is missing -
+never a silent pass - and V8VM_REQUIRE_TS=1 makes a missing toolchain
+fail.
+
+Limits: type-checking and bundling are host-side loop steps. At runtime
+the guest executes the bundled JavaScript; vm.run of a .ts file would
+evaluate raw TypeScript as JavaScript.
 
 ## OS self-sandbox (--sandbox)
 
