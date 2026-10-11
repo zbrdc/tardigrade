@@ -44,6 +44,9 @@ pub(crate) struct World {
     /// Math.random counter for seeded runs (Config.seed); None leaves
     /// V8's own Math.random in place.
     pub(crate) random_state: Option<u64>,
+    /// Zero point of this run's performance.now(): the moment the run's
+    /// state was created, i.e. the start of the run.
+    pub(crate) perf_origin: std::time::Instant,
     // ids cleared via clear_timer while their callback was on the stack
     pub(crate) cleared: Vec<u64>,
     exit_code: AtomicI32,
@@ -64,6 +67,7 @@ impl World {
             stdin_eof: false,
             stdin_sub: None,
             random_state: None,
+            perf_origin: Instant::now(),
             cleared: Vec::new(),
             exit_code: AtomicI32::new(-1),
             unhandled_rejection: None,

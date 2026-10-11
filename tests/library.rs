@@ -13,7 +13,17 @@ fn run_returns_the_guest_exit_code_and_can_run_again() {
     assert_eq!(v8vm::run("vm.exit(3)", "a.js", &cfg), 3);
     assert_eq!(v8vm::run("", "empty.js", &cfg), 0);
     assert_eq!(v8vm::run("throw new Error('x')", "b.js", &cfg), 1);
-    assert_eq!(v8vm::run("for (;;) {}", "spin.js", &v8vm::Config { timeout_ms: 50, ..cfg }), 124);
+    assert_eq!(
+        v8vm::run(
+            "for (;;) {}",
+            "spin.js",
+            &v8vm::Config {
+                timeout_ms: 50,
+                ..cfg
+            }
+        ),
+        124
+    );
 }
 
 /// Joins a guest thread with a bound, so a guest whose watchdog never fires
@@ -76,8 +86,16 @@ fn overlap_round() {
         50,
         start.clone(),
     );
-    assert_eq!(join_bounded(a, 30), 7, "guest A: isolated fs, own exit code");
-    assert_eq!(join_bounded(b, 30), 124, "guest B: killed by its own watchdog");
+    assert_eq!(
+        join_bounded(a, 30),
+        7,
+        "guest A: isolated fs, own exit code"
+    );
+    assert_eq!(
+        join_bounded(b, 30),
+        124,
+        "guest B: killed by its own watchdog"
+    );
 }
 
 #[test]
@@ -111,8 +129,16 @@ fn early_vm_exit_stays_per_run_while_another_guest_is_pending() {
         0,
         start.clone(),
     );
-    assert_eq!(join_bounded(quick, 30), 31, "early exit code belongs to its own run");
-    assert_eq!(join_bounded(slow, 30), 0, "naturally-finished guest sees no leaked exit code");
+    assert_eq!(
+        join_bounded(quick, 30),
+        31,
+        "early exit code belongs to its own run"
+    );
+    assert_eq!(
+        join_bounded(slow, 30),
+        0,
+        "naturally-finished guest sees no leaked exit code"
+    );
 }
 
 #[test]
@@ -144,7 +170,10 @@ fn preload_data_takes_the_same_restore_path_as_a_preload_file() {
                     if (b.length !== 2 || b[0] !== 0 || b[1] !== 255) vm.exit(9);";
     assert_eq!(run_with(v2, check_v2), 0, "v2 snapshot with a binary file");
     let legacy = r#"{"rel/x.txt":"hi"}"#;
-    assert_eq!(run_with(legacy, "if (vm.fs.read('/rel/x.txt') !== 'hi') vm.exit(9);"), 0);
+    assert_eq!(
+        run_with(legacy, "if (vm.fs.read('/rel/x.txt') !== 'hi') vm.exit(9);"),
+        0
+    );
     // restore throws on an unknown version, which aborts the run with 2.
     assert_eq!(run_with(r#"{"version":3}"#, "vm.exit(0);"), 2);
 }
@@ -176,4 +205,77 @@ fn fs_quota_boundary_from_the_library_config() {
                     }
                     if (!ok) throw new Error('fs changed by a failed write');";
     assert_eq!(v8vm::run(unchanged, "quota-unchanged.js", &cfg), 0);
+}
+
+/// The seed drive for a run: exit code of the first draw, scaled into a
+/// stable integer so a library test can compare sequences without
+/// sharing stdout.
+fn seeded_first_draw(seed: u64) -> i32 {
+    let cfg = Config {
+        timeout_ms: 0,
+        // hermetic: the guest must not consume the test harness stdin
+        stdin_consumed: true,
+        seed: Some(seed),
+        ..Config::new()
+    };
+    v8vm::run(
+        "vm.exit(Math.floor(Math.random() * 1000));",
+        "seeded.js",
+        &cfg,
+    )
+}
+
+fn seeded_guest(seed: u64, gate: Arc<Barrier>) -> std::thread::JoinHandle<i32> {
+    std::thread::spawn(move || {
+        gate.wait();
+        seeded_first_draw(seed)
+    })
+}
+
+#[test]
+fn seeded_runs_keep_independent_reproducible_sequences_while_concurrent() {
+    // The PRNG counter is per-run World state: each seed reproduces its
+    // own first draw, also while another seeded guest is mid-run.
+    let a = seeded_first_draw(7);
+    let b = seeded_first_draw(8);
+    assert_eq!(seeded_first_draw(7), a, "seed 7 must reproduce");
+    assert_ne!(a, b, "seeds 7 and 8 must differ");
+    for _ in 0..25 {
+        let gate = Arc::new(Barrier::new(2));
+        let ha = seeded_guest(7, gate.clone());
+        let hb = seeded_guest(8, gate);
+        assert_eq!(join_bounded(ha, 30), a, "concurrent seed 7 drifted");
+        assert_eq!(join_bounded(hb, 30), b, "concurrent seed 8 drifted");
+    }
+}
+
+#[test]
+fn performance_now_origin_is_the_start_of_each_run() {
+    // One run spins 200 ms; the next run's first performance.now() must
+    // still be small, which only holds when the zero point is per run
+    // (a process-wide origin would include the first run's 200 ms).
+    let spin = Config {
+        timeout_ms: 0,
+        stdin_consumed: true,
+        ..Config::new()
+    };
+    v8vm::run(
+        "const t0 = performance.now(); let s = 0; while (performance.now() - t0 < 200) s += 1; vm.exit(s > 0 ? 0 : 1);",
+        "spin.js",
+        &spin,
+    );
+    let probe = Config {
+        timeout_ms: 0,
+        stdin_consumed: true,
+        ..Config::new()
+    };
+    let code = v8vm::run(
+        "vm.exit(performance.now() < 100 ? 0 : 1);",
+        "probe.js",
+        &probe,
+    );
+    assert_eq!(
+        code, 0,
+        "second run's first now() was not near the run's start"
+    );
 }

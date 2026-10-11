@@ -167,7 +167,7 @@ fn text_decoder_fatal_throws_on_invalid_utf8() {
           console.log(err.constructor.name, err.message);
         }
         "#,
-        "\"hi\"\nTypeError The encoded data is not valid.\n",
+        "\"hi\"\nTypeError The encoded data was not valid for encoding utf-8\n",
     );
 }
 
@@ -390,4 +390,215 @@ fn seed_zero_is_a_seed_and_bad_seeds_are_usage_errors() {
     let bad = v8vm(&["--seed=oops", path.to_str().unwrap()], b"");
     assert_eq!(bad.code, 2);
     assert!(bad.stderr.contains("bad --seed"), "stderr: {}", bad.stderr);
+}
+
+/// Spawns v8vm under an address-space cap (prlimit execs timeout, which
+/// execs v8vm; both inherit the cap), still bounded by the same 60 s
+/// kill as every other spawn.
+fn v8vm_capped(as_bytes: u64, args: &[&str], stdin: &[u8]) -> Run {
+    let mut capped = vec![
+        "prlimit".to_string(),
+        format!("--as={}", as_bytes),
+        "--".to_string(),
+        "timeout".to_string(),
+        "60".to_string(),
+        env!("CARGO_BIN_EXE_v8vm").to_string(),
+    ];
+    capped.extend(args.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = capped.iter().map(|s| s.as_str()).collect();
+    spawn(&refs, stdin)
+}
+
+/// The spawn/wait/kill core of `v8vm`, for any command line.
+fn spawn(argv: &[&str], stdin: &[u8]) -> Run {
+    let mut child = Command::new(argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn test command");
+    let mut pipe = child.stdin.take().unwrap();
+    let input = stdin.to_vec();
+    let feeder = std::thread::spawn(move || {
+        let _ = pipe.write_all(&input);
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll test command") {
+            break status;
+        }
+        if start.elapsed() > LIMIT {
+            child.kill().expect("kill hung test command");
+            child.wait().expect("reap test command");
+            panic!("test command still running after {:?}", LIMIT);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    feeder.join().unwrap();
+    let out = child
+        .wait_with_output()
+        .expect("collect test command output");
+    Run {
+        code: status.code().expect("exit code, not a signal"),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+// ---- review round 1 ----
+
+#[test]
+fn text_decoder_resets_bom_and_carry_after_a_flushing_decode() {
+    ok(
+        "td-bom-reset",
+        r#"
+        const d = new TextDecoder();
+        console.log(JSON.stringify(d.decode(new Uint8Array([97]))));
+        // A non-stream decode ends the stream: the next call starts fresh,
+        // so a leading BOM goes (Node prints "b" here too).
+        console.log(JSON.stringify(d.decode(new Uint8Array([0xEF,0xBB,0xBF,98]))));
+        const e = new TextDecoder();
+        e.decode(new Uint8Array(0), {stream:true});
+        console.log(JSON.stringify(e.decode(new Uint8Array([0xEF,0xBB,0xBF,97]))));
+        // A throwing (fatal) decode resets as well.
+        const f = new TextDecoder("utf-8", {fatal:true});
+        try { f.decode(new Uint8Array([0xEF,0xBB,0xBF,0xFF])); } catch (err) { console.log(err.name); }
+        console.log(JSON.stringify(f.decode(new Uint8Array([0xEF,0xBB,0xBF,97]))));
+        // A stream sequence still flushes its carry at the final call.
+        const s = new TextDecoder();
+        console.log(JSON.stringify(s.decode(new Uint8Array([0xF0,0x9F,0x98]), {stream:true})));
+        console.log(JSON.stringify(s.decode(new Uint8Array([0x80]))));
+        "#,
+        "\"a\"\n\"b\"\n\"a\"\nTypeError\n\"a\"\n\"\"\n\"\u{1f600}\"\n",
+    );
+}
+
+#[test]
+fn text_decoder_trims_labels_and_treats_null_options_as_empty() {
+    ok(
+        "td-label-trim",
+        r#"
+        console.log(new TextDecoder(" utf-8 ").encoding, new TextDecoder("\tutf8\n").encoding);
+        console.log(new TextDecoder("utf-8", null).fatal, new TextDecoder("utf-8").fatal);
+        for (const bad of [1, "x"]) {
+          try { new TextDecoder("utf-8", bad); } catch (err) { console.log("ctor:", err.constructor.name); }
+        }
+        try { new TextDecoder("utf-8", { get fatal() { throw new Error("g"); } }); }
+        catch (err) { console.log("getter:", err.message); }
+        const d = new TextDecoder();
+        console.log(JSON.stringify(d.decode(new Uint8Array([97]), null)));
+        try { d.decode(new Uint8Array([97]), 5); } catch (err) { console.log("decode opts:", err.constructor.name); }
+        "#,
+        "utf-8 utf-8\nfalse false\nctor: TypeError\nctor: TypeError\ngetter: g\n\"a\"\ndecode opts: TypeError\n",
+    );
+}
+
+#[test]
+fn decoder_and_encoder_state_is_private_and_tagged() {
+    ok(
+        "webapi-hygiene",
+        r#"
+        const d = new TextDecoder("utf-8", {fatal: true});
+        console.log(JSON.stringify(Object.keys(d)), JSON.stringify(Object.getOwnPropertyNames(d)));
+        // The old internal names are inert now.
+        d.__carry = "garbage"; d.__bom = 1;
+        console.log(JSON.stringify(d.decode(new Uint8Array([0xEF,0xBB,0xBF,97]))));
+        const e = new TextEncoder();
+        console.log(e.encoding, new TextDecoder().encoding, Object.keys(e).length);
+        console.log(Object.prototype.toString.call(e), Object.prototype.toString.call(d));
+        console.log(d.fatal, d.ignoreBOM);
+        class Sub extends TextDecoder { }
+        console.log(JSON.stringify(new Sub().decode(new Uint8Array([104]))));
+        try { TextDecoder("utf-8"); } catch (err) { console.log("no new:", err.constructor.name); }
+        "#,
+        "[] []\n\"a\"\nutf-8 utf-8 0\n[object TextEncoder] [object TextDecoder]\ntrue false\n\"h\"\nno new: TypeError\n",
+    );
+}
+
+#[test]
+fn atob_btoa_and_structured_clone_require_an_argument() {
+    ok(
+        "webapi-no-arg",
+        r#"
+        try { atob(); } catch (err) { console.log(err.constructor.name, err.message); }
+        try { btoa(); } catch (err) { console.log(err.constructor.name, err.message); }
+        try { structuredClone(); } catch (err) { console.log(err.constructor.name, err.message); }
+        "#,
+        "TypeError The \"input\" argument must be specified\nTypeError The \"input\" argument must be specified\nTypeError The \"The value argument must be specified\" argument must be specified\n",
+    );
+}
+
+#[test]
+fn structured_clone_validates_options_and_rejects_shared_buffers() {
+    ok(
+        "sc-options",
+        r#"
+        console.log(structuredClone(1, null), structuredClone(1, undefined), structuredClone(1, {}));
+        for (const bad of [2, "x", true]) {
+          try { structuredClone(1, bad); } catch (err) { console.log("opts:", err.constructor.name); }
+        }
+        try { structuredClone(1, { transfer: {} }); } catch (err) { console.log("transfer:", err.constructor.name); }
+        console.log(structuredClone(1, { transfer: [] }));
+        try { structuredClone(1, { get transfer() { throw new Error("tg"); } }); }
+        catch (err) { console.log("getter:", err.message); }
+        try { structuredClone(new SharedArrayBuffer(8)); } catch (err) { console.log("sab:", err.name); }
+        const sab = new SharedArrayBuffer(8);
+        try { structuredClone(new Uint8Array(sab)); } catch (err) { console.log("sab view:", err.name); }
+        "#,
+        "1 1 1\nopts: TypeError\nopts: TypeError\nopts: TypeError\ntransfer: TypeError\n1\ngetter: tg\nsab: DataCloneError\nsab view: DataCloneError\n",
+    );
+}
+
+#[test]
+fn decode_of_a_huge_buffer_under_memory_pressure_throws_instead_of_aborting() {
+    // 300 MB of ASCII under a 1.4 GB address-space cap: the input buffer
+    // exists, but the Rust output reserve cannot. The fallible path turns
+    // that into a guest RangeError; the old path aborted the process.
+    let path = script(
+        "decode-pressure",
+        r#"const u = new Uint8Array(300 * 1048576).fill(65);
+           try { new TextDecoder().decode(u); console.log("decoded"); }
+           catch (e) { console.log(e.name, e.message); }"#,
+    );
+    let r = v8vm_capped(1_400_000_000, &[path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout, "RangeError decoded text too large\n",
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn btoa_past_the_string_limit_throws_range_error() {
+    // 420 MB of "a" encodes to 560 MB of base64, past V8's ~536 M-char
+    // string limit: RangeError, not an empty string or an abort.
+    let path = script(
+        "btoa-huge",
+        r#"try { btoa("a".repeat(420 * 1048576)); console.log("no throw"); }
+           catch (e) { console.log(e.name, e.message); }"#,
+    );
+    let r = v8vm_capped(
+        3_000_000_000,
+        &["--memory=800", path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.starts_with("RangeError"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn performance_now_starts_near_zero_each_run() {
+    ok(
+        "perf-origin",
+        r#"
+        const a = performance.now();
+        console.log(a >= 0 && a < 5000, typeof performance.timeOrigin);
+        let b = 0; for (let i = 0; i < 1e6; i++) b += i;
+        const c = performance.now();
+        console.log(c >= a, b > 0);
+        "#,
+        "true undefined\ntrue true\n",
+    );
 }

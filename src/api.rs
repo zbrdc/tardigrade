@@ -9,8 +9,8 @@ use crate::fs_api::{
 use crate::net::{net_close, net_listen, net_port, net_send};
 use crate::stdin::stdin_read;
 use crate::timers::{clear_timer, set_interval, set_timeout};
-use crate::Config;
 use crate::webapi;
+use crate::Config;
 
 fn make_fn<'s>(
     scope: &mut v8::HandleScope<'s>,
@@ -19,7 +19,7 @@ fn make_fn<'s>(
     v8::Function::new_raw(scope, cb)
 }
 
-fn set(
+pub(crate) fn set(
     obj: v8::Local<v8::Object>,
     scope: &mut v8::HandleScope,
     name: &str,
@@ -29,7 +29,7 @@ fn set(
     obj.set(scope, key.into(), value);
 }
 
-fn put_fn(
+pub(crate) fn put_fn(
     obj: v8::Local<v8::Object>,
     scope: &mut v8::HandleScope,
     name: &str,
