@@ -182,6 +182,9 @@ workspace with `vm.run`, checks it, and reports with `vm.exit(0)` or
 `vm.exit(1)`. The workspace is plain JSON, so the agent can read and edit
 it directly, or edit it through another tardigrade run as the example does.
 
+`examples/agent-loop-ts.sh` runs the same loop for an app written in
+TypeScript; see [TYPESCRIPT.md](TYPESCRIPT.md).
+
 ## Running hostile code
 
 tardigrade keeps guests away from the host by giving them no host APIs, but the

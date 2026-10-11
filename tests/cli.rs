@@ -3113,3 +3113,998 @@ fn sandbox_flag_is_refused_on_unsupported_platforms() {
         r.stderr
     );
 }
+
+// --- TypeScript agent loop (examples/agent-loop-ts.sh) ---
+
+/// TARDIGRADE_REQUIRE_TS=1 turns a missing TypeScript toolchain from a skip into
+/// a failure, mirroring TARDIGRADE_REQUIRE_SANDBOX for the kernel checks. The
+/// tests that use these helpers run only on Linux x86_64 (where the
+/// bounded runner is), so they are gated the same way and stay dead-code
+/// clean on other targets.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ts_required() -> bool {
+    std::env::var("TARDIGRADE_REQUIRE_TS").is_ok_and(|v| v == "1")
+}
+
+/// A skip notice written straight to stderr, so it survives libtest's
+/// capture and a skipped test is never mistaken for a pass.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn ts_skipped(reason: &str, test: &str) {
+    let _ = writeln!(std::io::stderr(), "SKIPPED ({}): {}", reason, test);
+}
+
+/// True when `tool --version` runs successfully: an executable the loop
+/// can use, not just a name on PATH.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn runs_on_host(tool: &str) -> bool {
+    Command::new(tool)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// The pinned tsc-rs package, the same default examples/ts-pin.sh reads
+/// through TARDIGRADE_TSC_RS_PKG; every test passes it on to the scripts
+/// through that variable, so the probes here and the loop can never
+/// disagree about which checker runs.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const TSC_RS_PKG: &str = "tsc-rs@0.3.0";
+
+/// The primary checker command built from the pin, exactly as
+/// examples/agent-loop-ts.sh builds it - including the
+/// TARDIGRADE_TSC_RS_PKG override, so a test forced onto another pin
+/// probes and runs the same checker the scripts would.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn tsc_rs_cmd() -> String {
+    let pkg = std::env::var("TARDIGRADE_TSC_RS_PKG").unwrap_or_else(|_| TSC_RS_PKG.to_string());
+    format!("npx -y {pkg}")
+}
+
+/// The first checker command that really runs - the same bounded probe
+/// and the same order (tsc-rs fetched by npx, then tsc) as the loop, so a
+/// test gated here runs the checker that would actually decide. None
+/// means no usable checker: a skip, not a confusing later failure.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn usable_checker(primary: &str, fallback: &str) -> Option<String> {
+    let probe = |cmd: &str| {
+        Command::new("timeout")
+            .arg("60")
+            .args(cmd.split_whitespace())
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if probe(primary) {
+        Some(primary.to_string())
+    } else if probe(fallback) {
+        Some(fallback.to_string())
+    } else {
+        None
+    }
+}
+
+/// bun for the loop: $BUN, then PATH, then the default install location -
+/// the same order examples/ts-smoke.sh probes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn find_bun() -> Option<String> {
+    if let Ok(bun) = std::env::var("BUN") {
+        if runs_on_host(&bun) {
+            return Some(bun);
+        }
+    }
+    if runs_on_host("bun") {
+        return Some("bun".to_string());
+    }
+    let home = std::env::var("HOME").ok()?;
+    let bun = format!("{}/.bun/bin/bun", home.trim_end_matches('/'));
+    runs_on_host(&bun).then_some(bun)
+}
+
+/// The smoke check must skip loudly when the toolchain is missing, never
+/// pass silently: exit 77 (the automake skip code the Makefile recipe
+/// turns into TS-SKIPPED), the reason on stderr, and no TS-OK anywhere.
+/// An emptied PATH and HOME make the probes fail even on a host that has
+/// the tools, so the skip path itself is what is tested.
+#[test]
+fn ts_smoke_skips_loudly_without_a_toolchain() {
+    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-smoke-empty-home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    // /bin/bash, not "bash": the emptied child PATH is applied before the
+    // exec, so a PATH lookup for the shell itself would fail. The require
+    // flag is scrubbed: this test owns it, and an inherited
+    // TARDIGRADE_REQUIRE_TS=1 (the documented strict mode) would turn the
+    // skip into exit 1 and make strict mode unable to ever pass.
+    let out = Command::new("/bin/bash")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+        .env("BUN", "")
+        .env("HOME", &home)
+        .env("PATH", "")
+        .env_remove("TARDIGRADE_REQUIRE_TS")
+        .output()
+        .expect("run ts-smoke");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(77), "stderr: {stderr}");
+    assert!(!stdout.contains("TS-OK"), "a skip must never print TS-OK");
+    assert!(
+        stderr.contains("SKIPPED (") && stderr.contains("TypeScript agent-loop smoke check"),
+        "the skip must be loud, stderr: {stderr}"
+    );
+}
+
+/// With the toolchain still missing, TARDIGRADE_REQUIRE_TS=1 makes that same
+/// skip a failure naming the flag.
+#[test]
+fn ts_smoke_require_flag_fails_when_the_toolchain_is_missing() {
+    let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-smoke-empty-home");
+    std::fs::create_dir_all(&home).expect("create fake home");
+    let out = Command::new("/bin/bash")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+        .env("BUN", "")
+        .env("HOME", &home)
+        .env("PATH", "")
+        .env("TARDIGRADE_REQUIRE_TS", "1")
+        .output()
+        .expect("run ts-smoke");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stdout.contains("TS-OK"), "a failed skip must never print TS-OK");
+    assert!(
+        stderr.contains("TARDIGRADE_REQUIRE_TS=1 but"),
+        "the failure must name the flag, stderr: {stderr}"
+    );
+}
+
+/// bun present but no usable checker is still the loud missing-toolchain
+/// skip, not a broken run: PATH holds a stub bun that answers --version
+/// and a stub npx that is present but fails (offline, nothing cached),
+/// and tsc is unreachable.
+#[test]
+fn ts_smoke_skips_when_bun_cannot_be_paired_with_a_checker() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-stub-bun");
+    let _ = std::fs::remove_dir_all(&root);
+    let bin = root.join("bin");
+    let home = root.join("home");
+    std::fs::create_dir_all(&bin).expect("mkdir stub bin");
+    std::fs::create_dir_all(&home).expect("mkdir stub home");
+    let stub = bin.join("bun");
+    std::fs::write(&stub, "#!/bin/sh\necho 1.3.5\n").expect("write stub bun");
+    make_executable(&stub);
+    let dead_npx = bin.join("npx");
+    std::fs::write(&dead_npx, "#!/bin/sh\nexit 1\n").expect("write dead stub npx");
+    make_executable(&dead_npx);
+
+    let run = |require: bool| {
+        Command::new("/bin/bash")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
+            .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+            .env("BUN", &stub)
+            .env("HOME", &home)
+            .env("PATH", &bin)
+            .env("TARDIGRADE_REQUIRE_TS", if require { "1" } else { "" })
+            .output()
+            .expect("run ts-smoke")
+    };
+    let out = run(false);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(77), "stderr: {stderr}");
+    assert!(!stdout.contains("TS-OK"));
+    assert!(
+        stderr.contains("SKIPPED (") && stderr.contains("no usable type checker"),
+        "the skip must name the unusable checker, stderr: {stderr}"
+    );
+    let out = run(true);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("TARDIGRADE_REQUIRE_TS=1 but"), "stderr: {stderr}");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(path).expect("stat stub").permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(path, perm).expect("chmod stub");
+}
+
+/// Runs a command to completion under a hard wall-clock bound; 180 s
+/// covers npx fetching tsc-rs on a cold cache. Two invariants, from
+/// kill(2), govern the timeout path: the process group a negative pid
+/// names lives only while its leader is unreaped, and this child - whose
+/// id is the asserted pgid - is reaped only after the signal, so the
+/// signal can never name a reused or foreign pgid; and pgid > 1 keeps
+/// init (and pid 0's own group) out of range by construction.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn().expect("spawn");
+    let pgid = i32::try_from(child.id()).expect("pid fits in pid_t");
+    assert!(pgid > 1, "refusing to signal pgid {pgid}");
+    // The pipes are drained on their own threads; the Child itself stays
+    // here so only this thread ever reaps it.
+    let out_pipe = child.stdout.take().expect("stdout pipe");
+    let err_pipe = child.stderr.take().expect("stderr pipe");
+    // Readers deliver through channels, so waiting on them is bounded: a
+    // descendant that left the group can hold the pipes open past the
+    // leader's exit forever, and an unbounded join would hang the test.
+    let out_rx = drain_pipe(out_pipe);
+    let err_rx = drain_pipe(err_pipe);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Err(e) => panic!("wait failed: {e}"),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                // Signal before reap: the leader's death would dissolve
+                // the group and free the pgid for reuse.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                let status = child.wait().expect("wait after kill");
+                panic!(
+                    "command did not exit within {secs} s (killed pgid {pgid}, status {status}) \
+                     | stdout: {} | stderr: {}",
+                    String::from_utf8_lossy(&recv_by(&out_rx, deadline)),
+                    String::from_utf8_lossy(&recv_by(&err_rx, deadline))
+                );
+            }
+        }
+    };
+    // Same bound on the normal path: whatever arrived by the deadline is
+    // the output; a still-blocked reader contributes nothing rather than
+    // hanging the suite.
+    let stdout = recv_by(&out_rx, deadline);
+    let stderr = recv_by(&err_rx, deadline);
+    std::process::Output { status, stdout, stderr }
+}
+
+/// Reads one pipe to its end on a thread and delivers the bytes through a
+/// channel, so the wait for them can be bounded (see recv_by).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Receives one reader's buffer, bounded by `deadline`; empty when the
+/// reader is still blocked on a pipe some descendant holds.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn recv_by(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> Vec<u8> {
+    let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
+        return Vec::new();
+    };
+    rx.recv_timeout(wait).unwrap_or_default()
+}
+
+/// The full loop against the real tools: the seeded type errors end their
+/// turn as FAIL with the checker's lines and the checker named, the
+/// type-correct-but-wrong app FAILs through the driver, and the fixed app
+/// prints PASS.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
+    let test = "agent_loop_ts_type_errors_fail_then_fixed_app_passes";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    if usable_checker(&tsc_rs_cmd(), "tsc").is_none() {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
+        ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir loop scratch");
+    let ws = root.join("ws.json");
+    // A stale workspace file must not leak into the run: the loop starts
+    // by removing it.
+    std::fs::write(&ws, b"not json at all").expect("poison the stale workspace");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+        .env("WS", &ws)
+        .env("BUN", bun)
+        // An isolated TMPDIR proves the loop's scratch dir is cleaned up.
+        .env("TMPDIR", &root)
+        .env("TARDIGRADE_TSC_RS_PKG", TSC_RS_PKG);
+    let out = output_within(cmd, 180);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("FAIL: TypeScript type errors"), "stdout: {stdout}");
+    assert!(stdout.contains("error TS"), "stdout: {stdout}");
+    assert!(stdout.contains("checker: "), "stdout: {stdout}");
+    assert!(
+        stdout.contains("FAIL: sum([1,2,3]) returned -6, want 6"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
+    let leftovers: Vec<String> = std::fs::read_dir(&root)
+        .expect("list loop scratch")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("tardigrade-agent-ts."))
+        .collect();
+    assert!(leftovers.is_empty(), "loop scratch dirs left behind: {leftovers:?}");
+}
+
+/// The in-guest TypeScript check (examples/ts-in-guest): when
+/// TSC_RUST_WASM names a ts_rust.wasm build, the compiler runs inside the
+/// guest - type errors exit 2 with tsc-style lines, a clean project
+/// transpiles into the RAM fs. The artifact is never committed, so a
+/// missing one is a loud skip; TARDIGRADE_REQUIRE_TS=1 fails instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn ts_wasm_checks_and_transpiles_inside_the_guest() {
+    let test = "ts_wasm_checks_and_transpiles_inside_the_guest";
+    let Ok(wasm) = std::env::var("TSC_RUST_WASM") else {
+        assert!(
+            !ts_required(),
+            "TARDIGRADE_REQUIRE_TS=1 but TSC_RUST_WASM is not set to a ts_rust.wasm build"
+        );
+        ts_skipped("TSC_RUST_WASM is not set (the wasm build is not committed)", test);
+        return;
+    };
+    if !PathBuf::from(&wasm).is_file() {
+        assert!(
+            !ts_required(),
+            "TARDIGRADE_REQUIRE_TS=1 but TSC_RUST_WASM={} is not a file",
+            wasm
+        );
+        ts_skipped("TSC_RUST_WASM does not name an existing wasm build", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-in-guest");
+    let _ = std::fs::remove_dir_all(&root);
+    // A broken project and a clean one with emit; the tsconfigs decide.
+    let bad = root.join("bad");
+    let good = root.join("good");
+    std::fs::create_dir_all(bad.join("lib")).expect("mkdir bad");
+    std::fs::create_dir_all(good.join("lib")).expect("mkdir good");
+    std::fs::write(
+        bad.join("app.ts"),
+        "import { sum } from \"./lib/sum\";\nconst wrong: number = sum([\"a\", \"b\"]);\n",
+    )
+    .expect("write bad app");
+    std::fs::write(
+        bad.join("lib/sum.ts"),
+        "export const sum = (xs: string[]): string => xs.join(\"\");\n",
+    )
+    .expect("write bad lib");
+    std::fs::write(
+        bad.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true }, "include": ["app.ts", "lib"] }"#,
+    )
+    .expect("write bad tsconfig");
+    std::fs::write(
+        good.join("app.ts"),
+        "import { sum } from \"./lib/sum\";\nimport { two } from \"./lib/we\\\"ird\";\nconsole.log(sum([\"a\", \"b\"]) + two);\n",
+    )
+    .expect("write good app");
+    std::fs::write(
+        good.join("lib/sum.ts"),
+        "export const sum = (xs: string[]): string => xs.join(\"\");\n",
+    )
+    .expect("write good lib");
+    // A quote in a file name must travel as data: run.sh embeds every
+    // project file as a base64 snapshot entry and never splices a path
+    // into program text.
+    std::fs::write(
+        good.join("lib/we\"ird.ts"),
+        "export const two = 2;\n",
+    )
+    .expect("write oddly named lib");
+    // A tab is a legal file name character and JSON forbids raw control
+    // characters in strings, so the snapshot keys must escape it.
+    std::fs::write(
+        good.join("lib/ta\tb.ts"),
+        "export const three = 3;\n",
+    )
+    .expect("write tab-named lib");
+    std::fs::write(
+        good.join("app.ts"),
+        "import { sum } from \"./lib/sum\";\nimport { two } from \"./lib/we\\\"ird\";\nimport { three } from \"./lib/ta\tb\";\nconsole.log(sum([\"a\", \"b\"]) + two + three);\n",
+    )
+    .expect("write good app with odd imports");
+    std::fs::write(
+        good.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "outDir": "out" }, "include": ["app.ts", "lib"] }"#,
+    )
+    .expect("write good tsconfig");
+
+    let run = |proj: &std::path::Path, ws: &str| {
+        let mut cmd = Command::new("/bin/bash");
+        cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-in-guest/run.sh"))
+            .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+            .env("TSC_RUST_WASM", &wasm)
+            .arg(proj)
+            .arg(ws);
+        output_within(cmd, 180)
+    };
+
+    let out = run(&bad, root.join("bad-ws.json").to_str().unwrap());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "stdout: {stdout}");
+    assert!(
+        stdout.contains("error TS2322") && stdout.contains("app.ts(2,7)"),
+        "the type error must print tsc-style, stdout: {stdout}"
+    );
+
+    let good_ws = root.join("good-ws.json");
+    // A trailing slash on the project directory must not leak into the
+    // seeded /app paths.
+    let slashed = format!("{}/", good.display());
+    let out = run(std::path::Path::new(&slashed), good_ws.to_str().unwrap());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    let dump = std::fs::read_to_string(&good_ws).expect("read the workspace dump");
+    assert!(dump.contains("/app/out/app.js"), "emit must land in vm.fs: {dump}");
+    assert!(
+        dump.contains("/app/out/lib/sum.js") && dump.contains("export const sum = (xs)"),
+        "the transpiled lib must be in the dump: {dump}"
+    );
+    assert!(
+        dump.contains("/app/out/lib/we\\\"ird.js") && dump.contains("export const two = 2;"),
+        "the oddly named module must emit too: {dump}"
+    );
+    assert!(
+        dump.contains("/app/out/lib/ta\\tb.js") && dump.contains("export const three = 3;"),
+        "the tab-named module must emit too: {dump}"
+    );
+    assert!(!root.join("good-ws.json.pre").exists(), "no stale .pre snapshot");
+}
+
+/// Members named by examples/vm.d.ts: (scope, name) with scope "vm",
+/// "vm.fs", .... A namespace line records the name and opens a scope, a
+/// lone "}" closes it, and every declaration shape the file may use -
+/// function, const, let, var, class, interface, type - names its scope's
+/// members, so a member smuggled in under any of them is still compared
+/// with the runtime. Doc comments never match those shapes.
+/// Declaration shapes the parser names: the bool says whether the shape
+/// opens a named block. Braces are counted per line, so a multi-line
+/// interface or object type inside a namespace keeps the scopes balanced
+/// (an anonymous block pushes an empty name that its closer pops).
+const DTS_SHAPES: [(&str, bool); 9] = [
+    ("namespace ", true),
+    ("class ", true),
+    ("interface ", true),
+    ("enum ", true),
+    ("function ", false),
+    ("const ", false),
+    ("let ", false),
+    ("var ", false),
+    ("type ", false),
+];
+
+fn vm_dts_members(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let mut line = raw.trim();
+        for prefix in ["declare ", "export ", "abstract "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                line = rest.trim_start();
+            }
+        }
+        let mut opens_block = false;
+        let mut name = String::new();
+        for (shape, opens) in DTS_SHAPES {
+            let Some(rest) = line.strip_prefix(shape) else { continue };
+            opens_block = opens;
+            name = rest
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            break;
+        }
+        if !name.is_empty() {
+            out.push((stack.join("."), name.clone()));
+        }
+        // The member's scope is the stack before its own block opens.
+        let delta = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if delta > 0 {
+            stack.push(if opens_block { name } else { String::new() });
+        } else if delta < 0 {
+            for _ in 0..(-delta) {
+                stack.pop();
+            }
+        }
+    }
+    out
+}
+
+/// examples/vm.d.ts must name every vm.* and WebAssembly member a live
+/// guest has, and the guest must have every member it names, so the types
+/// cannot drift from the runtime (and so from the Guest API table in
+/// docs/GUEST-API.md).
+#[test]
+fn vm_dts_members_match_the_runtime() {
+    let source = r#"
+const groups = [
+  ["vm", vm], ["vm.fs", vm.fs], ["vm.net", vm.net], ["vm.stdin", vm.stdin],
+  ["WebAssembly", WebAssembly],
+];
+for (const [name, obj] of groups) {
+  console.log(name + ": " + Object.getOwnPropertyNames(obj).sort().join(" "));
+}
+"#;
+    let r = run_js("vm-dts-members", source);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut runtime = Vec::new();
+    for line in r.stdout.lines() {
+        let (scope, names) = line.split_once(": ").expect("scope: names line");
+        for name in names.split(' ') {
+            runtime.push((scope.to_string(), name.to_string()));
+        }
+    }
+    let dts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/vm.d.ts"))
+        .expect("read examples/vm.d.ts");
+    // Only the compared trees: the runtime side enumerates vm, its
+    // namespaces and WebAssembly; the file also declares globals (console,
+    // timers, ...) that live outside them.
+    let compared = |scope: &str| scope == "vm" || scope.starts_with("vm.") || scope == "WebAssembly";
+    let declared: Vec<(String, String)> = vm_dts_members(&dts)
+        .into_iter()
+        .filter(|(scope, _)| compared(scope))
+        .collect();
+    assert!(!declared.is_empty(), "vm.d.ts parsed to nothing");
+
+    for (scope, name) in &declared {
+        assert!(
+            runtime.contains(&(scope.clone(), name.clone())),
+            "vm.d.ts declares {scope}.{name} but the runtime does not have it"
+        );
+    }
+    for (scope, name) in &runtime {
+        assert!(
+            declared.contains(&(scope.clone(), name.clone())),
+            "the runtime has {scope}.{name} but vm.d.ts does not declare it"
+        );
+    }
+}
+
+/// The parser keeps scopes balanced across every declaration shape the
+/// file may grow: a multi-line interface, enum or abstract class inside a
+/// namespace must not swallow the namespace's later members, and export
+/// prefixes must not hide a declaration.
+#[test]
+fn vm_dts_parser_scopes_block_declarations() {
+    let text = "\
+declare namespace vm {\n  namespace fs {\n    interface Stat {\n      type: string;\n      size: number;\n    }\n    export function stat(path: string): Stat;\n    enum Kind { A,\n      B }\n    abstract class Base {\n      abstract kind(): string;\n    }\n    export const KIND: Kind;\n  }\n  const version: string;\n}\n";
+    let members = vm_dts_members(text);
+    let expect = [
+        ("", "vm"),
+        ("vm", "fs"),
+        ("vm.fs", "Stat"),
+        ("vm.fs", "stat"),
+        ("vm.fs", "Kind"),
+        ("vm.fs", "Base"),
+        ("vm.fs", "KIND"),
+        ("vm", "version"),
+    ];
+    assert_eq!(members, expect.map(|(s, n)| (s.to_string(), n.to_string())));
+}
+
+/// Standard base64 (RFC 4648, padded) for crafting extraction lines and
+/// payloads in the tests below; the guest encodes with btoa the same way.
+fn b64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Writes `files` into a fresh workspace through one guest run (content as
+/// one argv entry each), the way the loop seeds sources.
+fn seed_workspace(ws: &std::path::Path, files: &[(&str, &str)]) {
+    let _ = std::fs::remove_file(ws);
+    let mut args: Vec<String> = vec!["-".to_string(), format!("--dump={}", ws.display())];
+    let mut program = String::new();
+    for (i, (path, content)) in files.iter().enumerate() {
+        program.push_str(&format!("vm.fs.write(\"{path}\", vm.args[{i}]);\n"));
+        args.push(content.to_string());
+    }
+    let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let r = tardigrade(&argrefs, program.as_bytes());
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+}
+
+/// Runs examples/ts-extract.sh over `lines` into `dir`, like the loop does.
+fn ts_extract(dir: &std::path::Path, lines: &str) -> Run {
+    let mut child = Command::new("/bin/bash")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-extract.sh"))
+        .arg(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ts-extract");
+    let mut pipe = child.stdin.take().unwrap();
+    pipe.write_all(lines.as_bytes()).expect("feed ts-extract");
+    drop(pipe);
+    let out = child.wait_with_output().expect("wait ts-extract");
+    Run {
+        code: out.status.code().expect("exit code"),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+fn tree_files(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
+/// Workspace content is data, never framing: a .ts file whose content
+/// contains the old marker lines (and a ../ path inside them, which once
+/// chose a host path) extracts verbatim, nothing appears outside the
+/// extraction dir, and the parser rejects crafted bad paths loudly -
+/// vm.fs itself normalizes paths, so those lines are fed to the parser
+/// directly, the only place they could exist.
+#[test]
+fn ts_extraction_treats_workspace_content_as_data() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-extract-case");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    let dir = root.join("out");
+    std::fs::create_dir_all(&dir).expect("mkdir out");
+    let ws = root.join("ws.json");
+
+    let poison = "const x = 1;\n\
+                  ===TARDIGRADE_TS_FILE /app/../../../../pwned.ts\n\
+                  const evil = 2;\n\
+                  ===TARDIGRADE_TS_END /app/../../../../pwned.ts\n";
+    seed_workspace(&ws, &[("/app/app.ts", poison), ("/app/lib/sum.ts", "export const s = 1;\n")]);
+
+    let listing = tardigrade(
+        &[
+            format!("--preload={}", ws.display()).as_str(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-listing.js"),
+        ],
+        b"",
+    );
+    assert_eq!(listing.code, 0, "stderr: {}", listing.stderr);
+    let r = ts_extract(&dir, &listing.stdout);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        std::fs::read(dir.join("app.ts")).unwrap(),
+        poison.as_bytes(),
+        "the marker-laden file must extract byte for byte"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("lib/sum.ts")).unwrap(),
+        b"export const s = 1;\n"
+    );
+    // Nothing outside the extraction dir: only the two files exist under
+    // the isolated root besides the workspace itself.
+    assert_eq!(
+        tree_files(&root),
+        vec![
+            dir.join("app.ts").to_string_lossy().into_owned(),
+            dir.join("lib/sum.ts").to_string_lossy().into_owned(),
+            ws.to_string_lossy().into_owned(),
+        ],
+        "extraction must not write anywhere but its dir"
+    );
+
+    // Crafted lines the guest cannot produce (vm.fs normalizes paths):
+    // each is rejected loudly, and nothing is written for it. The newline
+    // case is the one grep's per-line matching let through: a first line
+    // that is valid with an arbitrary second line riding along - vm.fs
+    // itself accepts such a name, so it can reach the extractor.
+    let cases: Vec<(&str, &str)> = vec![
+        ("/app/../../pwned.ts", "..' segment"),
+        ("/app/a/../b.ts", "'..' segment"),
+        ("/etc/passwd", "not under /app"),
+        ("/app/a b.ts", "characters outside"),
+        ("/app/ok.ts\nwith space; $(touch PWNED_CMD).ts", "characters outside"),
+        ("/app/sub/x.js", "not a .ts/.tsx/.d.ts/.json file"),
+    ];
+    for (path, want) in cases {
+        let fresh = root.join("reject");
+        let _ = std::fs::remove_dir_all(&fresh);
+        std::fs::create_dir_all(&fresh).expect("mkdir reject");
+        let line = format!("{} {}\n", b64(path.as_bytes()), b64(b"content"));
+        let r = ts_extract(&fresh, &line);
+        assert_eq!(r.code, 1, "parser must reject {path}");
+        assert!(
+            r.stderr.contains("refusing") && r.stderr.contains(path) && r.stderr.contains(want),
+            "rejection of {path} must name it and the reason: {}",
+            r.stderr
+        );
+        assert!(
+            tree_files(&fresh).is_empty(),
+            "nothing may be written for {path}"
+        );
+    }
+}
+
+/// Bundles travel on stdin as base64, not as one argv entry (the kernel
+/// caps a single argument near 128 KiB): a bundle well past that cap
+/// loads through examples/ts-load-bundle.js exactly the way the loop's
+/// build step does, and the loaded /app/app.js runs.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn ts_bundle_beyond_the_argv_limit_still_loads_and_runs() {
+    let test = "ts_bundle_beyond_the_argv_limit_still_loads_and_runs";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-big-bundle");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir big-bundle scratch");
+    let literal: String = "A".repeat(240_000);
+    std::fs::write(
+        root.join("big.ts"),
+        format!(
+            "export const big = \"{literal}\";\n(globalThis as any).bigLen = big.length;\n"
+        ),
+    )
+    .expect("write big fixture");
+    let mut bun_cmd = Command::new(&bun);
+    bun_cmd
+        .args(["build", "big.ts", "--target=browser", "--format=iife", "--outfile=big.js"])
+        .current_dir(&root);
+    let out = output_within(bun_cmd, 60);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let bundle = std::fs::read(root.join("big.js")).expect("read the bundle");
+    assert!(bundle.len() > 200_000, "bundle only {} bytes", bundle.len());
+
+    let ws = root.join("ws.json");
+    let loader = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-load-bundle.js");
+    let encoded = format!("{}\n", b64(&bundle));
+    let r = tardigrade(
+        &[loader, &format!("--dump={}", ws.display())],
+        encoded.as_bytes(),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let probe = script(
+        "ts-big-bundle-probe",
+        "vm.run(\"/app/app.js\");\nconsole.log(globalThis.bigLen);",
+    );
+    let r = tardigrade(&[&format!("--preload={}", ws.display()), probe.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "240000\n", "the full bundle must have loaded and run");
+}
+
+/// The loop's fallback checker path: with tsc-rs forced to fail
+/// (TARDIGRADE_TSC_RS=/bin/false), the pinned typescript tsc decides, the loop
+/// still passes end to end, and its output names the checker that ran.
+/// This is also where a checker-dependent tsconfig (an ES5 default target
+/// breaks Set for-of, #private and bigint) shows up as a failure.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_loop_ts_with_the_tsc_fallback_passes() {
+    let test = "agent_loop_ts_with_the_tsc_fallback_passes";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    if usable_checker("/bin/false", "npx -y -p typescript@5.9.3 tsc").is_none() {
+        assert!(
+            !ts_required(),
+            "TARDIGRADE_REQUIRE_TS=1 but the fallback tsc cannot be fetched"
+        );
+        ts_skipped("the pinned typescript tsc cannot be fetched", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts-fallback");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir fallback scratch");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+        .env("WS", root.join("ws.json"))
+        .env("BUN", bun)
+        .env("TMPDIR", &root)
+        // The primary is poisoned through the same pin variable the tests
+        // use, so the fallback path and the pin plumbing are both real.
+        .env("TARDIGRADE_TSC_RS_PKG", "tsc-rs@0.0.0-no-such-version")
+        .env("TARDIGRADE_TSC", "npx -y -p typescript@5.9.3 tsc");
+    let out = output_within(cmd, 240);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("checker: npx -y -p typescript@5.9.3 tsc"),
+        "the fallback that ran must be named, stdout: {stdout}"
+    );
+    assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
+}
+
+/// vm.d.ts pins signatures, not just member names: misusing the guest API
+/// fails a real type-check (encodeInto takes a Uint8Array - the runtime
+/// throws for other views - and a net handler is (payload, from) => void),
+/// while the WebAssembly declarations type-check real use under lib esnext.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn vm_dts_rejects_api_misuse() {
+    let test = "vm_dts_rejects_api_misuse";
+    if usable_checker(&tsc_rs_cmd(), "tsc").is_none() {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
+        ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("vm-dts-misuse");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir misuse scratch");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/vm.d.ts"),
+        root.join("vm.d.ts"),
+    )
+    .expect("copy vm.d.ts");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true, "lib": ["esnext"] }, "include": ["**/*.ts"] }"#,
+    )
+    .expect("write tsconfig");
+    std::fs::write(
+        root.join("good.ts"),
+        "const bytes = new TextEncoder().encode(\"{}\");\n\
+         const mod = new WebAssembly.Module(bytes);\n\
+         const valid: boolean = WebAssembly.validate(bytes);\n\
+         const mem = new WebAssembly.Memory({ initial: 1 });\n\
+         const grown: number = mem.grow(1);\n\
+         const buf: ArrayBuffer = mem.buffer;\n\
+         console.log(valid, grown, buf.byteLength, mod instanceof WebAssembly.Module);\n",
+    )
+    .expect("write good fixture");
+    std::fs::write(
+        root.join("bad.ts"),
+        "const enc = new TextEncoder();\n\
+         enc.encodeInto(\"ab\", new DataView(new ArrayBuffer(8)));\n\
+         vm.net.listen(1, (p: number) => p);\n",
+    )
+    .expect("write bad fixture");
+
+    let checker = usable_checker(&tsc_rs_cmd(), "tsc").expect("gated above");
+    let mut parts = checker.split_whitespace();
+    let mut cmd = Command::new(parts.next().expect("checker program"));
+    cmd.args(parts).args(["-p", "."]).current_dir(&root);
+    let out = output_within(cmd, 180);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "misuse must fail: {text}");
+    assert!(text.contains("bad.ts"), "errors must point at bad.ts: {text}");
+    assert!(
+        text.contains("error TS2345") && text.matches("error TS").count() >= 2,
+        "encodeInto and listen misuse must both be type errors: {text}"
+    );
+    assert!(!text.contains("good.ts"), "the WebAssembly typing must hold: {text}");
+}
+
+/// A workspace file the extractor rejects FAILs the turn with the
+/// rejection message only: never a partial tree type-checked into
+/// misleading TS2307 errors. Drives the loop's real build_app by sourcing
+/// the script (its main() narrative runs only when executed).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_loop_ts_rejected_extraction_fails_the_turn_cleanly() {
+    let test = "agent_loop_ts_rejected_extraction_fails_the_turn_cleanly";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    if usable_checker(&tsc_rs_cmd(), "tsc").is_none() {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
+        ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-reject-extract");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir reject scratch");
+    // A space is a legal vm.fs path character and the listing offers the
+    // file (it ends in .ts); the extractor's charset is what rejects it.
+    seed_workspace(
+        &root.join("ws.json"),
+        &[
+            ("/app/app.ts", "import { sum } from \"./lib/sum\";\n(globalThis as any).sum = sum;\n"),
+            ("/app/lib/sum.ts", "export const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);\n"),
+            ("/app/bad name.ts", "const x: number = 1;\n"),
+        ],
+    );
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg("-c")
+        .arg(format!("source '{script}' && if build_app; then echo UNEXPECTED; exit 1; fi"))
+        .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+        .env("WS", root.join("ws.json"))
+        .env("BUN", bun)
+        .env("TMPDIR", &root)
+        .env("TARDIGRADE_TSC_RS_PKG", TSC_RS_PKG);
+    let out = output_within(cmd, 120);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "the expected FAIL turn: {text}");
+    assert!(
+        text.contains("FAIL: extraction rejected a workspace file"),
+        "the turn must FAIL with the rejection: {text}"
+    );
+    assert!(
+        text.contains("ts-extract: refusing") && text.contains("bad name.ts"),
+        "the extractor's message must name the file: {text}"
+    );
+    assert!(
+        !text.contains("error TS"),
+        "no partial tree may be type-checked into misleading errors: {text}"
+    );
+}
+
+/// The bounded runner gives up on readers at the deadline: a descendant
+/// that left the process group but still holds the output pipes cannot
+/// hang the suite - whatever arrived by the deadline is the output. (The
+/// descendant here exits on its own; nothing is signalled.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn bounded_runner_gives_up_on_pipes_a_descendant_holds() {
+    let mut cmd = Command::new("/bin/bash");
+    // The background sleep inherits stdout and holds it open for 3 s
+    // after the leader exits at once.
+    cmd.arg("-c").arg("sleep 3 >&1 & exit 0");
+    let start = std::time::Instant::now();
+    let out = output_within(cmd, 1);
+    assert_eq!(out.status.code(), Some(0), "the leader exits immediately");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "the drain must give up at the 1 s deadline, took {:?}",
+        start.elapsed()
+    );
+    // The held pipe means no EOF: the reader was still blocked, and the
+    // output is what had arrived - nothing.
+    assert!(out.stdout.is_empty());
+}

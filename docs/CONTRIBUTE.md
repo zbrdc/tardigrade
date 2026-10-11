@@ -8,6 +8,7 @@
     make check      # build, then scripted smoke checks over the examples
     make ci         # test, clippy, then check; stops at the first failure
     make test-heavy # the #[ignore]d memory-heavy tests; not part of ci
+    make check-ts   # the TypeScript agent loop; see TYPESCRIPT.md
     make clean      # cargo clean
 
 `make ci` is the gate: CI runs `make ci CARGOFLAGS=--locked`

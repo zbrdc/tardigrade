@@ -27,6 +27,7 @@ tardigrade is a command-line tool and a Rust library, written on the `v8` crate
 - [docs/OPTIONS.md](docs/OPTIONS.md): command-line options, exit codes and environment variables
 - [docs/GUEST-API.md](docs/GUEST-API.md): the JavaScript API inside a run, including `vm.fs` and the snapshot format
 - [docs/LIBRARY.md](docs/LIBRARY.md): embedding tardigrade in a Rust program
+- [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md): TypeScript apps in the agent loop, and vm.d.ts
 - [docs/SANDBOX.md](docs/SANDBOX.md): what `--sandbox` enforces, and what it does not
 - [docs/KNOWN_RISKS.md](docs/KNOWN_RISKS.md): guarantees and limits of the caps and the isolation
 - [docs/KNOWN_BUGS.md](docs/KNOWN_BUGS.md): open defects

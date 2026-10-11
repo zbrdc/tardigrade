@@ -30,6 +30,18 @@ check: build
 	@OUT=$(OUT) BRIDGE=$(BRIDGE) bash examples/serve-demo.sh
 	@echo OK
 
+# The TypeScript agent loop (examples/agent-loop-ts.sh): bun bundles the
+# app, tsc-rs (or tsc) type-checks it. Both are host-side dev tools; when
+# they are missing, or present but unusable, this skips loudly (77 becomes
+# TS-SKIPPED, never a silent pass) and TARDIGRADE_REQUIRE_TS=1 fails instead.
+check-ts: build
+	@OUT=$(OUT) bash examples/ts-smoke.sh; status=$$?; \
+	case $$status in \
+	  0) echo TS-OK ;; \
+	  77) echo TS-SKIPPED ;; \
+	  *) exit 1 ;; \
+	esac
+
 # The CI gate: unit/integration tests, clippy, then the scripted smoke checks.
 # Sub-makes run one after another, so a parallel make (-j) cannot interleave them.
 ci:
@@ -44,4 +56,4 @@ test-heavy:
 clean:
 	$(CARGO) clean
 
-.PHONY: check clean build test clippy ci test-heavy
+.PHONY: check clean build test clippy ci test-heavy check-ts
