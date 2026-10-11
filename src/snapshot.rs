@@ -84,16 +84,17 @@ fn parse_v2(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapsh
         .get("files")
         .and_then(|v| v.as_object())
         .ok_or("invalid snapshot: files must be an object")?;
-    // Count before decoding anything: an over-cap snapshot is refused
-    // before the host has normalized or materialized its entries.
-    let dirs_len = match obj.get("dirs") {
-        Some(v) => v
-            .as_array()
-            .ok_or("invalid snapshot: dirs must be an array")?
-            .len(),
-        None => 0,
+    // Fetch and type-check dirs once; the count gate runs before
+    // decoding anything so an over-cap snapshot is refused before the
+    // host has normalized or materialized its entries.
+    let dirs = match obj.get("dirs") {
+        None => None,
+        Some(v) => Some(
+            v.as_array()
+                .ok_or("invalid snapshot: dirs must be an array")?,
+        ),
     };
-    if files.len() + dirs_len > MAX_ENTRIES {
+    if files.len() + dirs.map_or(0, |arr| arr.len()) > MAX_ENTRIES {
         return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
     }
     let mut seen = BTreeSet::new();
@@ -103,19 +104,21 @@ fn parse_v2(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapsh
         push_seen(&mut seen, key.clone())?;
         out.push((key, entry_bytes(entry)?));
     }
-    let mut dirs = BTreeSet::new();
-    if let Some(v) = obj.get("dirs") {
-        let arr = v.as_array().ok_or("invalid snapshot: dirs must be an array")?;
+    let mut dir_set = BTreeSet::new();
+    if let Some(arr) = dirs {
         for d in arr {
             let s = d
                 .as_str()
                 .ok_or("invalid snapshot: dirs entries must be strings")?;
             let key = normalize(s)?;
             push_seen(&mut seen, key.clone())?;
-            dirs.insert(key);
+            dir_set.insert(key);
         }
     }
-    Ok(Snapshot { dirs, files: out })
+    Ok(Snapshot {
+        dirs: dir_set,
+        files: out,
+    })
 }
 
 fn entry_bytes(entry: &serde_json::Value) -> FsResult<Vec<u8>> {

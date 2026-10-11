@@ -49,12 +49,26 @@ pub(crate) fn usage(files: &BTreeMap<String, Vec<u8>>, dirs: &BTreeSet<String>) 
 
 /// Collapses `.`/`..`/duplicate slashes and rejects anything that is not an
 /// absolute path inside the sandbox root.
+/// Paths echoed in guest-facing errors are capped so a huge argument
+/// cannot balloon the message past V8's string limit.
+pub(crate) fn shown(path: &str) -> String {
+    const MAX: usize = 256;
+    if path.len() <= MAX {
+        return path.to_string();
+    }
+    let cut = path
+        .char_indices()
+        .find(|(i, _)| *i >= MAX)
+        .map_or(path.len(), |(i, _)| i);
+    format!("{}...", &path[..cut])
+}
+
 pub(crate) fn normalize(path: &str) -> FsResult<String> {
     if path.contains('\0') {
-        return Err(format!("path contains NUL: {}", path));
+        return Err(format!("path contains NUL: {}", shown(path)));
     }
     if !path.starts_with('/') {
-        return Err(format!("path must be absolute: {}", path));
+        return Err(format!("path must be absolute: {}", shown(path)));
     }
     let mut parts: Vec<&str> = Vec::new();
     for seg in path.split('/') {
@@ -63,7 +77,7 @@ pub(crate) fn normalize(path: &str) -> FsResult<String> {
             ".." => {
                 // Popping past the root means the path wants out.
                 if parts.pop().is_none() {
-                    return Err(format!("path escapes root: {}", path));
+                    return Err(format!("path escapes root: {}", shown(path)));
                 }
             }
             other => parts.push(other),
@@ -313,13 +327,23 @@ impl RamFs {
         })
     }
 
+    /// Post-operation usage for a write, checked end to end so an
+    /// (unreachable) counter near u64::MAX errors instead of wrapping.
+    fn used_after(&self, add: u64, old: u64) -> FsResult<u64> {
+        self.used
+            .checked_add(add)
+            .and_then(|u| u.checked_sub(old))
+            .ok_or_else(|| ACCOUNTING.to_string())
+    }
+
     /// Quota, caps, and shape check for a would-be write of `len` bytes,
     /// without any data. Lets the callback reject a giant buffer before
     /// copying it into Rust memory.
     pub(crate) fn probe_write(&self, path: &str, len: usize) -> FsResult<()> {
         let plan = self.plan_write(path, len)?;
+        let used_after = self.used_after(plan.add, plan.old)?;
         self.reserve(
-            self.used + plan.add - plan.old,
+            used_after,
             self.entries() + plan.missing.len() + plan.new_file,
         )
     }
@@ -328,8 +352,9 @@ impl RamFs {
     /// and replaces an existing file at `path` wholesale.
     pub(crate) fn write(&mut self, path: &str, data: Vec<u8>) -> FsResult<()> {
         let plan = self.plan_write(path, data.len())?;
+        let used_after = self.used_after(plan.add, plan.old)?;
         self.reserve(
-            self.used + plan.add - plan.old,
+            used_after,
             self.entries() + plan.missing.len() + plan.new_file,
         )?;
         let WritePlan {
@@ -369,7 +394,8 @@ impl RamFs {
         let missing = self.missing_dirs(&p)?;
         let add: u64 = missing.iter().map(|d| dir_cost(d)).sum::<u64>() + dir_cost(&p);
         let count = missing.len() + 1;
-        self.reserve(self.used + add, self.entries() + count)?;
+        let used_after = self.used_after(add, 0)?;
+        self.reserve(used_after, self.entries() + count)?;
         self.insert_dirs(missing);
         self.dirs.insert(p);
         self.charge(add)
@@ -665,8 +691,13 @@ impl RamFs {
             delta += dir_cost(d) as i64;
         }
         for (p, bytes) in &snap.files {
-            if want.contains(p) || self.dirs.contains(p) {
+            if self.dirs.contains(p) || snap.dirs.contains(p) {
                 return Err(format!("is a directory: {}", p));
+            }
+            // Not itself a directory, but some snapshot directory lives
+            // under this file: the file is what stands in the way.
+            if want.contains(p) {
+                return Err(format!("not a directory: {}", p));
             }
             let old = self.files.get(p).map_or(0, |d| file_cost(p, d.len()));
             delta += file_cost(p, bytes.len()) as i64 - old as i64;
@@ -676,7 +707,10 @@ impl RamFs {
         if entries_after > MAX_ENTRIES {
             return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
         }
-        if self.quota != 0 && (self.used as i64 + delta) > self.quota as i64 {
+        // i128: quotas at or above 2^63 are representable (--fs-quota
+        // accepts them), and casting them to i64 would wrap negative and
+        // reject every restore.
+        if self.quota != 0 && (self.used as i128 + delta as i128) > self.quota as i128 {
             return Err("fs quota exceeded".to_string());
         }
         Ok(RestorePlan {
@@ -1099,6 +1133,58 @@ mod tests {
             f.rename("/b", &long).unwrap();
             assert_eq!(f.used, usage(&f.files, &f.dirs));
         }
+    }
+
+    #[test]
+    fn restore_works_with_quotas_at_or_above_2_to_the_63() {
+        // --fs-quota accepts values whose byte counts do not fit i64;
+        // casting the quota would wrap negative and reject everything.
+        let mut f = RamFs::new(1 << 63);
+        f.restore(r#"{"version":2,"files":{"/a":{"text":"x"}}}"#).unwrap();
+        assert_eq!(f.read_string("/a").unwrap(), "x");
+        f.write("/b", b"y".to_vec()).unwrap();
+        assert_eq!(f.read_string("/b").unwrap(), "y");
+    }
+
+    #[test]
+    fn usage_gates_error_instead_of_wrapping() {
+        // A counter near u64::MAX is unreachable through the quota, but
+        // the gates must still refuse to wrap it around to a small value.
+        let mut f = fs();
+        f.used = u64::MAX - 10;
+        let err = f.write("/f", vec![0u8; 20]).unwrap_err();
+        assert_eq!(err, "fs accounting overflow");
+        assert_eq!(f.used, u64::MAX - 10); // untouched
+        let err = f.mkdir("/d", false).unwrap_err();
+        assert_eq!(err, "fs accounting overflow");
+    }
+
+    #[test]
+    fn error_messages_truncate_huge_paths() {
+        let err = normalize(&"a".repeat(100_000)).unwrap_err();
+        assert!(err.starts_with("path must be absolute: a"));
+        assert!(err.ends_with("..."));
+        assert!(err.len() < 300, "{}", err.len());
+        // multibyte chars are not split by the cut
+        let err = normalize(&"é".repeat(100_000)).unwrap_err();
+        assert!(err.ends_with("..."));
+        assert!(std::str::from_utf8(err.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn restore_reports_the_file_when_a_dir_would_sit_under_it() {
+        let mut f = fs();
+        // a declared directory under a snapshot file
+        let snap = r#"{"version":2,"files":{"/a":{"text":"x"}},"dirs":["/a/b"]}"#;
+        assert_eq!(f.restore(snap).unwrap_err(), "not a directory: /a");
+        // a file and its own child
+        let snap = r#"{"version":2,"files":{"/p":{"text":"x"},"/p/c":{"text":"y"}}}"#;
+        assert_eq!(f.restore(snap).unwrap_err(), "not a directory: /p");
+        // ... while a file landing on a directory still says so
+        f.mkdir("/d", false).unwrap();
+        let snap = r#"{"version":2,"files":{"/d":{"text":"x"}}}"#;
+        assert_eq!(f.restore(snap).unwrap_err(), "is a directory: /d");
+        assert!(f.list("/").unwrap().is_empty()); // nothing applied
     }
 
     #[test]

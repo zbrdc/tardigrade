@@ -44,7 +44,8 @@ and is not set by this repo.
 - "--memory=<mb>" V8 heap cap in MB (default 256)
 - "--fs-quota=<mb>" RAM filesystem quota in MB (default 64, 0 disables)
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
-- "--dump=<file>" write vm.snapshot() to a file when the run ends
+- "--dump=<file>" write the snapshot to a file after the run ends, whatever
+  the ending: normal exit, vm.exit, uncaught exception, or timeout
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
 - uncaught exceptions and unhandled promise rejections exit 1; usage errors 2

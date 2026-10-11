@@ -34,32 +34,73 @@ fn arg_path(scope: &mut v8::HandleScope, v: &v8::Value) -> PathArg {
     PathArg::Text(s.to_rust_string_lossy(scope))
 }
 
+/// UTF-16 units per scan chunk: bounds the scratch buffer so a huge
+/// path argument cannot allocate unboundedly outside --memory.
+const SURROGATE_CHUNK: usize = 4096;
+
 /// True when the raw UTF-16 code units contain an unpaired surrogate.
 /// Read through String::write, which reports the code units verbatim
-/// (the lossy Rust conversion would already have replaced them).
+/// (the lossy Rust conversion would already have replaced them), in
+/// fixed-size chunks from `start`.
 fn has_lone_surrogate(s: &v8::String, scope: &mut v8::HandleScope) -> bool {
-    let mut units = vec![0u16; s.length()];
-    let wrote = s.write(scope, &mut units, 0, v8::WriteOptions::NO_NULL_TERMINATION);
-    lone_surrogate_in(&units[..wrote])
-}
-
-/// Pure scan: a lead surrogate must be followed by a trail surrogate,
-/// and a trail surrogate must be preceded by a lead.
-fn lone_surrogate_in(units: &[u16]) -> bool {
-    let mut i = 0;
-    while i < units.len() {
-        let u = units[i];
-        if (0xd800..0xdc00).contains(&u) {
-            match units.get(i + 1) {
-                Some(next) if (0xdc00..0xe000).contains(next) => i += 1,
-                _ => return true,
-            }
-        } else if (0xdc00..0xe000).contains(&u) {
+    let len = s.length();
+    let mut scan = SurrogateScan::default();
+    let mut buf = vec![0u16; SURROGATE_CHUNK.min(len)];
+    let mut start = 0;
+    while start < len {
+        let take = SURROGATE_CHUNK.min(len - start);
+        let wrote = s.write(scope, &mut buf[..take], start, v8::WriteOptions::NO_NULL_TERMINATION);
+        if scan.feed(&buf[..wrote]) {
             return true;
         }
-        i += 1;
+        start += wrote;
     }
-    false
+    // A lead dangling at the very end has no next chunk to pair with.
+    scan.pending_lead
+}
+
+/// Streaming surrogate scan: a lead surrogate must be followed by a
+/// trail surrogate, and a trail must be preceded by a lead. A lead at a
+/// chunk boundary stays pending until the next chunk decides.
+#[derive(Default)]
+struct SurrogateScan {
+    pending_lead: bool,
+}
+
+impl SurrogateScan {
+    fn feed(&mut self, units: &[u16]) -> bool {
+        let mut i = 0;
+        if self.pending_lead {
+            match units.first() {
+                Some(next) if (0xdc00..0xe000).contains(next) => i = 1,
+                _ => return true,
+            }
+            self.pending_lead = false;
+        }
+        while i < units.len() {
+            let u = units[i];
+            if (0xd800..0xdc00).contains(&u) {
+                match units.get(i + 1) {
+                    Some(next) if (0xdc00..0xe000).contains(next) => i += 1,
+                    None => self.pending_lead = true,
+                    _ => return true,
+                }
+            } else if (0xdc00..0xe000).contains(&u) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+/// One-shot scan over a whole unit slice: a lead dangling at the very
+/// end is lone, because there is no next chunk to pair it with.
+/// (Test-facing; the callback path streams through SurrogateScan.)
+#[cfg(test)]
+fn lone_surrogate_in(units: &[u16]) -> bool {
+    let mut scan = SurrogateScan::default();
+    scan.feed(units) || scan.pending_lead
 }
 
 /// Reads a path argument, propagating a thrown conversion and rejecting
@@ -371,6 +412,40 @@ mod tests {
         assert!(lone_surrogate_in(&[0xd800, 0xd800])); // lead, lead
         assert!(!lone_surrogate_in(&[0xd83d, 0xde00, 0xfffd])); // emoji + U+FFFD
         assert!(!lone_surrogate_in(&[0xfffd, 0xfffd])); // genuine U+FFFD is fine
+    }
+
+    #[test]
+    fn surrogate_scan_carries_leads_across_chunk_boundaries() {
+        // A pair split across chunks is still a pair.
+        let mut scan = SurrogateScan::default();
+        assert!(!scan.feed(&[0x61, 0xd800]));
+        assert!(!scan.feed(&[0xdc00, 0x62]));
+        // A lead at the end of the last chunk is lone.
+        let mut scan = SurrogateScan::default();
+        assert!(!scan.feed(&[0xd800]));
+        // A trail opening the next chunk without a pending lead is lone.
+        let mut scan = SurrogateScan::default();
+        assert!(!scan.feed(&[0x61]));
+        assert!(scan.feed(&[0xdc00]));
+        // A pending lead met by a BMP char is lone.
+        let mut scan = SurrogateScan::default();
+        assert!(!scan.feed(&[0xd800]));
+        assert!(scan.feed(&[0x41]));
+        // Feeding the scan in 2-unit slices matches the one-shot scan.
+        let units: Vec<u16> = [0x61u16, 0xd83d, 0xde00, 0xd800, 0x62, 0xdc00]
+            .into_iter()
+            .cycle()
+            .take(200)
+            .collect();
+        let mut scan = SurrogateScan::default();
+        let mut streamed = false;
+        for pair in units.chunks(2) {
+            if scan.feed(pair) {
+                streamed = true;
+                break;
+            }
+        }
+        assert_eq!(streamed, lone_surrogate_in(&units));
     }
 
     #[test]

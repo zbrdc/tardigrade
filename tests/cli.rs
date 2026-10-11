@@ -557,6 +557,55 @@ fn full_quota_control_characters_survive_a_snapshot_round_trip() {
 }
 
 #[test]
+fn dump_is_written_for_every_ending() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dump_has_f = |name: &str| {
+        let path = dir.join(name);
+        let json = std::fs::read_to_string(&path).unwrap_or_default();
+        path.exists() && json.contains("\"/f\"")
+    };
+    let endings = [
+        ("vm.exit(0) at top level", "vm.fs.write('/f','x'); vm.exit(0);", 0),
+        ("vm.exit(0) in a timer", "vm.fs.write('/f','x'); setTimeout(() => vm.exit(0), 5);", 0),
+        ("vm.exit(0) in a microtask", "vm.fs.write('/f','x'); Promise.resolve().then(() => vm.exit(0));", 0),
+        ("vm.exit(3)", "vm.fs.write('/f','x'); vm.exit(3);", 3),
+        (
+            "timeout",
+            "vm.fs.write('/f','x'); for (;;) {}",
+            124,
+        ),
+    ];
+    for (i, (what, src, want)) in endings.iter().enumerate() {
+        let script_path = script(&format!("ending-{}", i), src);
+        let dump = dir.join(format!("ending-{}.json", i));
+        let _ = std::fs::remove_file(&dump); // only this run's dump counts
+        let r = v8vm(
+            &[
+                "--timeout=200",
+                &format!("--dump={}", dump.display()),
+                script_path.to_str().unwrap(),
+            ],
+            b"",
+        );
+        assert_eq!(r.code, *want, "{}: exit code (stderr: {})", what, r.stderr);
+        assert!(dump_has_f(&format!("ending-{}.json", i)), "{}: dump missing /f", what);
+    }
+}
+
+#[test]
+fn fs_error_messages_truncate_huge_paths() {
+    let r = run_js(
+        "huge-path-msg",
+        "const p = 'a'.repeat(300000);
+         try { vm.fs.read(p); console.log('no throw'); }
+         catch (e) { console.log(e.message.length < 300, e.message.startsWith('path must be absolute: a'), e.message.endsWith('...')); }
+         console.log(vm.fs.exists(p));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "true true true\nfalse\n");
+}
+
+#[test]
 fn dump_then_preload_restores_the_filesystem() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.json");
     let writer = script("dump-writer", "vm.fs.write('/k', 'v\\u00e9');");
