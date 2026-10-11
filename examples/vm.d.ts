@@ -1,12 +1,15 @@
-// Type definitions for the tardigrade guest API, compared with the runtime by
-// tests/cli.rs (vm_dts_members_match_the_runtime): every vm.* member
-// named here exists in a live guest, and every runtime member is named.
+// Type definitions for the tardigrade guest API, compared with the runtime
+// by tests/cli.rs (vm_dts_members_match_the_runtime): every vm.* and
+// WebAssembly member named here exists in a live guest, and every runtime
+// member is named.
 //
 // tardigrade guests are not DOM environments: the tsconfig should not pull in
 // lib.dom (the tsconfig that examples/agent-loop-ts.sh generates sets
 // "lib": ["esnext"]), or TextEncoder, WebAssembly and friends would be
-// declared twice - under lib esnext they are otherwise absent, so this
-// file declares the WebAssembly surface tardigrade promises.
+// declared twice - under lib esnext they are otherwise absent. This file
+// declares the whole WebAssembly namespace the engine exposes here;
+// instantiateStreaming and compileStreaming stay undeclared because this
+// runtime lacks them.
 
 declare namespace vm {
   /** The V8 engine version string. */
@@ -160,6 +163,42 @@ declare namespace WebAssembly {
     readonly buffer: ArrayBuffer;
     grow(delta: number): number;
   }
+  class Table {
+    constructor(descriptor: {
+      element: "anyfunc" | "externref";
+      initial: number;
+      maximum?: number;
+    });
+    readonly length: number;
+    get(index: number): any;
+    set(index: number, value: any): void;
+    grow(delta: number, value?: any): number;
+  }
+  class Global {
+    constructor(
+      descriptor: {
+        value: "i32" | "i64" | "f32" | "f64" | "v128" | "externref" | "anyfunc";
+        mutable?: boolean;
+      },
+      value?: any,
+    );
+    value: any;
+    valueOf(): any;
+  }
+  class Tag {
+    constructor(descriptor: { types: string[] });
+  }
+  class Exception {
+    constructor(tag: Tag, payload: unknown[]);
+    getArg(tag: Tag, index: number): any;
+    is(tag: Tag): boolean;
+  }
+  class CompileError extends Error {}
+  class LinkError extends Error {}
+  class RuntimeError extends Error {}
+  /** The built-in tag for JavaScript values crossing an exception
+   *  boundary. */
+  const JSTag: Tag;
   function compile(bytes: ArrayBuffer | ArrayBufferView): Promise<Module>;
   function instantiate(
     bytes: ArrayBuffer | ArrayBufferView,

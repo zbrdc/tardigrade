@@ -2949,55 +2949,71 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
 /// function, const, let, var, class, interface, type - names its scope's
 /// members, so a member smuggled in under any of them is still compared
 /// with the runtime. Doc comments never match those shapes.
+/// Declaration shapes the parser names: the bool says whether the shape
+/// opens a named block. Braces are counted per line, so a multi-line
+/// interface or object type inside a namespace keeps the scopes balanced
+/// (an anonymous block pushes an empty name that its closer pops).
+const DTS_SHAPES: [(&str, bool); 9] = [
+    ("namespace ", true),
+    ("class ", true),
+    ("interface ", true),
+    ("enum ", true),
+    ("function ", false),
+    ("const ", false),
+    ("let ", false),
+    ("var ", false),
+    ("type ", false),
+];
+
 fn vm_dts_members(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     for raw in text.lines() {
-        let line = raw.trim().strip_prefix("declare ").unwrap_or(raw.trim());
-        let (opens, rest) = if let Some(rest) = line.strip_prefix("namespace ") {
-            (true, rest)
-        } else if let Some(rest) = line.strip_prefix("function ") {
-            (false, rest)
-        } else if let Some(rest) = line.strip_prefix("const ") {
-            (false, rest)
-        } else if let Some(rest) = line.strip_prefix("let ") {
-            (false, rest)
-        } else if let Some(rest) = line.strip_prefix("var ") {
-            (false, rest)
-        } else if let Some(rest) = line.strip_prefix("class ") {
-            (false, rest)
-        } else if let Some(rest) = line.strip_prefix("interface ") {
-            (false, rest)
-        } else if let Some(rest) = line.strip_prefix("type ") {
-            (false, rest)
-        } else if line == "}" {
-            stack.pop();
-            continue;
-        } else {
-            continue;
-        };
-        let name = rest
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .next()
-            .unwrap_or_default();
-        if name.is_empty() {
-            continue;
+        let mut line = raw.trim();
+        for prefix in ["declare ", "export ", "abstract "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                line = rest.trim_start();
+            }
         }
-        out.push((stack.join("."), name.to_string()));
-        if opens {
-            stack.push(name.to_string());
+        let mut opens_block = false;
+        let mut name = String::new();
+        for (shape, opens) in DTS_SHAPES {
+            let Some(rest) = line.strip_prefix(shape) else { continue };
+            opens_block = opens;
+            name = rest
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            break;
+        }
+        if !name.is_empty() {
+            out.push((stack.join("."), name.clone()));
+        }
+        // The member's scope is the stack before its own block opens.
+        let delta = line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if delta > 0 {
+            stack.push(if opens_block { name } else { String::new() });
+        } else if delta < 0 {
+            for _ in 0..(-delta) {
+                stack.pop();
+            }
         }
     }
     out
 }
 
-/// examples/vm.d.ts must name every vm.* member a live guest has, and the
-/// guest must have every member it names, so the types cannot drift from
-/// the runtime (and so from the README's Guest API table).
+/// examples/vm.d.ts must name every vm.* and WebAssembly member a live
+/// guest has, and the guest must have every member it names, so the types
+/// cannot drift from the runtime (and so from the Guest API table in
+/// docs/GUEST-API.md).
 #[test]
 fn vm_dts_members_match_the_runtime() {
     let source = r#"
-const groups = [["vm", vm], ["vm.fs", vm.fs], ["vm.net", vm.net], ["vm.stdin", vm.stdin]];
+const groups = [
+  ["vm", vm], ["vm.fs", vm.fs], ["vm.net", vm.net], ["vm.stdin", vm.stdin],
+  ["WebAssembly", WebAssembly],
+];
 for (const [name, obj] of groups) {
   console.log(name + ": " + Object.getOwnPropertyNames(obj).sort().join(" "));
 }
@@ -3013,12 +3029,13 @@ for (const [name, obj] of groups) {
     }
     let dts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/vm.d.ts"))
         .expect("read examples/vm.d.ts");
-    // Only the vm tree is compared: the runtime side enumerates vm, vm.fs,
-    // vm.net and vm.stdin, while the file also declares globals (console,
-    // WebAssembly, ...) that live outside it.
+    // Only the compared trees: the runtime side enumerates vm, its
+    // namespaces and WebAssembly; the file also declares globals (console,
+    // timers, ...) that live outside them.
+    let compared = |scope: &str| scope == "vm" || scope.starts_with("vm.") || scope == "WebAssembly";
     let declared: Vec<(String, String)> = vm_dts_members(&dts)
         .into_iter()
-        .filter(|(scope, _)| scope == "vm" || scope.starts_with("vm."))
+        .filter(|(scope, _)| compared(scope))
         .collect();
     assert!(!declared.is_empty(), "vm.d.ts parsed to nothing");
 
@@ -3034,6 +3051,28 @@ for (const [name, obj] of groups) {
             "the runtime has {scope}.{name} but vm.d.ts does not declare it"
         );
     }
+}
+
+/// The parser keeps scopes balanced across every declaration shape the
+/// file may grow: a multi-line interface, enum or abstract class inside a
+/// namespace must not swallow the namespace's later members, and export
+/// prefixes must not hide a declaration.
+#[test]
+fn vm_dts_parser_scopes_block_declarations() {
+    let text = "\
+declare namespace vm {\n  namespace fs {\n    interface Stat {\n      type: string;\n      size: number;\n    }\n    export function stat(path: string): Stat;\n    enum Kind { A,\n      B }\n    abstract class Base {\n      abstract kind(): string;\n    }\n    export const KIND: Kind;\n  }\n  const version: string;\n}\n";
+    let members = vm_dts_members(text);
+    let expect = [
+        ("", "vm"),
+        ("vm", "fs"),
+        ("vm.fs", "Stat"),
+        ("vm.fs", "stat"),
+        ("vm.fs", "Kind"),
+        ("vm.fs", "Base"),
+        ("vm.fs", "KIND"),
+        ("vm", "version"),
+    ];
+    assert_eq!(members, expect.map(|(s, n)| (s.to_string(), n.to_string())));
 }
 
 /// Standard base64 (RFC 4648, padded) for crafting extraction lines and
