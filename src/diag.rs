@@ -1,0 +1,30 @@
+//! Small diagnostics and v8-string helpers shared across modules.
+
+pub(crate) fn to_rust_string(scope: &mut v8::HandleScope, v: &v8::Value) -> String {
+    match v.to_string(scope) {
+        Some(s) => s.to_rust_string_lossy(scope),
+        None => String::new(),
+    }
+}
+
+pub(crate) fn throw(scope: &mut v8::HandleScope, msg: &str) {
+    let msg = v8::String::new(scope, msg).unwrap();
+    let exc = v8::Exception::error(scope, msg);
+    scope.throw_exception(exc);
+}
+
+pub(crate) fn report(tc: &mut v8::TryCatch<'_, v8::HandleScope<'_>>) {
+    match tc.message() {
+        Some(msg) => {
+            let resource = msg
+                .get_script_resource_name(tc)
+                .map(|v| to_rust_string(tc, &v))
+                .unwrap_or_default();
+            let line = msg.get_line_number(tc).unwrap_or(0);
+            let m: v8::Local<v8::Value> = msg.get(tc).into();
+            let text = to_rust_string(tc, &m);
+            eprintln!("v8vm: uncaught exception: {}:{}: {}", resource, line, text);
+        }
+        None => eprintln!("v8vm: uncaught exception"),
+    }
+}

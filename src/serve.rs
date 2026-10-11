@@ -1,9 +1,12 @@
 //! Console protocol: one JS expression per input line, one JSON line out.
 
-use std::io::{BufRead, Write};
+use std::io::BufRead;
+use std::sync::mpsc::Sender;
 
-use crate::event_loop::{event_loop, report};
-use crate::world::{to_rust_string, world_mut};
+use crate::diag::{report, to_rust_string};
+use crate::event_loop::event_loop;
+use crate::eval_src;
+use crate::world::world_mut;
 
 /// Wraps one command line as a guest expression that always yields a JSON
 /// string. The line sits between newlines so a trailing `//` comment ends at
@@ -17,37 +20,13 @@ fn wrap_serve_expr(line: &str) -> String {
         + "\n));return r===undefined?\"null\":r}catch(e){return JSON.stringify({$error:String(e&&e.message||e)})}})()"
 }
 
-/// Compiles and evaluates one wrapped serve expression.
-fn eval_serve_line<'s>(
-    scope: &mut v8::HandleScope<'s>,
-    wrapped: &str,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let src = v8::String::new_from_utf8(scope, wrapped.as_bytes(), v8::NewStringType::Normal)
-        .unwrap();
-    let name = v8::String::new(scope, "serve").unwrap();
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        name.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-    let script = v8::Script::compile(scope, src, Some(&origin))?;
-    script.run(scope)
-}
-
 /// All encoding happens guest-side (JSON.stringify), so the host stays
-/// JSON-free.
-pub(crate) fn serve_loop<R: BufRead, W: Write>(
+/// JSON-free. Output lines (newline included) go to `lines`, which streams
+/// them to the calling thread.
+pub(crate) fn serve_loop<R: BufRead>(
     scope: &mut v8::HandleScope,
     input: R,
-    mut output: W,
+    lines: &Sender<String>,
 ) -> i32 {
     for line in input.lines() {
         let line = match line {
@@ -59,11 +38,10 @@ pub(crate) fn serve_loop<R: BufRead, W: Write>(
         }
         let wrapped = wrap_serve_expr(&line);
         let mut tc = v8::TryCatch::new(scope);
-        match eval_serve_line(&mut tc, &wrapped) {
+        match eval_src(&mut tc, &wrapped, "serve") {
             Some(v) => {
                 let out = to_rust_string(&mut tc, &v);
-                let _ = writeln!(output, "{}", out);
-                let _ = output.flush();
+                let _ = lines.send(format!("{}\n", out));
             }
             None => {
                 if tc.is_execution_terminating() {

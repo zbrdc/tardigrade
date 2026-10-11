@@ -2,8 +2,8 @@
 
 use std::io::Write;
 
+use crate::diag::to_rust_string;
 use crate::guest_cb;
-use crate::world::to_rust_string;
 
 fn print_line(
     args: &v8::FunctionCallbackArguments,

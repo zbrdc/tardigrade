@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
+
+use crate::stdin::StdinSub;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
 /// survives between loop turns.
@@ -36,10 +37,9 @@ pub(crate) struct World {
     pub(crate) next_port: u64,
     pub(crate) stdin_waiters: Vec<v8::Global<v8::PromiseResolver>>,
     pub(crate) stdin_eof: bool,
-    /// Shut-down signal for the reader thread; dropped with the world.
-    pub(crate) stdin_thread: Option<Sender<Option<Vec<u8>>>>,
-    /// Chunks produced by this run's reader thread (was a process global).
-    pub(crate) stdin_chunks: Option<Receiver<Option<Vec<u8>>>>,
+    /// This run's subscription to the process-wide stdin hub, created on the
+    /// first vm.stdin.read() and dropped (released) when the run ends.
+    pub(crate) stdin_sub: Option<StdinSub>,
     // ids cleared via clear_timer while their callback was on the stack
     pub(crate) cleared: Vec<u64>,
     exit_code: AtomicI32,
@@ -58,8 +58,7 @@ impl World {
             next_port: 1,
             stdin_waiters: Vec::new(),
             stdin_eof: false,
-            stdin_thread: None,
-            stdin_chunks: None,
+            stdin_sub: None,
             cleared: Vec::new(),
             exit_code: AtomicI32::new(-1),
             unhandled_rejection: None,
@@ -86,40 +85,4 @@ pub(crate) fn world_mut<S: AsMut<v8::Isolate>>(scope: &mut S) -> &mut World {
         .as_mut()
         .get_slot_mut::<World>()
         .expect("world is installed in the isolate before callbacks can run")
-}
-
-pub(crate) fn to_rust_string(scope: &mut v8::HandleScope, v: &v8::Value) -> String {
-    match v.to_string(scope) {
-        Some(s) => s.to_rust_string_lossy(scope),
-        None => String::new(),
-    }
-}
-
-pub(crate) fn throw(scope: &mut v8::HandleScope, msg: &str) {
-    let msg = v8::String::new(scope, msg).unwrap();
-    let exc = v8::Exception::error(scope, msg);
-    scope.throw_exception(exc.into());
-}
-
-// ---- unhandled rejections ----
-
-pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
-    if msg.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
-        return;
-    }
-    // The callback runs inside V8's own scope; opening a second HandleScope
-    // on the isolate would panic ("active scope can't be dropped") and abort.
-    let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
-    if world_mut(scope).unhandled_rejection.is_some() {
-        return;
-    }
-    // ponytail: first rejection wins; a later handler does not un-fail the
-    // run. The value is stringified later, inside the guest context scope.
-    match msg.get_value() {
-        Some(v) => {
-            let g = v8::Global::new(scope, v);
-            world_mut(scope).unhandled_rejection_exc = Some(g);
-        }
-        None => world_mut(scope).unhandled_rejection = Some("unknown".to_string()),
-    }
 }

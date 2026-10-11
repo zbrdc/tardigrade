@@ -1,24 +1,64 @@
-//! vm.stdin: streaming stdin into the guest. The blocking reader thread and
-//! its channel belong to this run's World, not to the process.
+//! vm.stdin: streaming stdin into the guest.
+//!
+//! Process stdin is genuinely process-global, so it is modeled that way: one
+//! process-wide hub owns a single blocking reader thread (started on the
+//! first subscription, never restarted) that keeps the UTF-8 boundary logic
+//! of [complete_utf8_len] and parks every chunk in a hub buffer. A run
+//! holds only its [StdinSub] subscription and pulls chunks out of the hub
+//! while it polls: nothing is ever pushed at a run, so a chunk that arrives
+//! while the reading run is on its way out simply stays buffered for the
+//! next subscriber instead of dying with it. EOF is sticky. When several
+//! runs read stdin concurrently, the first subscriber (front of the queue)
+//! receives the chunks until it ends; the others' read() promises stay
+//! pending.
+//!
+//! Caveats: once started, the reader thread keeps draining stdin into the
+//! hub buffer even while no run is subscribed (that is what preserves data
+//! across runs, at the cost of RAM instead of pipe backpressure), and it
+//! holds the process stdin lock while blocked, so a later serve() call in
+//! the same process waits for the reader to hit EOF first.
 
-use std::sync::mpsc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use crate::guest_cb;
 use crate::world::world_mut;
 
-guest_cb!(stdin_read, |_args, rv, scope| {
-    let resolver = v8::PromiseResolver::new(scope).unwrap();
-    if world_mut(scope).stdin_eof {
-        let empty = v8::String::new(scope, "").unwrap();
-        resolver.resolve(scope, empty.into());
-    } else {
-        let waiter = v8::Global::new(scope, resolver);
-        let world = world_mut(scope);
-        world.stdin_waiters.push(waiter);
-        start_stdin_thread(world);
+/// A run's subscription to the stdin hub. Dropping it releases the hub slot
+/// so a later run can receive chunks.
+pub(crate) struct StdinSub {
+    id: u64,
+}
+
+impl Drop for StdinSub {
+    fn drop(&mut self) {
+        unsubscribe(self.id);
     }
-    rv.set(resolver.get_promise(scope).into());
+}
+
+struct HubState {
+    /// Chunks read from process stdin, waiting to be pulled by the current
+    /// subscriber (or kept for the next one).
+    buf: VecDeque<Vec<u8>>,
+    /// Sticky: once process stdin hit EOF, every future subscriber sees it.
+    eof: bool,
+    /// Subscriber queue; the front id is the run currently entitled to
+    /// chunks.
+    subs: VecDeque<u64>,
+    started: bool,
+}
+
+static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| {
+    Mutex::new(HubState {
+        buf: VecDeque::new(),
+        eof: false,
+        subs: VecDeque::new(),
+        started: false,
+    })
 });
+
+static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Length of the prefix of `buf` that can go to the guest now. A multi-byte
 /// UTF-8 sequence cut by a read boundary is held back for the next chunk;
@@ -41,49 +81,94 @@ fn complete_utf8_len(buf: &[u8]) -> usize {
     n
 }
 
-/// Lazily spawns the blocking stdin reader. It sends chunks down a channel
-/// the event loop polls; on EOF it sends None and exits. No libc needed.
-/// Chunks end on UTF-8 boundaries so the guest never sees a split character.
-/// The channel lives in the World: when the run ends, the sender half is
-/// dropped and the reader thread exits on its next write.
-fn start_stdin_thread(world: &mut crate::world::World) {
-    if world.stdin_thread.is_some() {
-        return;
-    }
-    let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
-    let sender = tx.clone();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 65536];
-        let mut pending: Vec<u8> = Vec::new();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    if !pending.is_empty() {
-                        let _ = sender.send(Some(std::mem::take(&mut pending)));
-                    }
-                    let _ = sender.send(None);
-                    break;
+/// The one blocking reader thread. It stays alive between runs, parking
+/// chunks in the hub buffer, and exits after EOF.
+fn reader_loop() {
+    use std::io::Read;
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = [0u8; 65536];
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) | Err(_) => {
+                let mut st = HUB.lock().unwrap();
+                if !pending.is_empty() {
+                    st.buf.push_back(std::mem::take(&mut pending));
                 }
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    let ready_len = complete_utf8_len(&pending);
-                    if ready_len == 0 {
-                        continue;
-                    }
-                    let rest = pending.split_off(ready_len);
-                    let ready = std::mem::replace(&mut pending, rest);
-                    if sender.send(Some(ready)).is_err() {
-                        break;
-                    }
+                st.eof = true;
+                return;
+            }
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                let ready_len = complete_utf8_len(&pending);
+                if ready_len == 0 {
+                    continue;
                 }
+                let rest = pending.split_off(ready_len);
+                let ready = std::mem::replace(&mut pending, rest);
+                HUB.lock().unwrap().buf.push_back(ready);
             }
         }
-    });
-    world.stdin_thread = Some(tx);
-    world.stdin_chunks = Some(rx);
+    }
 }
+
+fn unsubscribe(id: u64) {
+    let mut st = HUB.lock().unwrap();
+    if let Some(pos) = st.subs.iter().position(|sid| *sid == id) {
+        st.subs.remove(pos);
+    }
+}
+
+fn subscribe() -> StdinSub {
+    let id = NEXT_SUB_ID.fetch_add(1, Ordering::Relaxed);
+    let mut st = HUB.lock().unwrap();
+    st.subs.push_back(id);
+    if !st.started {
+        st.started = true;
+        std::thread::Builder::new()
+            .name("v8vm-stdin".to_string())
+            .spawn(reader_loop)
+            .expect("spawn stdin reader");
+    }
+    StdinSub { id }
+}
+
+/// Pulls one event for `id`: `Some(Some(chunk))` is data, `Some(None)` is
+/// EOF (the subscription is retired with it), `None` means nothing to take
+/// right now - either the buffer is empty and stdin is not at EOF, or
+/// another run is ahead in the subscriber queue.
+fn take_event(id: u64) -> Option<Option<Vec<u8>>> {
+    let mut st = HUB.lock().unwrap();
+    if st.subs.front() != Some(&id) {
+        return None;
+    }
+    if let Some(chunk) = st.buf.pop_front() {
+        return Some(Some(chunk));
+    }
+    if st.eof {
+        st.subs.pop_front();
+        return Some(None);
+    }
+    None
+}
+
+guest_cb!(stdin_read, |_args, rv, scope| {
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    {
+        let world = world_mut(scope);
+        if !world.stdin_eof && world.stdin_sub.is_none() {
+            world.stdin_sub = Some(subscribe());
+        }
+    }
+    if world_mut(scope).stdin_eof {
+        let empty = v8::String::new(scope, "").unwrap();
+        resolver.resolve(scope, empty.into());
+    } else {
+        let waiter = v8::Global::new(scope, resolver);
+        world_mut(scope).stdin_waiters.push(waiter);
+    }
+    rv.set(resolver.get_promise(scope).into());
+});
 
 /// Hands one chunk to exactly one waiting reader, or resolves everyone with
 /// "" at EOF.
@@ -105,24 +190,18 @@ fn resolve_stdin_waiters(scope: &mut v8::HandleScope, chunk: Option<&[u8]>) {
     }
 }
 
-/// Drains one chunk off the reader channel, if any waiter is due.
+/// Delivers one hub event (if any) to the waiting readers.
 pub(crate) fn poll_stdin(scope: &mut v8::HandleScope) -> Option<i32> {
-    let eof = {
-        let world = world_mut(scope);
-        if world.stdin_waiters.is_empty() {
-            return None;
-        }
-        world.stdin_eof
-    };
-    if eof {
+    if world_mut(scope).stdin_waiters.is_empty() {
+        return None;
+    }
+    if world_mut(scope).stdin_eof {
         resolve_stdin_waiters(scope, None);
         return None;
     }
-    let chunk = world_mut(scope)
-        .stdin_chunks
-        .as_ref()
-        .and_then(|rx| rx.try_recv().ok());
-    match chunk {
+    let sub_id = world_mut(scope).stdin_sub.as_ref().map(|sub| sub.id);
+    let event = sub_id.and_then(take_event);
+    match event {
         Some(Some(bytes)) => resolve_stdin_waiters(scope, Some(&bytes)),
         Some(None) => {
             world_mut(scope).stdin_eof = true;
@@ -153,7 +232,7 @@ mod tests {
         assert_eq!(complete_utf8_len(&three[..2]), 0);
         let four = "😀".as_bytes();
         for cut in 1..4 {
-            assert_eq!(complete_utf8_len(&[b'x', b'y'].iter().chain(&four[..cut]).copied().collect::<Vec<_>>()), 2);
+            assert_eq!(complete_utf8_len(&b"xy".iter().chain(&four[..cut]).copied().collect::<Vec<_>>()), 2);
         }
     }
 

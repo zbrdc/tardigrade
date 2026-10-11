@@ -5,7 +5,7 @@ implemented in Rust on the v8 crate (Deno's rusty_v8 bindings, V8 12.9).
 
 Inspired by just-bash (vercel-labs): a simulated bash environment with an
 in-memory filesystem for AI agents. v8-vm is the same idea on a real V8. An
-application gets its own isolate and process, a virtual filesystem that
+application gets its own isolate, a virtual filesystem that
 exists only in process memory, an event loop with timers, an in-memory
 network, streaming stdin, a heap cap, and a wall-clock timeout. Guests never
 make a syscall of their own.
@@ -43,8 +43,11 @@ in-process from Rust:
 
 Note: each run()/serve() call creates its own isolate and world; several
 guests can run concurrently in one process and do not see each other's
-state. serve() still reads commands from process stdin, which remains one
-shared stream per process.
+state. vm.stdin is fed by one process-wide reader: input a run does not
+read is kept for the next run. serve() still reads commands from process
+stdin, which remains one shared stream per process. Isolation is per
+isolate within the process: a V8 out-of-memory abort or other V8 fatal
+error ends the whole process and every guest in it.
 
 ## Event loop
 
@@ -97,7 +100,9 @@ tsc-rs at this boundary to let agents write TypeScript.
 - vm.net is a same-process message switch, not sockets: it cannot leave the
   run. One delivery generation per loop turn.
 - This is an application-level sandbox, not a container: isolation is by
-  omission of host APIs, inside one ordinary process per run. For hostile
-  code, run v8vm itself under a container/seccomp profile.
+  omission of host APIs, per isolate inside one ordinary process. A V8
+  fatal error (for example the heap-cap abort below) ends the whole
+  process and every guest in it. For hostile code, run v8vm itself under
+  a container/seccomp profile.
 - Hitting the heap cap aborts with the V8 out-of-memory report.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

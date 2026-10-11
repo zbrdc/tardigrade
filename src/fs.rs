@@ -1,7 +1,8 @@
 //! vm.fs: the RAM filesystem. Throwing read/remove, as documented.
 
+use crate::diag::{throw, to_rust_string};
 use crate::guest_cb;
-use crate::world::{throw, to_rust_string, world_mut};
+use crate::world::world_mut;
 
 guest_cb!(fs_read, |args, rv, scope| {
     let path = to_rust_string(scope, &args.get(0));

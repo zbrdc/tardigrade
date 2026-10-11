@@ -3,16 +3,20 @@
 //!
 //! Library surface: [run] executes one guest program and returns its exit
 //! code; [serve] runs the console protocol over any reader/writer pair.
-//! Each call owns its isolate and its world state, so guests can run
-//! concurrently in one process without seeing each other. Disk is touched
-//! only at the explicit host boundary (entry source, preload/dump files).
-//! Guests never make a syscall of their own.
+//! V8 is initialized once on a dedicated host thread that also begets every
+//! guest thread (a pkey requirement of the default platform), so callers may
+//! live on any thread. Each run owns its isolate and its world state, so
+//! guests can run concurrently in one process without seeing each other.
+//! Disk is touched only at the explicit host boundary (entry source,
+//! preload/dump files). Guests never make a syscall of their own.
 
 mod api;
 mod console;
+mod diag;
 mod event_loop;
 mod exit;
 mod fs;
+mod host;
 mod net;
 mod serve;
 mod stdin;
@@ -21,12 +25,13 @@ mod watchdog;
 mod world;
 
 use std::io::Write;
-use std::sync::LazyLock;
+use std::sync::mpsc;
 
 use api::install;
-use event_loop::{event_loop, report};
+use diag::report;
+use event_loop::{event_loop, promise_reject_callback};
 use watchdog::Watchdog;
-use world::{to_rust_string, world_mut, World, promise_reject_callback};
+use world::{world_mut, World};
 
 /// Host-side run configuration.
 #[derive(Clone, Debug)]
@@ -86,20 +91,7 @@ pub(crate) use guest_cb;
 /// Guest-side glue evaluated before the entry source.
 const PRELUDE: &str = include_str!("prelude.js");
 
-static V8_INIT: LazyLock<()> = LazyLock::new(|| {
-    // Unprotected platform: the default one enforces thread-isolated (pkey
-    // write-protected) code allocations, whose threading guarantees assume a
-    // pumped message loop per isolate. Guests run isolates on arbitrary
-    // user threads without pumping, so two concurrent runs crashed with
-    // SEGV_PKUERR in V8's shared code range. The v8 crate ships this
-    // variant for exactly that embedding style (its own multi-threaded
-    // tests use it); the cost is losing JIT write-protection hardening.
-    let platform = v8::new_unprotected_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
-});
-
-fn eval_src<'s>(
+pub(crate) fn eval_src<'s>(
     scope: &mut v8::HandleScope<'s>,
     src: &str,
     name: &str,
@@ -192,7 +184,7 @@ fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
     let mut tc = v8::TryCatch::new(scope);
     match eval_src(&mut tc, "vm.snapshot()", "dump") {
         Some(v) => {
-            let json = to_rust_string(&mut tc, &v);
+            let json = diag::to_rust_string(&mut tc, &v);
             if std::fs::write(dump, json).is_err() {
                 eprintln!("v8vm: cannot write dump {:?}", dump);
             }
@@ -213,7 +205,7 @@ fn execute_inner(
     scope: &mut v8::HandleScope,
     handle: &v8::IsolateHandle,
     spec: &RunSpec,
-    output: Option<&mut dyn Write>,
+    lines: Option<&mpsc::Sender<String>>,
 ) -> i32 {
     install(scope, spec.cfg);
     if !eval_prelude(scope) {
@@ -227,8 +219,9 @@ fn execute_inner(
 
     let mut code = eval_entry(scope, spec);
     if code == 0 {
-        code = match output {
-            Some(out) => serve::serve_loop(scope, std::io::stdin().lock(), out),
+        code = match lines {
+            // serve: stdin is the command channel
+            Some(lines) => serve::serve_loop(scope, std::io::stdin().lock(), lines),
             None => event_loop(scope),
         };
     }
@@ -244,20 +237,19 @@ fn execute(
     source: &str,
     entry: &str,
     cfg: &Config,
-    output: Option<&mut dyn Write>,
+    lines: Option<&mpsc::Sender<String>>,
 ) -> i32 {
-    LazyLock::force(&V8_INIT);
-
     let mut world = World::new();
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
-    world.stdin_eof = cfg.stdin_consumed || output.is_some();
+    world.stdin_eof = cfg.stdin_consumed || lines.is_some();
 
     // Heap cap; past it V8 aborts with its own out-of-memory report.
     let params = v8::CreateParams::default().heap_limits(64 << 20, cfg.heap_mb << 20);
     let mut isolate = v8::Isolate::new(params);
-    // The isolate owns the world through the slot; slot teardown drops it
-    // (and its Global handles) while the isolate is still alive, replacing
-    // the old manual clearing against a process global.
+    // The isolate owns the world through its embedder slot. On isolate
+    // teardown the annex nulls its isolate pointer before the slots are
+    // dropped, so the slot's Global handles see a disposed isolate and skip
+    // resetting themselves (v8 handle.rs) - no manual clearing needed.
     isolate.set_slot(world);
     isolate.set_promise_reject_callback(promise_reject_callback);
     let handle = isolate.thread_safe_handle();
@@ -266,18 +258,39 @@ fn execute(
     let mut hs = v8::HandleScope::new(&mut isolate);
     let context = v8::Context::new(&mut hs, Default::default());
     let scope = &mut v8::ContextScope::new(&mut hs, context);
-    execute_inner(scope, &handle, &spec, output)
+    execute_inner(scope, &handle, &spec, lines)
 }
 
 /// Run one guest program and return its exit code.
 pub fn run(source: &str, entry: &str, cfg: &Config) -> i32 {
-    execute(source, entry, cfg, None)
+    let (done, rx) = mpsc::channel();
+    host::submit(host::Job {
+        source: source.to_string(),
+        entry: entry.to_string(),
+        cfg: cfg.clone(),
+        lines: None,
+        done,
+    });
+    rx.recv().expect("v8vm guest finished")
 }
 
 /// Serve the console protocol on the given writer (reads commands from
-/// stdin). One JS expression per line in, one JSON line out.
-pub fn serve<W: Write>(output: W, source: &str, entry: &str, cfg: &Config) -> i32 {
-    let mut output = output;
-    let out: &mut dyn Write = &mut output;
-    execute(source, entry, cfg, Some(out))
+/// stdin). One JS expression per line in, one JSON line out. The guest runs
+/// on the host thread's descendants; W never leaves the calling thread.
+pub fn serve<W: Write>(mut output: W, source: &str, entry: &str, cfg: &Config) -> i32 {
+    let (lines, line_rx) = mpsc::channel::<String>();
+    let (done, rx) = mpsc::channel();
+    host::submit(host::Job {
+        source: source.to_string(),
+        entry: entry.to_string(),
+        cfg: cfg.clone(),
+        lines: Some(lines),
+        done,
+    });
+    for line in line_rx {
+        // Same per-line write+flush ordering the guest produced.
+        let _ = output.write_all(line.as_bytes());
+        let _ = output.flush();
+    }
+    rx.recv().expect("v8vm guest finished")
 }

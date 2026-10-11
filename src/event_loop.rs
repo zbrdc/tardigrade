@@ -3,11 +3,12 @@
 
 use std::time::{Duration, Instant};
 
+use crate::diag::{report, to_rust_string};
 use crate::stdin;
-use crate::world::{to_rust_string, world_mut, NetMsg, World};
+use crate::world::{world_mut, NetMsg, World};
 use v8::HandleScope;
 
-pub(crate) enum Outcome {
+enum Outcome {
     Ok,
     Exception,
     Terminated,
@@ -22,22 +23,6 @@ fn stop_code(world: &World, oc: Outcome) -> Option<i32> {
             Some(if code >= 0 { code } else { 124 })
         }
         Outcome::Exception => Some(1),
-    }
-}
-
-pub(crate) fn report(tc: &mut v8::TryCatch<'_, v8::HandleScope<'_>>) {
-    match tc.message() {
-        Some(msg) => {
-            let resource = msg
-                .get_script_resource_name(tc)
-                .map(|v| to_rust_string(tc, &v))
-                .unwrap_or_default();
-            let line = msg.get_line_number(tc).unwrap_or(0);
-            let m: v8::Local<v8::Value> = msg.get(tc).into();
-            let text = to_rust_string(tc, &m);
-            eprintln!("v8vm: uncaught exception: {}:{}: {}", resource, line, text);
-        }
-        None => eprintln!("v8vm: uncaught exception"),
     }
 }
 
@@ -108,10 +93,7 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
                 .min_by_key(|(_, t)| t.when)
                 .map(|(i, _)| i)
         };
-        let idx = match idx {
-            Some(i) => i,
-            None => return None,
-        };
+        let idx = idx?;
         // Move the timer out: the callback may add/clear timers. Whether it
         // was cleared during its own callback is tracked in world.cleared.
         let mut timer = world_mut(scope).timers.swap_remove(idx);
@@ -137,6 +119,29 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
     scope.cancel_terminate_execution();
     let code = world_mut(scope).exit_code();
     Some(if code >= 0 { code } else { 124 })
+}
+
+// ---- unhandled rejections ----
+
+pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
+    if msg.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
+        return;
+    }
+    // The callback runs inside V8's own scope; opening a second HandleScope
+    // on the isolate would panic ("active scope can't be dropped") and abort.
+    let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
+    if world_mut(scope).unhandled_rejection.is_some() {
+        return;
+    }
+    // ponytail: first rejection wins; a later handler does not un-fail the
+    // run. The value is stringified later, inside the guest context scope.
+    match msg.get_value() {
+        Some(v) => {
+            let g = v8::Global::new(scope, v);
+            world_mut(scope).unhandled_rejection_exc = Some(g);
+        }
+        None => world_mut(scope).unhandled_rejection = Some("unknown".to_string()),
+    }
 }
 
 /// After the loop ends: an unhandled rejection fails the run with 1.
@@ -215,3 +220,4 @@ fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> 
     }
     wake.saturating_duration_since(Instant::now())
 }
+

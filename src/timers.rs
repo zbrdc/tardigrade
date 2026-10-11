@@ -2,8 +2,9 @@
 
 use std::time::{Duration, Instant};
 
+use crate::diag::throw;
 use crate::guest_cb;
-use crate::world::{throw, world_mut, Timer};
+use crate::world::{world_mut, Timer};
 
 fn set_timer_common(
     args: &v8::FunctionCallbackArguments,

@@ -48,9 +48,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         }
     }
     if c.entry.is_empty() && !c.serve {
-        return Err(format!(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]"
-        ));
+        return Err("usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]".to_string());
     }
     if c.serve && c.entry == "-" {
         return Err("--serve needs a file entry; stdin is the command channel".into());

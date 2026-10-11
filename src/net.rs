@@ -1,7 +1,8 @@
 //! vm.net: the same-process message switch.
 
+use crate::diag::{throw, to_rust_string};
 use crate::guest_cb;
-use crate::world::{throw, to_rust_string, world_mut, NetMsg};
+use crate::world::{world_mut, NetMsg};
 
 guest_cb!(net_port, |_args, rv, scope| {
     let port = {

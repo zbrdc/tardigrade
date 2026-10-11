@@ -87,7 +87,7 @@ fn relay(stream: &mut TcpStream, guest: &mut Guest, req: &Request) {
         "path": req.path,
         "body": req.body,
     });
-    let expr = format!("handler({})", payload.to_string());
+    let expr = format!("handler({})", payload);
     let out = guest.call(&expr);
 
     let (status, ctype, body): (i64, String, String) = match serde_json::from_str::<serde_json::Value>(&out) {
