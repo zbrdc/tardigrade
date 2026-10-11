@@ -12,13 +12,23 @@ make a syscall of their own.
 
 ## Build
 
-Requires cargo. The v8 crate downloads prebuilt V8 bindings on first build
-(CARGO_HOME/CARGO_TARGET_DIR are pointed at the scratch volume by the
-Makefile).
+Requires cargo. The v8 crate downloads a prebuilt static V8 on first build.
 
     make check
 
-Binaries land in the scratch target directory, not the repo.
+Binaries land in the cargo target directory (target/ by default), not the
+repo.
+
+## Development
+
+    make test   # cargo test --release: unit, CLI, and library tests
+    make check  # build, then scripted smoke checks over the examples
+    make ci     # test then check; the same gate CI runs (.github/workflows/ci.yml)
+
+Environment overrides: CARGO selects the cargo binary (default cargo), and
+CARGO_TARGET_DIR relocates all build output (default target; set it as an
+environment variable or a make variable). CARGO_HOME is cargo's own registry
+cache knob and is not set by this repo.
 
 ## Use
 
@@ -97,6 +107,8 @@ tsc-rs at this boundary to let agents write TypeScript.
 
 - Guests make no syscalls: the only disk access is at the host boundary
   (entry source, --preload/--dump files). Verify: strace -f -e trace=openat
+  shows those reads plus V8's startup probe of
+  /sys/devices/system/cpu/online (read-only); nothing else opens.
 - vm.net is a same-process message switch, not sockets: it cannot leave the
   run. One delivery generation per loop turn.
 - This is an application-level sandbox, not a container: isolation is by

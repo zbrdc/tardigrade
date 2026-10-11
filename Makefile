@@ -24,7 +24,10 @@ check: build
 	@OUT=$(OUT) BRIDGE=$(BRIDGE) bash examples/serve-demo.sh
 	@echo OK
 
+# The CI gate: unit/integration tests, then the scripted smoke checks.
+ci: test check
+
 clean:
 	$(CARGO) clean
 
-.PHONY: check clean build test
+.PHONY: check clean build test ci

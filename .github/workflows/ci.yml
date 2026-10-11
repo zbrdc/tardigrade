@@ -1,0 +1,29 @@
+# CI for v8vm. The v8 crate downloads a prebuilt static V8 library on the
+# first build (into the target directory, under release/gn_out/), so the
+# first uncached run is slow; Swatinem/rust-cache caches target/ and the
+# cargo registry between runs, which includes that archive.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Build
+        run: cargo build --release
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Test and smoke checks
+        # make ci = cargo test --release, then make check (build + scripted
+        # checks that drive the example programs end to end).
+        run: make ci
