@@ -18,7 +18,9 @@
 #
 set -euo pipefail
 OUT=${OUT:?set OUT to the tardigrade binary}
-DIR=$(cd "$(dirname "$0")" && pwd)
+# BASH_SOURCE, not $0: the cli tests source this file to drive build_app,
+# and then $0 is the shell, not this script.
+DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WS=${WS:-$(dirname "$OUT")/agent-ts-ws.json}
 
 # bun is looked up in $BUN, then PATH, then its default install location;
@@ -107,7 +109,11 @@ build_app() {
   local dir="$WORK/turn" rc=0
   rm -rf "$dir"
   mkdir -p "$dir"
-  extract "$dir"
+  # The guard matters inside `if build_app`: set -e is off there, so an
+  # unguarded rejected extraction would continue on a partial tree and
+  # report misleading TS2307 cannot-find-module errors instead of the
+  # rejection. A rejected file FAILs the turn with the message only.
+  extract "$dir" || return 1
   if [ ! -f "$dir/app.ts" ]; then
     echo "workspace has no /app/app.ts to build" >&2
     exit 1
@@ -175,28 +181,36 @@ export const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
 EOF
 )
 
-# Start from a clean workspace: a stale file from an earlier run must not
-# leak into this one.
-rm -f "$WS"
+main() {
+  # Start from a clean workspace: a stale file from an earlier run must not
+  # leak into this one.
+  rm -f "$WS"
 
-echo "== seed workspace with an app that does not type-check =="
-ws_write /app/app.ts "$app_ts"
-ws_write /app/lib/stats.ts "$stats_ts"
-ws_write /app/lib/sum.ts "$sum_type_error"
+  echo "== seed workspace with an app that does not type-check =="
+  ws_write /app/app.ts "$app_ts"
+  ws_write /app/lib/stats.ts "$stats_ts"
+  ws_write /app/lib/sum.ts "$sum_type_error"
 
-echo "== turn 1: type-check, observe the FAIL turn =="
-if build_app; then
-  echo "unexpected: the seeded app must not type-check"; exit 1
+  echo "== turn 1: type-check, observe the FAIL turn =="
+  if build_app; then
+    echo "unexpected: the seeded app must not type-check"; exit 1
+  fi
+
+  echo "== turn 2: agent edits the app (swap for an LLM call) =="
+  ws_write /app/lib/sum.ts "$sum_types_ok_logic_wrong"
+  build_app
+  if "$OUT" --preload="$WS" --dump="$WS" "$DIR/agent-driver.js"; then
+    echo "unexpected pass"; exit 1
+  fi
+
+  echo "== turn 3: agent fixes the logic, rerun =="
+  ws_write /app/lib/sum.ts "$sum_fixed"
+  build_app
+  "$OUT" --preload="$WS" --dump="$WS" "$DIR/agent-driver.js"
+}
+
+ # Run as a script; sourcing loads the helpers (the cli tests drive
+ # build_app this way) without running the demo narrative.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main
 fi
-
-echo "== turn 2: agent edits the app (swap for an LLM call) =="
-ws_write /app/lib/sum.ts "$sum_types_ok_logic_wrong"
-build_app
-if "$OUT" --preload="$WS" --dump="$WS" "$DIR/agent-driver.js"; then
-  echo "unexpected pass"; exit 1
-fi
-
-echo "== turn 3: agent fixes the logic, rerun =="
-ws_write /app/lib/sum.ts "$sum_fixed"
-build_app
-"$OUT" --preload="$WS" --dump="$WS" "$DIR/agent-driver.js"

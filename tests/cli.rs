@@ -3158,12 +3158,16 @@ fn ts_extraction_treats_workspace_content_as_data() {
     );
 
     // Crafted lines the guest cannot produce (vm.fs normalizes paths):
-    // each is rejected loudly, and nothing is written for it.
+    // each is rejected loudly, and nothing is written for it. The newline
+    // case is the one grep's per-line matching let through: a first line
+    // that is valid with an arbitrary second line riding along - vm.fs
+    // itself accepts such a name, so it can reach the extractor.
     let cases: Vec<(&str, &str)> = vec![
         ("/app/../../pwned.ts", "..' segment"),
         ("/app/a/../b.ts", "'..' segment"),
         ("/etc/passwd", "not under /app"),
         ("/app/a b.ts", "characters outside"),
+        ("/app/ok.ts\nwith space; $(touch PWNED_CMD).ts", "characters outside"),
         ("/app/sub/x.js", "not a .ts/.tsx/.d.ts/.json file"),
     ];
     for (path, want) in cases {
@@ -3339,4 +3343,64 @@ fn vm_dts_rejects_api_misuse() {
         "encodeInto and listen misuse must both be type errors: {text}"
     );
     assert!(!text.contains("good.ts"), "the WebAssembly typing must hold: {text}");
+}
+
+/// A workspace file the extractor rejects FAILs the turn with the
+/// rejection message only: never a partial tree type-checked into
+/// misleading TS2307 errors. Drives the loop's real build_app by sourcing
+/// the script (its main() narrative runs only when executed).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_loop_ts_rejected_extraction_fails_the_turn_cleanly() {
+    let test = "agent_loop_ts_rejected_extraction_fails_the_turn_cleanly";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    if !checker_runnable("npx -y tsc-rs@0.3.0", "tsc") {
+        assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
+        ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-reject-extract");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir reject scratch");
+    // A space is a legal vm.fs path character and the listing offers the
+    // file (it ends in .ts); the extractor's charset is what rejects it.
+    seed_workspace(
+        &root.join("ws.json"),
+        &[
+            ("/app/app.ts", "import { sum } from \"./lib/sum\";\n(globalThis as any).sum = sum;\n"),
+            ("/app/lib/sum.ts", "export const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);\n"),
+            ("/app/bad name.ts", "const x: number = 1;\n"),
+        ],
+    );
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg("-c")
+        .arg(format!("source '{script}' && if build_app; then echo UNEXPECTED; exit 1; fi"))
+        .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
+        .env("WS", root.join("ws.json"))
+        .env("BUN", bun)
+        .env("TMPDIR", &root);
+    let out = output_within(cmd, 120);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "the expected FAIL turn: {text}");
+    assert!(
+        text.contains("FAIL: extraction rejected a workspace file"),
+        "the turn must FAIL with the rejection: {text}"
+    );
+    assert!(
+        text.contains("ts-extract: refusing") && text.contains("bad name.ts"),
+        "the extractor's message must name the file: {text}"
+    );
+    assert!(
+        !text.contains("error TS"),
+        "no partial tree may be type-checked into misleading errors: {text}"
+    );
 }

@@ -26,8 +26,14 @@ while read -r p64 c64 || [ -n "${p64:-}" ]; do
     *) reject "$path" "not under /app" ;;
   esac
   rel=${path#/app/}
-  printf '%s' "$rel" | grep -Eq '^([A-Za-z0-9._-]+)(/[A-Za-z0-9._-]+)*$' \
-    || reject "$path" "path segment has characters outside [A-Za-z0-9._-]"
+  # A whole-string glob, not grep: grep matches per line, so a path whose
+  # first line was valid sailed through with a newline and anything after
+  # it riding along. The negated class admits exactly the segment
+  # characters plus the separator.
+  case $rel in
+    *[!A-Za-z0-9._/-]*)
+      reject "$path" "path segment has characters outside [A-Za-z0-9._-]" ;;
+  esac
   seg=$rel
   while [ -n "$seg" ]; do
     part=${seg%%/*}
