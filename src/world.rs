@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::stdin::StdinSub;
 use crate::timers::RunningTimer;
@@ -55,6 +55,19 @@ pub(crate) enum TermReason {
 pub(crate) struct Termination {
     reason: AtomicU8,
     finished: AtomicBool,
+    /// Wakes the watchdog: blocked until the deadline, or until a mark,
+    /// finish, or stop wakes it (a bare atomic cannot do that).
+    wake: (Mutex<()>, Condvar),
+}
+
+/// What ended a [Termination::wait_for].
+pub(crate) enum Wake {
+    /// The run is over; the waiter should exit.
+    Stopped,
+    /// The deadline passed without a reason.
+    Deadline,
+    /// A termination reason is set and wants delivering.
+    Reason,
 }
 
 impl Termination {
@@ -62,6 +75,7 @@ impl Termination {
         Termination {
             reason: AtomicU8::new(0),
             finished: AtomicBool::new(false),
+            wake: (Mutex::new(()), Condvar::new()),
         }
     }
 
@@ -73,6 +87,7 @@ impl Termination {
             TermReason::Oom => 2,
         };
         let _ = self.reason.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+        self.wake.1.notify_all();
     }
 
     pub(crate) fn reason(&self) -> Option<TermReason> {
@@ -98,8 +113,37 @@ impl Termination {
 
     pub(crate) fn finish(&self) {
         self.finished.store(true, Ordering::SeqCst);
+        self.wake.1.notify_all();
+    }
+
+    /// Blocks until the deadline (forever when None), waking early when a
+    /// reason or finish lands. Spurious wakes re-evaluate and wait again.
+    /// The mutex guard is dropped before returning, so callers may act on
+    /// the result (e.g. terminate the isolate) without holding it.
+    pub(crate) fn wait_for(&self, deadline: Option<Instant>) -> Wake {
+        let mut guard = self.wake.0.lock().unwrap();
+        loop {
+            if self.finished.load(Ordering::SeqCst) {
+                return Wake::Stopped;
+            }
+            if self.reason().is_some() {
+                return Wake::Reason;
+            }
+            match deadline.map(|d| d.saturating_duration_since(Instant::now())) {
+                Some(Duration::ZERO) => return Wake::Deadline,
+                wait => {
+                    let (g, _) = self
+                        .wake
+                        .1
+                        .wait_timeout(guard, wait.unwrap_or(Duration::MAX))
+                        .unwrap();
+                    guard = g;
+                }
+            }
+        }
     }
 }
+
 
 /// All guest world state for one run. The isolate owns it through an embedder
 /// slot (see [world_mut]); one JS thread touches it, and the watchdog thread
@@ -226,7 +270,8 @@ impl World {
         let _ = self
             .exit_code
             .compare_exchange(-1, code, Ordering::SeqCst, Ordering::SeqCst);
-    }}
+    }
+}
 /// Reaches this run's World through the isolate embedder slot. Works from
 /// any scope (HandleScope, TryCatch, CallbackScope...) because they all
 /// expose the isolate. The returned reference borrows the scope, so unlike

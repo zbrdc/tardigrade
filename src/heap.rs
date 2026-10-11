@@ -1,29 +1,26 @@
-//! Heap-cap enforcement, in three cooperating pieces.
+//! Heap-cap enforcement, in two independent pieces with supported APIs
+//! only.
 //!
-//! A garbage-collection epilogue judges the JS heap: after a major
-//! collection the used-heap figure is the live set, so a guest is stopped
-//! (exit 137) exactly when its live data passes the cap, while a
-//! garbage-heavy guest whose collections succeed keeps running. The
-//! epilogue is registered through the engine's own (mangled) symbol: the
-//! v8 crate binds only the prologue variant.
+//! The JS heap is capped by V8's own near-heap-limit callback, registered
+//! through the crate's `add_near_heap_limit_callback`. V8 invokes it only
+//! after its collections failed to keep the heap under the configured
+//! limit, so the callback is post-GC by construction: a guest whose
+//! collections succeed (churn with a small live set) never trips it, and
+//! genuinely growing guests do. The callback marks the OOM termination,
+//! requests the termination, and returns a raised limit with generous
+//! unwinding headroom so the allocation that triggered it succeeds and
+//! JavaScript resumes straight into the termination - growth otherwise
+//! dies inside V8's allocation retry, which never returns to JavaScript
+//! and ignores termination. Where a run is actually stopped therefore sits
+//! between the configured cap and the raised limit (README states this).
 //!
-//! The near-heap-limit callback is the second line: V8 invokes it only
-//! after collections failed to keep the heap under its own (raised)
-//! limit, and it still raises the limit so the pending allocation
-//! succeeds and JavaScript resumes into the termination instead of dying
-//! inside V8's allocation retry, which never returns to JavaScript and
-//! ignores termination.
-//!
-//! ArrayBuffer memory shares the same single budget from the allocator
-//! side: this V8 build does not account sandboxed backing stores as
-//! external memory, so a counting allocator refuses any allocation that
-//! would push live backing-store bytes plus the latest post-GC heap
-//! figure past the cap; V8 turns the refusal into a catchable RangeError
-//! the guest may survive. Judging the raw pre-GC figure (an earlier
-//! design) terminates garbage-heavy guests whose live set never
-//! approaches the cap, and an interrupt request queued from inside a GC
-//! callback (`IsolateHandle::request_interrupt`, also tried) is never
-//! delivered for tight allocation loops; neither is used.
+//! ArrayBuffer memory is capped separately by the counting allocator:
+//! this V8 build does not account sandboxed backing stores as external
+//! memory, so the allocator enforces its own budget (live backing-store
+//! bytes against the same --memory figure) by refusing allocations that
+//! would cross it; V8 reports the refusal to the guest as a catchable
+//! RangeError it may survive. Resizable ArrayBuffers and growable
+//! SharedArrayBuffers bypass the allocator entirely (see README).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,45 +28,27 @@ use std::sync::Arc;
 
 use crate::world::{TermReason, Termination};
 
-extern "C" {
-    /// v8::Isolate::AddGCEpilogueCallback(callback, data, gc_type_filter)
-    /// by its mangled name: the crate binds only the prologue variant, and
-    /// the engine exports this symbol from the same static library. The
-    /// C++ member function takes `this` as its first argument, which is
-    /// exactly this declaration.
-    fn _ZN2v87Isolate21AddGCEpilogueCallbackEPFvPS0_NS_6GCTypeENS_15GCCallbackFlagsEPvES4_S2_(
-        isolate: *mut v8::Isolate,
-        callback: extern "C" fn(
-            isolate: *mut v8::Isolate,
-            ty: v8::GCType,
-            flags: v8::GCCallbackFlags,
-            data: *mut c_void,
-        ),
-        data: *mut c_void,
-        gc_type_filter: v8::GCType,
-    );
-}
-
 /// Smallest workable cap: V8 cannot sustain less (its own check failures
 /// and fatal OOMs dominate below this).
 pub(crate) const MIN_CAP_MB: usize = 8;
 
 /// The cap plan for a run: the effective cap in MB, the cap in bytes, and
-/// V8's raised limit in bytes. The headroom (twice the cap, at least
-/// 32 MiB) keeps the fatal allocation-retry path away from guests that
-/// are merely close to the cap, while the near-heap-limit rescue covers
-/// genuinely over-cap growth. Saturating arithmetic and pre-shift
+/// V8's own heap limit in bytes. Saturating arithmetic and pre-shift
 /// ceilings, because a library caller can pass any usize (a plain `*`/`<<`
 /// would panic a debug build or wrap in release).
 pub(crate) fn plan(heap_mb: usize) -> CapPlan {
     let cap_mb = heap_mb.max(MIN_CAP_MB);
-    let headroom_mb = cap_mb.saturating_mul(2).max(32);
-    let v8_max_mb = cap_mb.saturating_add(headroom_mb);
+    let v8_max_mb = cap_mb.saturating_add(headroom_mb(cap_mb));
     CapPlan {
         cap_mb,
         cap_bytes: cap_mb.min(usize::MAX >> 20).saturating_mul(1 << 20),
         v8_max_bytes: v8_max_mb.min(usize::MAX >> 20).saturating_mul(1 << 20),
     }
+}
+
+/// Headroom V8 gets above the cap (probing max = cap exactly first).
+fn headroom_mb(cap_mb: usize) -> usize {
+    cap_mb.saturating_mul(2).max(32)
 }
 
 /// The derived limits for one run (see [plan]).
@@ -79,88 +58,48 @@ pub(crate) struct CapPlan {
     pub(crate) v8_max_bytes: usize,
 }
 
-/// The per-run heap state shared with V8's callbacks. The callbacks
-/// receive only the `data` pointer plus (for GC callbacks) the isolate,
-/// so termination goes through the thread-safe handle and the shared
-/// termination reason.
+/// The per-run state V8's near-heap-limit callback needs. The callback
+/// receives only the `data` pointer, so termination goes through the
+/// thread-safe handle and the shared termination reason.
 pub(crate) struct HeapGuard {
     handle: v8::IsolateHandle,
     term: Arc<Termination>,
-    cap_bytes: usize,
-    /// The latest post-GC used-heap figure, shared with the counting
-    /// allocator so heap and buffers share one budget.
-    heap_used: Arc<AtomicUsize>,
-    /// Where the near-heap-limit rescue raises V8's limit to: the starting
-    /// limit plus twice itself, room for one more growth step of a
-    /// doubling shape so the termination is observed in JavaScript.
+    /// Where the callback raises V8's limit to, so the pending allocation
+    /// succeeds and the termination is observed in JavaScript.
     limit_ceiling: usize,
 }
 
 impl HeapGuard {
-    pub(crate) fn new(
-        handle: v8::IsolateHandle,
-        term: Arc<Termination>,
-        plan: &CapPlan,
-        heap_used: Arc<AtomicUsize>,
-    ) -> Self {
+    pub(crate) fn new(handle: v8::IsolateHandle, term: Arc<Termination>, plan: &CapPlan) -> Self {
         HeapGuard {
             handle,
             term,
-            cap_bytes: plan.cap_bytes,
-            heap_used,
             limit_ceiling: plan.v8_max_bytes.saturating_mul(3),
         }
     }
 
-    /// The `data` argument for the V8 callbacks. The guard must outlive the
-    /// isolate: teardown runs GC, which calls back in through this pointer.
-    pub(crate) fn callback_data(&mut self) -> *mut c_void {
-        self as *mut Self as *mut c_void
-    }
-
-    /// Registers the heap-limit callback and the GC epilogue on `isolate`;
-    /// kept next to the guard so the callback data and the registrations
-    /// cannot drift apart.
+    /// Registers the heap-limit callback; kept next to the guard so the
+    /// callback data and the registration cannot drift apart.
     pub(crate) fn register(&mut self, isolate: &mut v8::Isolate) {
-        let data = self.callback_data();
+        let data = self as *mut Self as *mut c_void;
         isolate.add_near_heap_limit_callback(on_near_heap_limit, data);
-        unsafe {
-            _ZN2v87Isolate21AddGCEpilogueCallbackEPFvPS0_NS_6GCTypeENS_15GCCallbackFlagsEPvES4_S2_(
-                isolate,
-                after_gc,
-                data,
-                v8::GCType::ALL,
-            )
-        };
     }
 }
 
-/// After a collection: publish the heap figure for the shared budget and,
-/// after a major collection, stop a guest whose live set passed the cap.
-/// A borderline figure simply waits for the next collection, which a
-/// garbage-heavy guest passes and a growing one does not.
-pub(crate) extern "C" fn after_gc(
-    isolate: *mut v8::Isolate,
-    ty: v8::GCType,
-    _flags: v8::GCCallbackFlags,
+/// V8 invokes this after collections failed to keep the heap under its
+/// limit, with the limit about to block an allocation. Mark the OOM
+/// termination, request it, and raise the limit generously so the pending
+/// allocation succeeds and JavaScript resumes into the termination
+/// instead of dying inside V8's retry.
+pub(crate) extern "C" fn on_near_heap_limit(
     data: *mut c_void,
-) {
+    current: usize,
+    _initial: usize,
+) -> usize {
     let guard = unsafe { &*(data as *const HeapGuard) };
-    let iso = unsafe { &mut *isolate };
-    let mut stats = v8::HeapStatistics::default();
-    iso.get_heap_statistics(&mut stats);
-    let used = stats.used_heap_size();
-    guard.heap_used.store(used, Ordering::Relaxed);
-    if ty != v8::GCType::MARK_SWEEP_COMPACT {
-        return;
-    }
-    if guard.term.is_finished() || guard.term.reason().is_some() {
-        return;
-    }
-    if used > guard.cap_bytes {
-        guard.term.mark(TermReason::Oom);
-        guard.handle.terminate_execution();
-    }
+    guard.term.mark(TermReason::Oom);
+    guard.handle.terminate_execution();
+    guard.limit_ceiling.max(current)
 }
 
 fn counting_vtable() -> &'static v8::RustAllocatorVtable<AllocState> {
@@ -173,24 +112,20 @@ fn counting_vtable() -> &'static v8::RustAllocatorVtable<AllocState> {
     }
 }
 
-/// The allocator's view of the shared budget: its own live byte count
-/// against the cap minus the latest heap figure.
+/// The allocator's budget: live backing-store bytes against the cap. It
+/// is independent of the JS-heap figure (--memory caps each side at N).
 pub(crate) struct AllocState {
     live: AtomicUsize,
     cap_bytes: usize,
-    heap_used: Arc<AtomicUsize>,
 }
 
 impl AllocState {
     /// True when `extra` more backing-store bytes fit under the budget.
     fn fits(&self, extra: usize) -> bool {
-        let budget = self
-            .cap_bytes
-            .saturating_sub(self.heap_used.load(Ordering::Relaxed));
         self.live
             .load(Ordering::Relaxed)
             .checked_add(extra)
-            .map(|need| need <= budget)
+            .map(|need| need <= self.cap_bytes)
             .unwrap_or(false)
     }
 }
@@ -242,10 +177,19 @@ unsafe extern "C" fn reallocate(
     old_len: usize,
     new_len: usize,
 ) -> *mut c_void {
-    if data.is_null() || old_len == 0 {
+    if data.is_null() {
         return unsafe { allocate_uninitialized(st, new_len) };
     }
-    if !st.fits(new_len.saturating_sub(old_len)) {
+    if old_len == 0 {
+        // A zero-length block is our one-byte allocation; grow into a
+        // fresh block and release the old one.
+        let ptr = unsafe { allocate_uninitialized(st, new_len) };
+        if !ptr.is_null() {
+            unsafe { std::alloc::dealloc(data as *mut u8, layout(0)) };
+        }
+        return ptr;
+    }
+    if new_len > old_len && !st.fits(new_len - old_len) {
         return std::ptr::null_mut();
     }
     let ptr = unsafe {
@@ -262,35 +206,14 @@ unsafe extern "C" fn drop_handle(st: *const AllocState) {
     drop(unsafe { Arc::from_raw(st) });
 }
 
-/// The counting allocator for a run: enforces the ArrayBuffer half of the
-/// shared budget by refusing allocations that do not fit.
-pub(crate) fn counting_allocator(
-    cap_bytes: usize,
-    heap_used: Arc<AtomicUsize>,
-) -> v8::UniqueRef<v8::Allocator> {
+/// The counting allocator for a run: enforces the ArrayBuffer side of
+/// --memory by refusing allocations that do not fit.
+pub(crate) fn counting_allocator(cap_bytes: usize) -> v8::UniqueRef<v8::Allocator> {
     let state = Arc::new(AllocState {
         live: AtomicUsize::new(0),
         cap_bytes,
-        heap_used,
     });
     unsafe { v8::new_rust_allocator(Arc::into_raw(state), counting_vtable()) }
-}
-
-/// V8 invokes this after collections failed to keep the heap under its
-/// limit, with the limit about to block an allocation. The guest's
-/// transient working set has reached V8's raised limit (three times the
-/// cap): end the run, and raise the limit to the ceiling so the pending
-/// allocation succeeds and the termination is observed when JavaScript
-/// resumes (growth by doubling otherwise dies inside the retry).
-pub(crate) extern "C" fn on_near_heap_limit(
-    data: *mut c_void,
-    _current: usize,
-    _initial: usize,
-) -> usize {
-    let guard = unsafe { &*(data as *const HeapGuard) };
-    guard.term.mark(TermReason::Oom);
-    guard.handle.terminate_execution();
-    guard.limit_ceiling
 }
 
 #[cfg(test)]
@@ -321,19 +244,13 @@ mod tests {
     }
 
     #[test]
-    fn allocator_state_enforces_the_shared_budget() {
-        let heap_used = Arc::new(AtomicUsize::new(0));
+    fn allocator_state_enforces_its_budget() {
         let st = AllocState {
             live: AtomicUsize::new(10 << 20),
             cap_bytes: 32 << 20,
-            heap_used: heap_used.clone(),
         };
         assert!(st.fits(22 << 20));
         assert!(!st.fits(23 << 20), "over the cap");
-        heap_used.store(20 << 20, Ordering::Relaxed);
-        assert!(!st.fits(13 << 20), "the heap figure eats the budget");
-        assert!(st.fits(2 << 20));
-        assert!(!st.fits(3 << 20));
         assert!(!st.fits(usize::MAX), "overflow does not fit");
     }
 }

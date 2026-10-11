@@ -311,6 +311,50 @@ fn set_growth_reports_137_at_the_largest_cap() {
 }
 
 #[test]
+fn large_array_churn_near_the_cap_passes() {
+    // The round-4 blocker: multi-megabyte temporaries with a real live set
+    // must not fire the heap cap - collections succeed, the run finishes.
+    for (live, churn, cap) in [("8", "40", "32"), ("2", "20", "64"), ("25", "20", "128")] {
+        let source = "const keep = []; for (let i = 0; i < LIVE; i++) keep.push(new Array(250000).fill(i + 0.5));
+             for (let i = 0; i < CHURN; i++) { new Array(CSZ).fill(i + 0.5); }
+             console.log('ok');"
+            .replace("LIVE", live)
+            .replace("CHURN", churn)
+            .replace("CSZ", if cap == "128" { "4000000" } else { "1000000" });
+        let path = script("churn-large-arrays", &source);
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 0, "live {}: stderr: {}", live, r.stderr);
+        assert_eq!(r.stdout, "ok\n", "live {}", live);
+    }
+}
+
+#[test]
+fn multi_megabyte_temporaries_at_a_small_cap_pass() {
+    // Same blocker, ch2.js shape: 400 x 4 MB arrays with zero live data.
+    let path = script(
+        "churn-huge-temps",
+        "let x = 0;
+         for (let i = 0; i < 400; i++) { x += new Array(500000).fill(i + 0.5).length; }
+         console.log('ok', x);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.starts_with("ok 200000000"), "stdout: {}", r.stdout);
+
+    // And z.js shape at the smallest cap: each 8 MB temporary fills the
+    // whole heap; the collections between them must keep the run alive.
+    let path = script(
+        "churn-cap-sized-temps",
+        "let x = 0;
+         for (let i = 0; i < 100; i++) { x += new Array(1000000).fill(i).length; }
+         console.log('done', x);",
+    );
+    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done 100000000\n");
+}
+
+#[test]
 fn map_of_objects_growth_reports_137() {
     let path = script(
         "oom-map-obj",

@@ -65,17 +65,17 @@ and when several consumers read at once the first one receives the chunks.
 Isolation is per isolate within the process: hitting the heap cap ends only
 that run (exit 137 for the JS heap, a catchable RangeError for
 ArrayBuffers), while other V8 fatal errors end the whole process and
-every guest in it. --memory is one budget shared by the JS heap and
-ArrayBuffer memory: a GC epilogue stops a run whose post-collection live
-set passes the cap, the counting allocator refuses the ArrayBuffer
-allocation that would cross what remains of the budget (V8 reports the
-refusal to the guest as a catchable RangeError), and V8's own heap limit
-is raised to three times the cap so genuinely over-cap growth is stopped
-cleanly instead of dying inside V8's allocation retry. Until a memory-hog
-guest is stopped, the process may commit several times the cap (measured:
-3-6x for growth shapes, about 2-3x for garbage-heavy-but-small guests
-awaiting a collection; retained ArrayBuffers are refused at the budget
-line itself).
+every guest in it. --memory caps the JS heap and ArrayBuffer memory
+separately, each at N MB: the JS heap is stopped by V8's own
+near-heap-limit callback (fires only after V8's collections failed
+under a limit at the cap plus twice the cap of headroom, and raises the
+limit so the termination is observed in JavaScript instead of dying
+inside V8's allocation retry), and the counting allocator refuses the
+ArrayBuffer allocation that would cross the cap (V8 reports the refusal
+to the guest as a catchable RangeError). Until a growing guest is
+stopped, the process may commit several times the cap (measured: 3-6x
+for growth shapes, lower for churn; retained ArrayBuffers are refused
+at the cap itself).
 
 ## Event loop
 
@@ -135,34 +135,39 @@ tsc-rs at this boundary to let agents write TypeScript.
   omission of host APIs, per isolate inside one ordinary process. A V8
   fatal error ends the whole process and every guest in it. For hostile
   code, run v8vm itself under a container/seccomp profile.
-- The heap cap terminates the guest, not the process. --memory is one
-  budget shared by the JS heap and ArrayBuffer memory. The JS heap is
-  judged by a GC epilogue on the post-collection live set; ArrayBuffer
-  allocations that would cross the remaining budget are refused by the
-  counting allocator and surface in the guest as a catchable RangeError;
-  a guest whose transient working set reaches V8's raised limit (three
-  times the cap) is stopped with the limit raised so the termination is
-  observed in JavaScript. Heap over-cap exits 137 with a one-line report
-  on stderr. Peak RSS is typically 3-6x the cap for growth shapes, about
-  2-3x for garbage-heavy guests under the cap, and near the budget line
-  for buffers. The smallest supported cap is 8 MB; growth that hits V8's
-  structural limits (Map size, array length) or string limits fails as an
-  ordinary uncaught RangeError (exit 1), as Node does.
-- Resizable ArrayBuffers and growable SharedArrayBuffers are NOT capped:
-  their pages are committed inside V8's sandbox reservation, which does
-  not go through the ArrayBuffer allocator (there is no V8 12.9 flag to
-  disable the feature; `--no-harmony-rab-gsab` does not exist). A guest
-  can therefore exceed --memory with `new ArrayBuffer(n, {
-  maxByteLength })` plus resize/grow; treat --memory as advisory where
-  such buffers are trusted.
 - Guest-reachable process aborts remain (V8 fatal error, observed as
   SIGTRAP, exit 133): a single allocation too large for V8's raised limit
   (`new Array(1e9)`, and `new Array(1e8).fill(0)` at any cap), string
   splitting past V8's maximum string size
   (`'ab'.repeat(2e8).split('')`), long native builtins that ignore
   termination (`a.length = 2**32 - 1; a.fill(0, 0, 2e8)` at small caps),
-  and tight loops allocating arrays with multi-kilobyte backing stores
-  (`const a = []; for (;;) a.push(new Array(1000).fill(1))` at any cap):
-  V8 runs its allocation retry there without any interrupt checkpoint,
-  so not even the wall-clock timeout is observed.
+  and some array-growth shapes
+  (`const a = []; for (;;) a.push(new Array(1000).fill(1))`, also with
+  100-element arrays, at any cap): V8 runs its allocation retry there
+  without any interrupt checkpoint, so not even the wall-clock timeout
+  is observed.
+- The heap cap terminates the guest, not the process. --memory caps the
+  JS heap and, separately, ArrayBuffer memory, each at N MB. The JS heap
+  is stopped by V8's near-heap-limit callback, which fires only after
+  V8's own collections failed under a limit set at the cap plus twice
+  the cap of headroom - so a growing guest is stopped somewhere between
+  the cap and about three times it, while churn whose collections
+  succeed (multi-megabyte temporaries, snapshots, JSON round-trips)
+  never trips it. The callback raises the limit so the pending
+  allocation succeeds and the termination is observed in JavaScript.
+  ArrayBuffer allocations that would cross the cap are refused by the
+  counting allocator and surface in the guest as a catchable RangeError.
+  Heap over-cap exits 137 with a one-line report on stderr; peak RSS is
+  typically 3-6x the cap for growth shapes and lower for churn. The
+  smallest supported cap is 8 MB; growth that hits V8's structural
+  limits (Map size, array length) or string limits fails as an ordinary
+  uncaught RangeError (exit 1), as Node does.
+- Resizable ArrayBuffers, growable SharedArrayBuffers, and
+  WebAssembly.Memory are NOT capped: their pages are committed inside
+  V8's sandbox reservation, which does not go through the ArrayBuffer
+  allocator (there is no V8 12.9 flag to disable the feature;
+  `--no-harmony-rab-gsab` does not exist). A guest can therefore exceed
+  --memory with `new ArrayBuffer(n, { maxByteLength })` plus resize or
+  `new WebAssembly.Memory({ initial })`; treat --memory as advisory
+  where such memory is trusted.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

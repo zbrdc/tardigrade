@@ -29,8 +29,6 @@ mod watchdog;
 mod world;
 
 use std::io::Write;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 use std::sync::mpsc;
 
 use api::install;
@@ -296,40 +294,31 @@ fn execute_inner(
 /// order, so the isolate goes first.
 struct Guest {
     isolate: v8::OwnedIsolate,
-    /// Exists for drop order: the guard (the V8 callbacks' data pointer)
-    /// must outlive the isolate through its teardown GC.
-    #[allow(dead_code)]
-    guard_slot: Option<Box<heap::HeapGuard>>,
+    /// Kept for drop order: the guard (the callback's data pointer) must
+    /// outlive the isolate through its teardown GC. Never read.
+    _guard: Box<heap::HeapGuard>,
 }
 
 impl Guest {
     fn new(cfg: &Config, mut world: World) -> (Guest, v8::IsolateHandle) {
-        // The user cap (JS heap plus ArrayBuffer memory, one shared
-        // budget) is enforced below V8's own hard limit: V8 may grow into
-        // the headroom so allocation paths that never reach the
-        // near-heap-limit callback still pass a GC and are judged by the
-        // epilogue. The heap starts small: a large explicit initial size
-        // makes this V8 saturate the old generation near that size
-        // ("reduce" GCs, then its fatal OOM) far below the maximum.
+        // --memory caps the JS heap and ArrayBuffer memory separately,
+        // each at N. V8's own limit sits above the cap with headroom: the
+        // near-heap-limit callback fires only after V8's collections
+        // failed under that limit, and the headroom gives the raise room
+        // to unwind into (no headroom left several growth shapes aborting
+        // inside V8's allocation retry, which ignores termination). The
+        // heap starts small: a large explicit initial size makes this V8
+        // saturate the old generation far below the maximum.
         let plan = heap::plan(cfg.heap_mb);
         world.heap_mb = plan.cap_mb;
         let term = world.term.clone();
-        let heap_used = Arc::new(AtomicUsize::new(0));
         let params = v8::CreateParams::default()
             .heap_limits(0, plan.v8_max_bytes)
-            .array_buffer_allocator(heap::counting_allocator(
-                plan.cap_bytes,
-                heap_used.clone(),
-            ));
+            .array_buffer_allocator(heap::counting_allocator(plan.cap_bytes));
 
         let mut isolate = v8::Isolate::new(params);
         let handle = isolate.thread_safe_handle();
-        let mut guard = Box::new(heap::HeapGuard::new(
-            handle.clone(),
-            term.clone(),
-            &plan,
-            heap_used,
-        ));
+        let mut guard = Box::new(heap::HeapGuard::new(handle.clone(), term.clone(), &plan));
         guard.register(&mut isolate);
         // The isolate owns the world through its embedder slot. On isolate
         // teardown the annex nulls its isolate pointer before the slots
@@ -338,13 +327,7 @@ impl Guest {
         // clearing needed.
         isolate.set_slot(world);
         isolate.set_promise_reject_callback(promise_reject_callback);
-        (
-            Guest {
-                isolate,
-                guard_slot: Some(guard),
-            },
-            handle,
-        )
+        (Guest { isolate, _guard: guard }, handle)
     }
 }
 
