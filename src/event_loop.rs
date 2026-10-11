@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::diag::{report, to_rust_string};
+use crate::diag::{rejection_text, report};
 use crate::stdin;
 use crate::world::{world_mut, NetMsg, World};
 use v8::HandleScope;
@@ -216,7 +216,7 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
     let text = match &first.value {
         Some(v) => {
             let val = v.open(scope);
-            to_rust_string(scope, val)
+            rejection_text(scope, val)
         }
         None => "unknown".to_string(),
     };

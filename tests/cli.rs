@@ -402,8 +402,9 @@ fn timers_fire_in_due_order_and_clear_works() {
 
 #[test]
 fn a_storm_of_set_and_clear_leaves_no_timers_behind() {
-    // 100k clear calls must not accumulate per-clear bookkeeping, and none
-    // of the cleared timers may ever fire.
+    // None of the 100k cleared timers may ever fire; the loop must reach
+    // the checking timer. (Bookkeeping itself is the O(1) RunningTimer
+    // slot, covered by the unit tests.)
     let r = run_js(
         "clear-storm",
         "let ran = 0;
@@ -412,6 +413,51 @@ fn a_storm_of_set_and_clear_leaves_no_timers_behind() {
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "ran=0\n");
+}
+
+#[test]
+fn a_fractional_clear_inside_its_own_callback_does_not_stop_it() {
+    // clearTimeout(iv + 0.5) must not match timer iv: the interval keeps
+    // running past the fractional clear and is only stopped by the exact
+    // clearInterval in the checking timer.
+    let r = run_js(
+        "fractional-clear",
+        "let n = 0;
+         const iv = setInterval(() => { n++; if (n === 2) clearTimeout(iv + 0.5); }, 5);
+         setTimeout(() => { clearInterval(iv); console.log('n=' + n); }, 100);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.starts_with("n="), "stdout: {}", r.stdout);
+    assert_ne!(r.stdout, "n=2\n", "the interval must survive the fractional clear");
+}
+
+#[test]
+fn rejecting_with_a_symbol_still_prints_a_reason() {
+    let r = run_js("rej-symbol", "Promise.reject(Symbol('s'))");
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection: <unprintable rejection value>"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn a_hundred_thousand_reject_then_catch_round_trips_quickly() {
+    // Forgetting used to scan every remembered rejection (O(n^2): 50k took
+    // 7 s, 200k over a minute). The bound is generous on purpose: the point
+    // is the curve, not the machine.
+    let start = std::time::Instant::now();
+    let r = run_js(
+        "rejection-storm",
+        "const ps = [];
+         for (let i = 0; i < 100000; i++) ps.push(Promise.reject(i));
+         for (const p of ps) p.catch(() => {});
+         console.log('done');",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done\n");
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
 }
 
 #[test]

@@ -31,11 +31,13 @@ impl RunningTimer {
         self.id = None;
     }
 
-    /// Records a clearTimeout; true when it cleared the running timer.
-    pub(crate) fn clear(&mut self, id: u64) -> bool {
-        let hit = self.id == Some(id);
-        self.cleared |= hit;
-        hit
+    /// Records a clearTimeout. The comparison uses the same f64 equality
+    /// as the schedule retain, so clearTimeout(7.5) does not hit timer 7
+    /// and clearTimeout(NaN) hits nothing.
+    pub(crate) fn clear(&mut self, id: f64) {
+        if self.id.map(|i| i as f64) == Some(id) {
+            self.cleared = true;
+        }
     }
 
     /// Whether the running timer cleared itself; the decision is consumed
@@ -96,7 +98,7 @@ guest_cb!(clear_timer, |args, _rv, scope| {
     let id = args.get(0).number_value(scope).unwrap_or(-1.0);
     let world = world_mut(scope);
     world.timers.retain(|t| t.id as f64 != id);
-    world.running_timer.clear(id as u64);
+    world.running_timer.clear(id);
 });
 
 #[cfg(test)]
@@ -107,7 +109,7 @@ mod tests {
     fn clearing_the_running_timer_from_inside_its_callback_sticks() {
         let mut rt = RunningTimer::new();
         rt.enter(7);
-        assert!(rt.clear(7));
+        rt.clear(7.0);
         assert!(rt.self_cleared(), "the running timer cleared itself");
         assert!(!rt.self_cleared(), "the decision is consumed once");
     }
@@ -116,25 +118,35 @@ mod tests {
     fn clearing_other_timers_does_not_touch_the_running_one() {
         let mut rt = RunningTimer::new();
         rt.enter(7);
-        assert!(!rt.clear(8));
+        rt.clear(8.0);
         assert!(!rt.self_cleared());
+    }
+
+    #[test]
+    fn a_fractional_id_does_not_hit_the_running_timer() {
+        let mut rt = RunningTimer::new();
+        rt.enter(7);
+        rt.clear(7.5);
+        assert!(!rt.self_cleared(), "7.5 is not timer 7");
+        rt.clear(f64::NAN);
+        assert!(!rt.self_cleared(), "NaN matches nothing");
     }
 
     #[test]
     fn nothing_matches_between_callbacks() {
         let mut rt = RunningTimer::new();
         rt.enter(7);
-        rt.clear(8);
+        rt.clear(8.0);
         rt.exit();
-        assert!(!rt.clear(7), "no timer is on the stack between callbacks");
-        assert!(!rt.self_cleared());
+        rt.clear(7.0);
+        assert!(!rt.self_cleared(), "no timer is on the stack between callbacks");
     }
 
     #[test]
     fn each_callback_starts_uncleared() {
         let mut rt = RunningTimer::new();
         rt.enter(1);
-        rt.clear(1);
+        rt.clear(1.0);
         rt.exit();
         rt.enter(2);
         assert!(!rt.self_cleared());
@@ -144,7 +156,7 @@ mod tests {
     fn a_self_clear_survives_exit_until_it_is_read() {
         let mut rt = RunningTimer::new();
         rt.enter(7);
-        rt.clear(7);
+        rt.clear(7.0);
         rt.exit();
         assert!(rt.self_cleared(), "run_timers reads the decision after exit");
     }

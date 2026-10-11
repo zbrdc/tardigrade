@@ -7,6 +7,16 @@ pub(crate) fn to_rust_string(scope: &mut v8::HandleScope, v: &v8::Value) -> Stri
     }
 }
 
+/// Stringifies a rejection value for the report. ToString is not defined
+/// for symbols (it throws), so the plain conversion yields nothing there;
+/// such values get a placeholder instead of an empty reason.
+pub(crate) fn rejection_text(scope: &mut v8::HandleScope, v: &v8::Value) -> String {
+    match v.to_string(scope) {
+        Some(s) => s.to_rust_string_lossy(scope),
+        None => "<unprintable rejection value>".to_string(),
+    }
+}
+
 pub(crate) fn throw(scope: &mut v8::HandleScope, msg: &str) {
     let msg = v8::String::new(scope, msg).unwrap();
     let exc = v8::Exception::error(scope, msg);
