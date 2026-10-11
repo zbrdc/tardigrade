@@ -14,6 +14,9 @@ OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 WASM=${TSC_RUST_WASM:?set TSC_RUST_WASM to a ts_rust.wasm build}
 PROJ=${1:?usage: run.sh <project-dir> [workspace.json]}
+# A trailing slash would make every seeded key /app/<abs path>/... , so it
+# is stripped first.
+PROJ=${PROJ%/}
 WS=${2:-$(dirname "$OUT")/ts-guest-ws.json}
 [ -f "$WASM" ] || { echo "run.sh: no wasm at $WASM" >&2; exit 1; }
 [ -f "$PROJ/tsconfig.json" ] || { echo "run.sh: $PROJ needs a tsconfig.json" >&2; exit 1; }
@@ -26,8 +29,25 @@ WS=${2:-$(dirname "$OUT")/ts-guest-ws.json}
 # run - no emitted output is ever stale - and removed on every exit path.
 PRE="$WS.pre"
 trap 'rm -f "$PRE"' EXIT
-json_string() { # json_string <text>: escape the two characters JSON needs
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+json_string() { # json_string <text>: a valid JSON string for any text
+  # Backslash, quote and every control character (as \u00XX): JSON forbids
+  # controls raw inside strings, so a tab in a file name would otherwise
+  # break the snapshot.
+  local s=$1 out='' i c n
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      \\) out+='\\' ;;
+      \") out+='\"' ;;
+      *)
+        printf -v n '%d' "'$c"
+        if ((n > 0 && n < 32)); then
+          printf -v c '\\u%04x' "$n"
+        fi
+        out+=$c ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 entries='"/tsc/ts_rust.wasm":{"b64":"'"$(base64 -w0 "$WASM")"'"}'
 while IFS= read -r f; do

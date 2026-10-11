@@ -2902,6 +2902,18 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
         "export const two = 2;\n",
     )
     .expect("write oddly named lib");
+    // A tab is a legal file name character and JSON forbids raw control
+    // characters in strings, so the snapshot keys must escape it.
+    std::fs::write(
+        good.join("lib/ta\tb.ts"),
+        "export const three = 3;\n",
+    )
+    .expect("write tab-named lib");
+    std::fs::write(
+        good.join("app.ts"),
+        "import { sum } from \"./lib/sum\";\nimport { two } from \"./lib/we\\\"ird\";\nimport { three } from \"./lib/ta\tb\";\nconsole.log(sum([\"a\", \"b\"]) + two + three);\n",
+    )
+    .expect("write good app with odd imports");
     std::fs::write(
         good.join("tsconfig.json"),
         r#"{ "compilerOptions": { "strict": true, "outDir": "out" }, "include": ["app.ts", "lib"] }"#,
@@ -2927,7 +2939,10 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
     );
 
     let good_ws = root.join("good-ws.json");
-    let out = run(&good, good_ws.to_str().unwrap());
+    // A trailing slash on the project directory must not leak into the
+    // seeded /app paths.
+    let slashed = format!("{}/", good.display());
+    let out = run(std::path::Path::new(&slashed), good_ws.to_str().unwrap());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
     let dump = std::fs::read_to_string(&good_ws).expect("read the workspace dump");
@@ -2939,6 +2954,10 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
     assert!(
         dump.contains("/app/out/lib/we\\\"ird.js") && dump.contains("export const two = 2;"),
         "the oddly named module must emit too: {dump}"
+    );
+    assert!(
+        dump.contains("/app/out/lib/ta\\tb.js") && dump.contains("export const three = 3;"),
+        "the tab-named module must emit too: {dump}"
     );
     assert!(!root.join("good-ws.json.pre").exists(), "no stale .pre snapshot");
 }
