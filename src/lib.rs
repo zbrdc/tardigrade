@@ -27,6 +27,8 @@ mod timers;
 mod watchdog;
 mod world;
 
+pub mod sandbox;
+
 use std::io::Write;
 use std::sync::mpsc;
 
@@ -52,6 +54,9 @@ pub struct Config {
     /// True when the entry source was read from stdin, so guest stdin is
     /// already at EOF.
     pub stdin_consumed: bool,
+    /// Pre-read contents of `preload`, for hosts that read it before applying
+    /// [`sandbox::apply`] (which then denies re-opening the file).
+    pub preload_data: Option<String>,
 }
 
 impl Default for Config {
@@ -63,6 +68,7 @@ impl Default for Config {
             preload: None,
             dump: None,
             stdin_consumed: false,
+            preload_data: None,
         }
     }
 }
@@ -141,7 +147,13 @@ fn eval_prelude(scope: &mut v8::HandleScope) -> bool {
 /// Seeds vm.fs from a snapshot dump; Some(code) aborts the run.
 fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
     let preload = cfg.preload.as_ref()?;
-    let state = match read_path(preload) {
+    // preload_data is the file the host already read before it applied the
+    // sandbox; the sandbox denies re-opening the path.
+    let loaded = match &cfg.preload_data {
+        Some(data) => Some(data.clone()),
+        None => read_path(preload),
+    };
+    let state = match loaded {
         Some(state) => state,
         None => {
             eprintln!("v8vm: cannot open preload {:?}", preload);

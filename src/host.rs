@@ -35,6 +35,14 @@ pub(crate) fn submit(job: Job) {
     LazyLock::force(&HOST).send(job).expect("v8vm host thread alive");
 }
 
+/// True once the host thread has been spawned (it initializes V8 as its
+/// first act). The sandbox must be applied before that point for its
+/// restrictions to reach the host thread, V8's workers and every guest.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn engine_started() -> bool {
+    LazyLock::get(&HOST).is_some()
+}
+
 fn host_thread(rx: Receiver<Job>) {
     // V8 must be initialized here, not on a caller's thread: the default
     // platform may protect JIT memory with pkeys, which requires all threads

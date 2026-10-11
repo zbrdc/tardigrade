@@ -18,6 +18,7 @@ clippy:
 
 check: build
 	@$(OUT) examples/hello.js | grep -qx 'hello from ram'
+	@$(OUT) --sandbox examples/hello.js | grep -qx 'hello from ram'
 	@$(OUT) examples/ramfs-demo.js | grep -qx 'files: /greeting.txt,/note.txt'
 	@$(OUT) --timeout=100 examples/spin.js >/dev/null 2>&1; test $$? -eq 124
 	@$(OUT) examples/timers.js | grep -qx 'done after 3 ticks'

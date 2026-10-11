@@ -35,7 +35,7 @@ and is not set by this repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]
+    v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
@@ -44,6 +44,7 @@ and is not set by this repo.
 - "--dump=<file>" write vm.snapshot() to a file when the run ends
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
+- "--sandbox" OS self-containment for hostile code (Linux only), see below
 - uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
 
 ## Library API
@@ -61,6 +62,13 @@ and serve() commands: input a run does not read is kept for the next run,
 and when several consumers read at once the first one receives the chunks.
 Isolation is per isolate within the process: a V8 out-of-memory abort or
 other V8 fatal error ends the whole process and every guest in it.
+
+For hostile code call `v8vm::sandbox::apply(dump)` once, before the first
+run()/serve() and before any thread exists; it refuses otherwise. Read a
+--preload file before applying and hand its contents to the library as
+`Config.preload_data`: after apply, the only file the run can write is the
+dump file. `Config` gained that field in 0.1.0, so embedders building a
+`Config` with a struct literal must add it (or use `..Default::default()`).
 
 ## Event loop
 
@@ -106,6 +114,84 @@ with --dump, run the driver contract (PASS/FAIL/exit code), let an agent (swap
 the canned edit for your LLM call) patch the workspace, rerun. Swap in
 tsc-rs at this boundary to let agents write TypeScript.
 
+## OS self-sandbox (--sandbox)
+
+For hostile code, `--sandbox` puts kernel-level containment around the run.
+Linux x86_64 only (the deny list and the x32 guard are verified on that ABI);
+on any other platform, or on a kernel missing the features, v8vm exits 2
+without running the guest.
+
+The layers are applied after the host reads the entry source and the preload
+file, and before the first run()/serve(). V8 is initialized lazily on the
+host thread that the first run()/serve() spawns, so that thread, V8's worker
+threads, every guest thread, the watchdog, and the stdin reader all inherit
+the layers, and they cover every guest later run in the same process. The
+library refuses to apply them once that host thread exists. Inherited descriptors >= 3 are closed
+first (anything the caller passed in would be a channel out of the sandbox),
+and `PR_SET_NO_NEW_PRIVS` is set; the seccomp filters are installed with
+TSYNC.
+
+- Landlock: filesystem access is denied except for two files. `--dump` is
+  created without truncation when the sandbox starts (a run that ends before
+  the snapshot leaves an existing file untouched, or an empty new file) and
+  is the only write the run can perform: the end-of-run snapshot truncates
+  and rewrites that one file, and even reading it back is denied. /dev/urandom
+  is readable because V8 opens it while seeding RNGs. Note what Landlock does
+  not mediate: file metadata, file existence, and symlink targets stay
+  observable through stat/access/readlink/chdir/statfs (xattr calls are
+  denied instead).
+- Landlock also scopes the process itself (ABI 6): signals may not be sent
+  to processes outside the sandbox, and abstract unix sockets outside it may
+  not be connected. This is the layer that stops a same-uid neighbour from
+  being signalled at all.
+- seccomp-BPF, a deny list where denied calls fail with EPERM: all socket
+  calls, exec (execve, execveat, fork, vfork), ptrace and cross-process
+  memory access, privilege and identity changes, mount and namespace calls,
+  kernel modules, bpf, perf, io_uring, userfaultfd, keyctl, System V and
+  POSIX message queues, personality, modify_ldt, xattr and other file
+  metadata changes, file-event notification (inotify, fanotify), and clock
+  setting.
+- Cross-process interference is filtered by argument, on top of the scopes:
+  kill, tgkill, rt_sigqueueinfo and rt_tgsigqueueinfo are denied unless the
+  target is the run's own pid (tkill, which names no process, is denied
+  outright); fcntl is denied for F_SETOWN, F_SETOWN_EX and F_SETSIG, which is
+  how an async fd would aim SIGIO at another process; prlimit64,
+  sched_setaffinity, sched_setscheduler and sched_setattr are denied unless
+  the target is 0 (the caller) or the run's own pid; setpriority is denied
+  unless it is PRIO_PROCESS for 0 or the run's own pid.
+- ioctl is denied for the terminal input injection requests TIOCSTI and
+  TIOCLINUX; other ioctl requests remain allowed on already-open descriptors,
+  which is a residual surface.
+- Process creation is filtered, not just denied: clone succeeds only with
+  CLONE_THREAD set and no CLONE_NEW* namespace flag, and clone3 fails with
+  ENOSYS so glibc falls back to clone (which is then checked). Threads still
+  work; fork and user-namespace escapes do not.
+- A small hand-written stacked filter kills the process on any syscall made
+  through a different ABI: a non-x86_64 arch value (int 0x80) or a syscall
+  number in the x32 range, which would otherwise bypass every deny rule.
+
+Everything the runtime needs stays allowed: threads, mmap/mprotect for the
+JIT, futex, clocks, getrandom, and reads/writes on already-open descriptors.
+At startup V8 probes /sys/devices/system/cpu/online, /proc/stat and
+/proc/self/maps; all are denied and V8 falls back (worker-pool sizing comes
+from sched_getaffinity) — /dev/urandom is allowed as above.
+
+What this does not do: it is not a VM. The guest runs as your user inside
+your process; kernel bugs, hardware side channels, the stdio descriptors,
+and the `--dump` file itself are out of scope. A compromised guest can still
+burn CPU until --timeout and read the filesystem's shape around it: stat,
+access, readlink, chdir and statfs are not mediated by Landlock, and
+getpriority and sched_getaffinity on other processes remain readable. The
+process's own pid is a valid signal target by design (raise and abort need
+it).
+
+Kernel requirements: Landlock ABI 6 (Linux 6.12, for the filesystem rights
+and the signal/abstract-socket scopes) and seccomp with TSYNC. A ruleset
+that is not fully enforced is refused rather than degraded. Verified on
+Linux 6.17 reporting Landlock ABI 7; older kernels are untested. If Landlock
+or seccomp is missing the run refuses to start — it never falls back to
+unsandboxed execution.
+
 ## Guarantees and limits
 
 - Guests make no syscalls: the only disk access a guest can trigger is at the
@@ -119,7 +205,7 @@ tsc-rs at this boundary to let agents write TypeScript.
 - This is an application-level sandbox, not a container: isolation is by
   omission of host APIs, per isolate inside one ordinary process. A V8
   fatal error (for example the heap-cap abort below) ends the whole
-  process and every guest in it. For hostile code, run v8vm itself under
-  a container/seccomp profile.
+  process and every guest in it. For hostile code, add `--sandbox`
+  (above) and/or run v8vm itself under a container/seccomp profile.
 - Hitting the heap cap aborts with the V8 out-of-memory report.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

@@ -314,3 +314,55 @@ fn serve_answers_a_final_command_without_a_trailing_newline_and_exits() {
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "2\n");
 }
+
+// ---- --sandbox (OS self-containment) ----
+
+#[test]
+fn sandbox_runs_a_plain_guest_end_to_end() {
+    let path = script(
+        "sb-hello",
+        "const arr = new Array(100000).fill('x'.repeat(50));
+         setTimeout(() => console.log('tick ' + arr.length), 5);
+         console.log('hello');",
+    );
+    let r = v8vm(&["--sandbox", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "hello\ntick 100000\n");
+}
+
+#[test]
+fn sandbox_timeout_kills_a_spinning_guest_with_124() {
+    let path = script("sb-spin", "for (;;) {}");
+    let r = v8vm(&["--sandbox", "--timeout=100", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124);
+}
+
+#[test]
+fn sandbox_dump_writes_the_allowed_file() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sb-dump.json");
+    // Start from no file: a leftover snapshot from an earlier run would mask
+    // a broken dump write.
+    let _ = std::fs::remove_file(&dump);
+    let path = script("sb-dump-guest", "vm.fs.write('/g', 'v');");
+    let r = v8vm(
+        &["--sandbox", &format!("--dump={}", dump.display()), path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dump).expect("dump file")).expect("dump json");
+    assert_eq!(json, serde_json::json!({"/g": "v"}));
+}
+
+#[test]
+fn sandbox_refuses_a_dump_it_cannot_prepare() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-dir/sb.json");
+    let path = script("sb-refused", "console.log('ran');");
+    let r = v8vm(
+        &["--sandbox", &format!("--dump={}", dump.display()), path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 2);
+    assert_eq!(r.stdout, "", "guest must not run");
+    assert!(r.stderr.contains("sandbox"), "stderr: {}", r.stderr);
+}

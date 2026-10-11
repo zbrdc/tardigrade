@@ -11,6 +11,7 @@ struct Cli {
     preload: Option<std::path::PathBuf>,
     dump: Option<std::path::PathBuf>,
     serve: bool,
+    sandbox: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Cli, String> {
@@ -23,6 +24,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         preload: None,
         dump: None,
         serve: false,
+        sandbox: false,
     };
     for a in argv {
         if a == "--" {
@@ -39,6 +41,8 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.dump = Some(v.into());
         } else if a == "--serve" {
             c.serve = true;
+        } else if a == "--sandbox" {
+            c.sandbox = true;
         } else if a.starts_with('-') && a != "-" {
             return Err(format!("unknown flag {}", a));
         } else if c.entry.is_empty() {
@@ -48,7 +52,10 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         }
     }
     if c.entry.is_empty() && !c.serve {
-        return Err("usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]".to_string());
+        return Err(
+            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]"
+                .to_string(),
+        );
     }
     if c.serve && c.entry == "-" {
         return Err("--serve needs a file entry; stdin is the command channel".into());
@@ -66,25 +73,14 @@ fn main() {
         }
     };
 
-    let (source, stdin_consumed) = if c.entry.is_empty() {
-        (String::new(), false)
-    } else if c.entry == "-" {
-        let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s).expect("read stdin");
-        (s, true)
-    } else {
-        match std::fs::read_to_string(&c.entry) {
-            Ok(s) => (s, false),
-            Err(_) => {
-                eprintln!("v8vm: cannot open {}", c.entry);
-                std::process::exit(2);
-            }
-        }
-    };
+    let (source, stdin_consumed) = read_entry(&c);
 
     if std::env::var("V8VM_DEBUG").is_ok() {
         eprintln!("v8vm: entry={:?} dump={:?} preload={:?} serve={}", c.entry, c.dump, c.preload, c.serve);
     }
+
+    // The sandbox sits between the host boundary reads and V8 init.
+    let preload_data = if c.sandbox { apply_sandbox(&c) } else { None };
 
     let cfg = v8vm::Config {
         timeout_ms: if c.serve && !c.timeout_set { 0 } else { c.timeout_ms },
@@ -93,8 +89,8 @@ fn main() {
         preload: c.preload,
         dump: c.dump,
         stdin_consumed,
+        preload_data,
     };
-
 
     let code = if c.serve {
         v8vm::serve(std::io::stdout(), &source, &c.entry, &cfg)
@@ -102,4 +98,40 @@ fn main() {
         v8vm::run(&source, &c.entry, &cfg)
     };
     std::process::exit(code);
+}
+
+/// Reads the entry program; "-" means stdin (then guest stdin is at EOF).
+fn read_entry(c: &Cli) -> (String, bool) {
+    if c.entry.is_empty() {
+        return (String::new(), false);
+    }
+    if c.entry == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).expect("read stdin");
+        return (s, true);
+    }
+    match std::fs::read_to_string(&c.entry) {
+        Ok(s) => (s, false),
+        Err(_) => {
+            eprintln!("v8vm: cannot open {}", c.entry);
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Reads the preload file and applies the OS sandbox, returning the pre-read
+/// preload contents. Any refusal exits 2 and the guest never runs.
+fn apply_sandbox(c: &Cli) -> Option<String> {
+    let preload_data = c.preload.as_ref().map(|path| match std::fs::read_to_string(path) {
+        Ok(data) => Some(data),
+        Err(_) => {
+            eprintln!("v8vm: cannot open preload {:?}", path);
+            std::process::exit(2);
+        }
+    });
+    if let Err(e) = v8vm::sandbox::apply(c.dump.as_deref()) {
+        eprintln!("v8vm: --sandbox: {}", e);
+        std::process::exit(2);
+    }
+    preload_data.flatten()
 }
