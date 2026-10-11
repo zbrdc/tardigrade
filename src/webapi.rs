@@ -30,6 +30,129 @@ fn throw_type(scope: &mut v8::HandleScope, msg: &str) {
     scope.throw_exception(exc);
 }
 
+/// Throws an Error whose `name` property is set: without a DOMException
+/// class this keeps `catch (e) => e.name` checks against the platform
+/// error names (DataCloneError, InvalidCharacterError) working.
+fn throw_named(scope: &mut v8::HandleScope, name: &str, msg: &str) {
+    let m = v8_str(scope, msg);
+    let exc = v8::Exception::error(scope, m);
+    match v8::Local::<v8::Object>::try_from(exc) {
+        Ok(obj) => {
+            let name_val = v8_str(scope, name);
+            set_prop(obj, scope, "name", name_val.into());
+            scope.throw_exception(obj.into());
+        }
+        Err(_) => {
+            scope.throw_exception(exc);
+        }
+    }
+}
+
+// ---- base64 (btoa / atob) ----
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_value(byte: u8) -> Option<u8> {
+    B64_ALPHABET.iter().position(|&c| c == byte).map(|i| i as u8)
+}
+
+/// Standard base64 with padding, the inverse of b64_decode_forgiving for
+/// valid inputs.
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let b0 = u32::from(group[0]);
+        let b1 = group.get(1).map_or(0, |&b| u32::from(b));
+        let b2 = group.get(2).map_or(0, |&b| u32::from(b));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[(n >> 18) as usize & 0x3f] as char);
+        out.push(B64_ALPHABET[(n >> 12) as usize & 0x3f] as char);
+        out.push(if group.len() > 1 { B64_ALPHABET[(n >> 6) as usize & 0x3f] as char } else { '=' });
+        out.push(if group.len() > 2 { B64_ALPHABET[n as usize & 0x3f] as char } else { '=' });
+    }
+    out
+}
+
+/// Forgiving-base64 decode (infra.spec.whatwg.org#forgiving-base64):
+/// ASCII whitespace is ignored, "=" is accepted only as the final quad's
+/// padding (at most two of it), and a remnant of one character is
+/// malformed. Trailing bits are not checked, matching atob.
+fn b64_decode_forgiving(input: &str) -> Result<Vec<u8>, ()> {
+    let stripped: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut data = stripped.as_slice();
+    if data.len().is_multiple_of(4) {
+        if let Some(rest) = data.strip_suffix(b"==") {
+            data = rest;
+        } else if let Some(rest) = data.strip_suffix(b"=") {
+            data = rest;
+        }
+    }
+    if data.len() % 4 == 1 || data.contains(&b'=') {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(data.len().div_ceil(4) * 3);
+    let (chunks, remainder) = data.as_chunks::<4>();
+    for group in chunks {
+        let mut v = [0u8; 4];
+        for (i, &b) in group.iter().enumerate() {
+            v[i] = b64_value(b).ok_or(())?;
+        }
+        out.extend_from_slice(&[v[0] << 2 | v[1] >> 4, v[1] << 4 | v[2] >> 2, v[2] << 6 | v[3]]);
+    }
+    match remainder {
+        [a, b] => out.push(b64_value(*a).ok_or(())? << 2 | b64_value(*b).ok_or(())? >> 4),
+        [a, b, c] => {
+            let (x, y, z) = (
+                b64_value(*a).ok_or(())?,
+                b64_value(*b).ok_or(())?,
+                b64_value(*c).ok_or(())?,
+            );
+            out.extend_from_slice(&[x << 2 | y >> 4, y << 4 | z >> 2]);
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// btoa's input domain: one byte per code unit, each <= 0xFF. V8 one-byte
+/// strings are Latin-1 by construction, so only two-byte strings need the
+/// per-unit check.
+fn latin1_units(scope: &mut v8::HandleScope, s: v8::Local<v8::String>) -> Result<Vec<u8>, ()> {
+    let view = v8::ValueView::new(scope, s);
+    match view.data() {
+        v8::ValueViewData::OneByte(bytes) => Ok(bytes.to_vec()),
+        v8::ValueViewData::TwoByte(units) => {
+            units.iter().map(|&u| u8::try_from(u).map_err(|_| ())).collect()
+        }
+    }
+}
+
+guest_cb!(btoa, |args, rv, scope| {
+    let Some(s) = args.get(0).to_string(scope) else { return };
+    match latin1_units(scope, s) {
+        Ok(bytes) => {
+            let b64 = b64_encode(&bytes);
+            rv.set(v8_str(scope, &b64).into());
+        }
+        Err(()) => throw_named(
+            scope,
+            "InvalidCharacterError",
+            "btoa: string contains characters outside of Latin-1",
+        ),
+    }
+});
+
+guest_cb!(atob, |args, rv, scope| {
+    let Some(s) = args.get(0).to_string(scope) else { return };
+    match b64_decode_forgiving(&s.to_rust_string_lossy(scope)) {
+        Ok(bytes) => match v8::String::new_from_one_byte(scope, &bytes, v8::NewStringType::Normal) {
+            Some(out) => rv.set(out.into()),
+            None => throw(scope, "decoded data too large"),
+        },
+        Err(()) => throw_named(scope, "InvalidCharacterError", "atob: invalid base64 input"),
+    }
+});
+
 // ---- TextEncoder byte level ----
 
 /// Builds a Uint8Array owning its own copy of the bytes (same pattern as
@@ -341,6 +464,8 @@ guest_cb!(decode_utf8, |args, rv, scope| {
 
 pub(crate) fn install(scope: &mut v8::HandleScope) {
     let global = scope.get_current_context().global(scope);
+    put_fn(global, scope, "atob", atob);
+    put_fn(global, scope, "btoa", btoa);
     // Helper callbacks the prelude's TextEncoder/TextDecoder classes bind
     // and then remove from the global object.
     put_fn(global, scope, "__encodeUtf8", encode_utf8);
@@ -442,5 +567,26 @@ mod tests {
         assert_eq!(decode_step(b"", &[b'a', 0xef, 0xbb, 0xbf], &start).unwrap().text, "a\u{feff}");
         let keep = opts(false, true, true, true);
         assert_eq!(decode_step(b"", &[0xef, 0xbb, 0xbf, b'a'], &keep).unwrap().text, "\u{feff}a");
+    }
+    #[test]
+    fn base64_round_trips_and_forgives_padding_shapes() {
+        for bytes in [&b""[..], &[0u8], &[0, 1], &[0, 1, 2], &[255, 254, 253, 0, 200]] {
+            let decoded = b64_decode_forgiving(&b64_encode(bytes)).unwrap();
+            assert_eq!(decoded, bytes);
+        }
+        // Whitespace is ignored, "one =" and "==" both work, QR== is Q with
+        // unchecked trailing bits, exactly like atob in browsers.
+        assert_eq!(b64_decode_forgiving(" Q U\n==").unwrap(), b"A");
+        assert_eq!(b64_decode_forgiving("QR==").unwrap(), b"A");
+        assert_eq!(b64_decode_forgiving("QUJD").unwrap(), b"ABC");
+    }
+
+    #[test]
+    fn base64_rejects_malformed_input() {
+        for bad in ["a", "====", "A===", "Q==", "AB=C", "A!BC"] {
+            assert!(b64_decode_forgiving(bad).is_err(), "{:?} decoded", bad);
+        }
+        // "=" may also close a full quad's final chunk, per the algorithm.
+        assert_eq!(b64_decode_forgiving("ABC=").unwrap(), [0x00, 0x10]);
     }
 }

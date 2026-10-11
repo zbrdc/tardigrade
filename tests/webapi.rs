@@ -229,3 +229,41 @@ fn text_decoder_rejects_other_labels_and_bad_input() {
         "utf-8 utf-8 utf-8\ntrue false false\nlatin1 RangeError\nutf-16 RangeError\nempty RangeError\ninput: TypeError\n",
     );
 }
+
+// ---- atob / btoa ----
+
+#[test]
+fn atob_and_btoa_round_trip_latin1_bytes() {
+    ok(
+        "b64-roundtrip",
+        r#"
+        for (const s of ["", "f", "fo", "foo", "foob", "fooba", "foobar"]) {
+          console.log(JSON.stringify(atob(btoa(s))), JSON.stringify(btoa(s)));
+        }
+        // Every Latin-1 byte survives.
+        let all = "";
+        for (let i = 0; i < 256; i++) all += String.fromCharCode(i);
+        console.log(all === atob(btoa(all)), all.length);
+        "#,
+        "\"\" \"\"\n\"f\" \"Zg==\"\n\"fo\" \"Zm8=\"\n\"foo\" \"Zm9v\"\n\"foob\" \"Zm9vYg==\"\n\"fooba\" \"Zm9vYmE=\"\n\"foobar\" \"Zm9vYmFy\"\ntrue 256\n",
+    );
+}
+
+#[test]
+fn atob_and_btoa_fail_like_browsers() {
+    ok(
+        "b64-failures",
+        r#"
+        console.log(JSON.stringify(atob(" Q U\n==")), JSON.stringify(atob("QR==")));
+        for (const bad of ["a", "====", "A===", "Q==", "AB=C", "A!BC"]) {
+          try { atob(bad); console.log(bad, "decoded"); } catch (err) {
+            console.log(err.name);
+          }
+        }
+        for (const bad of ["\u0100", "\u{1F600}", "\uD800"]) {
+          try { btoa(bad); } catch (err) { console.log(err.name); }
+        }
+        "#,
+        "\"A\" \"A\"\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\n",
+    );
+}
