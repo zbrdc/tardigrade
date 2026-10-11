@@ -1,17 +1,25 @@
 # tardigrade
 
-tardigrade runs small JavaScript programs entirely in RAM on the V8 engine. Each
-run gets its own V8 isolate, a filesystem that exists only in process
-memory, timers, an in-process message network, streaming stdin, a heap cap
-and a wall-clock timeout. Guest code has no host APIs: it cannot open host
-files or sockets, start processes or make system calls of its own.
+tardigrade runs small JavaScript and WebAssembly programs entirely in RAM on
+the V8 engine. Each run gets its own V8 isolate, a filesystem that exists
+only in process memory, timers, an in-process message network, streaming
+stdin, a heap cap and a wall-clock timeout. Guest code has no host APIs: it
+cannot open host files or sockets, start processes or make system calls of
+its own.
+
+WebAssembly is part of the guest language, so programs compiled from Rust,
+C or C++ run under the same caps. A module's imports, WASI for example, are
+supplied by guest JavaScript, not by the host; examples/ts-in-guest shows a
+working WASI shim.
 
 It is built for running code you do not fully trust, such as code written by
 an AI agent, with all of its state in one place: dump the filesystem to JSON
 at the end of a run, load it into the next one, and pin time and randomness
 with `--clock=virtual` and `--seed` for repeatable runs. On Linux x86_64
 with kernel 6.12 or newer, `--sandbox` adds kernel-level containment
-(Landlock and seccomp) around the whole process.
+(Landlock and seccomp) around the whole process. The exact limits of the
+caps, including WebAssembly memory not counting against the heap cap, are in
+[docs/KNOWN_RISKS.md](docs/KNOWN_RISKS.md).
 
 tardigrade is a command-line tool and a Rust library, written on the `v8` crate
 (rusty_v8, V8 12.9).
