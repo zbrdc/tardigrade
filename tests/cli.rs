@@ -4,6 +4,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod common;
+
 struct Run {
     code: i32,
     stdout: String,
@@ -269,6 +272,17 @@ fn serve_replies_reach_stdout_before_later_guest_output() {
 /// Like `v8vm`, but kills the child and fails if it outlives `limit`, so a
 /// hang regression is a test failure instead of a stuck test run.
 fn v8vm_bounded(args: &[&str], stdin: &[u8], limit: std::time::Duration) -> Run {
+    v8vm_bounded_started(args, stdin, limit, |_| {})
+}
+
+/// `v8vm_bounded` that also calls `started` with the child's pid right after
+/// the spawn, before any input is sent.
+fn v8vm_bounded_started(
+    args: &[&str],
+    stdin: &[u8],
+    limit: std::time::Duration,
+    started: impl FnOnce(u32),
+) -> Run {
     let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
         .args(args)
         .stdin(Stdio::piped())
@@ -276,6 +290,7 @@ fn v8vm_bounded(args: &[&str], stdin: &[u8], limit: std::time::Duration) -> Run 
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn v8vm");
+    started(child.id());
     let mut pipe = child.stdin.take().unwrap();
     let input = stdin.to_vec();
     let feeder = std::thread::spawn(move || {
@@ -317,52 +332,172 @@ fn serve_answers_a_final_command_without_a_trailing_newline_and_exits() {
 
 // ---- --sandbox (OS self-containment) ----
 
-#[test]
-fn sandbox_runs_a_plain_guest_end_to_end() {
-    let path = script(
-        "sb-hello",
-        "const arr = new Array(100000).fill('x'.repeat(50));
-         setTimeout(() => console.log('tick ' + arr.length), 5);
-         console.log('hello');",
-    );
-    let r = v8vm(&["--sandbox", path.to_str().unwrap()], b"");
-    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    assert_eq!(r.stdout, "hello\ntick 100000\n");
+const SANDBOX_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A dump the sandbox cannot anchor is refused while it prepares, before any
+/// kernel layer is installed, so these hold on every kernel.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod sandbox_prepare {
+    use super::*;
+
+    #[test]
+    fn sandbox_refuses_a_dump_it_cannot_prepare() {
+        let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-dir/sb.json");
+        let path = script("sb-refused", "console.log('ran');");
+        let dump_arg = format!("--dump={}", dump.display());
+        let r = v8vm_bounded(&["--sandbox", &dump_arg, path.to_str().unwrap()], b"", SANDBOX_LIMIT);
+        assert_eq!(r.code, 2);
+        assert_eq!(r.stdout, "", "guest must not run");
+        assert!(r.stderr.contains("sandbox"), "stderr: {}", r.stderr);
+    }
+
+    #[test]
+    fn sandbox_refuses_a_dump_that_is_not_a_regular_file() {
+        // The child's stdout is a pipe, so /dev/stdout is one too.
+        let path = script("sb-pipe-dump", "console.log('ran');");
+        let r = v8vm_bounded(
+            &["--sandbox", "--dump=/dev/stdout", path.to_str().unwrap()],
+            b"",
+            SANDBOX_LIMIT,
+        );
+        assert_eq!(r.code, 2);
+        assert_eq!(r.stdout, "", "guest must not run");
+        assert!(r.stderr.contains("--dump must be a regular file"), "stderr: {}", r.stderr);
+    }
 }
 
-#[test]
-fn sandbox_timeout_kills_a_spinning_guest_with_124() {
-    let path = script("sb-spin", "for (;;) {}");
-    let r = v8vm(&["--sandbox", "--timeout=100", path.to_str().unwrap()], b"");
-    assert_eq!(r.code, 124);
+/// Whether this kernel can sandbox. Where it cannot, the test must then
+/// check the refusal with `assert_refused` and return, and a skip notice is
+/// printed. V8VM_REQUIRE_SANDBOX=1 makes such a kernel a failure instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn sandbox_available(test: &str) -> bool {
+    if common::kernel_supports_sandbox() {
+        return true;
+    }
+    assert!(
+        !common::sandbox_required(),
+        "V8VM_REQUIRE_SANDBOX=1 but the kernel reports Landlock ABI {}, need {}",
+        common::landlock_abi(),
+        common::REQUIRED_LANDLOCK_ABI
+    );
+    common::skipped(test);
+    false
 }
 
-#[test]
-fn sandbox_dump_writes_the_allowed_file() {
-    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sb-dump.json");
-    // Start from no file: a leftover snapshot from an earlier run would mask
-    // a broken dump write.
-    let _ = std::fs::remove_file(&dump);
-    let path = script("sb-dump-guest", "vm.fs.write('/g', 'v');");
-    let r = v8vm(
-        &["--sandbox", &format!("--dump={}", dump.display()), path.to_str().unwrap()],
-        b"",
-    );
-    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&dump).expect("dump file")).expect("dump json");
-    assert_eq!(json, serde_json::json!({"/g": "v"}));
+/// On a kernel without Landlock ABI 6 the contract is a clear exit 2 and no
+/// guest run, never an unsandboxed run.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn assert_refused(args: &[&str], stdin: &[u8]) {
+    let r = v8vm_bounded(args, stdin, SANDBOX_LIMIT);
+    assert_eq!(r.code, 2, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "", "guest must not run");
+    assert!(r.stderr.contains("v8vm: --sandbox:"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("Landlock"), "stderr: {}", r.stderr);
 }
 
+/// Runs v8vm under `--sandbox`; None means the kernel cannot sandbox and the
+/// refusal has been checked.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn sandboxed(test: &str, args: &[&str], stdin: &[u8]) -> Option<Run> {
+    let mut full = vec!["--sandbox"];
+    full.extend_from_slice(args);
+    if sandbox_available(test) {
+        return Some(v8vm_bounded(&full, stdin, SANDBOX_LIMIT));
+    }
+    assert_refused(&full, stdin);
+    None
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod sandbox_run {
+    use super::*;
+
+    #[test]
+    fn sandbox_runs_a_plain_guest_end_to_end() {
+        let path = script(
+            "sb-hello",
+            "const arr = new Array(100000).fill('x'.repeat(50));
+             setTimeout(() => console.log('tick ' + arr.length), 5);
+             console.log('hello');",
+        );
+        let Some(r) = sandboxed("sandbox_runs_a_plain_guest_end_to_end", &[path.to_str().unwrap()], b"")
+        else {
+            return;
+        };
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert_eq!(r.stdout, "hello\ntick 100000\n");
+    }
+
+    #[test]
+    fn sandbox_timeout_kills_a_spinning_guest_with_124() {
+        let path = script("sb-spin", "for (;;) {}");
+        let args = ["--timeout=100", path.to_str().unwrap()];
+        let Some(r) = sandboxed("sandbox_timeout_kills_a_spinning_guest_with_124", &args, b"") else {
+            return;
+        };
+        assert_eq!(r.code, 124);
+    }
+
+    #[test]
+    fn sandbox_dump_writes_the_allowed_file() {
+        let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sb-dump.json");
+        // Start from no file: a leftover snapshot from an earlier run would
+        // mask a broken dump write.
+        let _ = std::fs::remove_file(&dump);
+        let path = script("sb-dump-guest", "vm.fs.write('/g', 'v');");
+        let dump_arg = format!("--dump={}", dump.display());
+        let args = [dump_arg.as_str(), path.to_str().unwrap()];
+        let Some(r) = sandboxed("sandbox_dump_writes_the_allowed_file", &args, b"") else {
+            return;
+        };
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&dump).expect("dump file")).expect("dump json");
+        assert_eq!(json, serde_json::json!({"/g": "v"}));
+    }
+
+    /// Waits for the child to carry a seccomp filter, so a serve run that
+    /// silently skipped the sandbox fails instead of passing on output alone.
+    fn wait_for_seccomp(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap_or_default();
+            if status.contains("Seccomp:\t2") {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "serve never became sandboxed: {}", status);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn sandbox_serve_answers_commands_over_stdin() {
+        let test = "sandbox_serve_answers_commands_over_stdin";
+        let path = script("sb-serve", "globalThis.state = { n: 0 };");
+        let args = ["--sandbox", "--serve", path.to_str().unwrap()];
+        let commands = b"1 + 1\nstate.n += 5\n";
+        if !sandbox_available(test) {
+            assert_refused(&args, commands);
+            return;
+        }
+        let r = v8vm_bounded_started(&args, commands, SANDBOX_LIMIT, wait_for_seccomp);
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert_eq!(r.stdout, "2\n5\n");
+    }
+}
+
+/// Where the layers cannot be built, `--sandbox` must still be a clear
+/// refusal and never an unsandboxed run.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 #[test]
-fn sandbox_refuses_a_dump_it_cannot_prepare() {
-    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no-such-dir/sb.json");
-    let path = script("sb-refused", "console.log('ran');");
-    let r = v8vm(
-        &["--sandbox", &format!("--dump={}", dump.display()), path.to_str().unwrap()],
-        b"",
-    );
+fn sandbox_flag_is_refused_on_unsupported_platforms() {
+    let path = script("sb-unsupported", "console.log('ran');");
+    let r = v8vm_bounded(&["--sandbox", path.to_str().unwrap()], b"", SANDBOX_LIMIT);
     assert_eq!(r.code, 2);
     assert_eq!(r.stdout, "", "guest must not run");
-    assert!(r.stderr.contains("sandbox"), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("--sandbox is only supported on Linux x86_64"),
+        "stderr: {}",
+        r.stderr
+    );
 }

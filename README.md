@@ -21,11 +21,13 @@ repo.
 
 ## Development
 
-    make test    # cargo test --release: unit, CLI, and library tests
+    make test    # cargo test --release: unit tests plus all four test targets
+                 # (cli, library, stdin_hub, sandbox)
     make clippy  # cargo clippy --release --all-targets, warnings denied
     make check   # build, then scripted smoke checks over the examples
-    make ci      # test, then clippy, then check, in that order; stops at the first failure
-                 # CI runs make ci CARGOFLAGS=--locked (.github/workflows/ci.yml)
+    make ci      # test, then clippy, then check, in that order; stops at the
+                 # first failure. CI runs make ci CARGOFLAGS=--locked
+                 # (.github/workflows/ci.yml)
 
 Environment overrides: CARGO selects the cargo binary (default cargo), and
 CARGO_TARGET_DIR relocates all build output (default target; set it as an
@@ -67,8 +69,10 @@ For hostile code call `v8vm::sandbox::apply(dump)` once, before the first
 run()/serve() and before any thread exists; it refuses otherwise. Read a
 --preload file before applying and hand its contents to the library as
 `Config.preload_data`: after apply, the only file the run can write is the
-dump file. `Config` gained that field in 0.1.0, so embedders building a
-`Config` with a struct literal must add it (or use `..Default::default()`).
+dump file. `preload_data` seeds the filesystem by itself (it needs no
+`preload` path) and takes precedence over reading `preload`. Embedders that
+build a `Config` with a struct literal must set the field, or use
+`..Default::default()`.
 
 ## Event loop
 
@@ -126,20 +130,23 @@ file, and before the first run()/serve(). V8 is initialized lazily on the
 host thread that the first run()/serve() spawns, so that thread, V8's worker
 threads, every guest thread, the watchdog, and the stdin reader all inherit
 the layers, and they cover every guest later run in the same process. The
-library refuses to apply them once that host thread exists. Inherited descriptors >= 3 are closed
-first (anything the caller passed in would be a channel out of the sandbox),
-and `PR_SET_NO_NEW_PRIVS` is set; the seccomp filters are installed with
-TSYNC.
+library refuses to apply them once that host thread exists. Inherited
+descriptors >= 3 are closed first (anything the caller passed in would be a
+channel out of the sandbox), and `PR_SET_NO_NEW_PRIVS` is set; the seccomp
+filters are installed with TSYNC.
 
 - Landlock: filesystem access is denied except for two files. `--dump` is
   created without truncation when the sandbox starts (a run that ends before
   the snapshot leaves an existing file untouched, or an empty new file) and
   is the only write the run can perform: the end-of-run snapshot truncates
-  and rewrites that one file, and even reading it back is denied. /dev/urandom
-  is readable because V8 opens it while seeding RNGs. Note what Landlock does
-  not mediate: file metadata, file existence, and symlink targets stay
-  observable through stat/access/readlink/chdir/statfs (xattr calls are
-  denied instead).
+  and rewrites that one file, and even reading it back is denied. `--dump`
+  must name a regular file: a pipe or terminal (`--dump=/dev/stdout` with
+  stdout piped) is refused up front with "--dump must be a regular file",
+  because Landlock can only anchor its rule on a file or directory.
+  /dev/urandom is readable because V8 opens it while seeding RNGs. Note what
+  Landlock does not mediate: file metadata, file existence, and symlink
+  targets stay observable through stat/access/readlink/chdir/statfs (xattr
+  calls are denied instead).
 - Landlock also scopes the process itself (ABI 6): signals may not be sent
   to processes outside the sandbox, and abstract unix sockets outside it may
   not be connected. This is the layer that stops a same-uid neighbour from
@@ -148,18 +155,22 @@ TSYNC.
   calls, exec (execve, execveat, fork, vfork), ptrace and cross-process
   memory access, privilege and identity changes, mount and namespace calls,
   kernel modules, bpf, perf, io_uring, userfaultfd, keyctl, System V and
-  POSIX message queues, personality, modify_ldt, xattr and other file
+  POSIX message queues (open, unlink, send, receive, notify, attributes),
+  personality, modify_ldt, xattr and other file
   metadata changes, file-event notification (inotify, fanotify), and clock
   setting.
 - Cross-process interference is filtered by argument, on top of the scopes:
   kill, tgkill, rt_sigqueueinfo and rt_tgsigqueueinfo are denied unless the
   target is the run's own pid (tkill, which names no process, is denied
-  outright); fcntl is denied for F_SETOWN, F_SETOWN_EX and F_SETSIG, which is
-  how an async fd would aim SIGIO at another process; prlimit64,
-  sched_setaffinity, sched_setscheduler and sched_setattr are denied unless
-  the target is 0 (the caller) or the run's own pid; setpriority is denied
-  unless it is PRIO_PROCESS for 0 or the run's own pid.
-- ioctl is denied for the terminal input injection requests TIOCSTI and
+  outright); fcntl is denied for F_SETOWN, F_SETOWN_EX and F_SETSIG, and
+  ioctl for their FIOSETOWN and SIOCSPGRP spellings, which is how an async fd
+  would aim SIGIO at another process (Landlock's Signal scope blocks that
+  delivery anyway, so these denials are defense in depth); prlimit64,
+  sched_setaffinity, sched_setscheduler, sched_setattr and sched_setparam are
+  denied unless the target is 0 (the caller) or the run's own pid;
+  setpriority and ioprio_set are denied unless they address a single process
+  (PRIO_PROCESS, IOPRIO_WHO_PROCESS) that is 0 or the run's own pid.
+- ioctl is also denied for the terminal input injection requests TIOCSTI and
   TIOCLINUX; other ioctl requests remain allowed on already-open descriptors,
   which is a residual surface.
 - Process creation is filtered, not just denied: clone succeeds only with
@@ -189,8 +200,31 @@ Kernel requirements: Landlock ABI 6 (Linux 6.12, for the filesystem rights
 and the signal/abstract-socket scopes) and seccomp with TSYNC. A ruleset
 that is not fully enforced is refused rather than degraded. Verified on
 Linux 6.17 reporting Landlock ABI 7; older kernels are untested. If Landlock
-or seccomp is missing the run refuses to start — it never falls back to
-unsandboxed execution.
+or seccomp is missing the run refuses to start with exit 2 and a message
+naming the layer, and it never falls back to unsandboxed execution.
+
+On a kernel below that (GitHub's hosted runners may be), the sandbox tests
+cannot exercise the real layers, so they skip instead of failing:
+
+- the runtime cases in tests/sandbox.rs and the `--sandbox` tests in
+  tests/cli.rs query the kernel with `landlock_create_ruleset(NULL, 0,
+  LANDLOCK_CREATE_RULESET_VERSION)`, print `SKIPPED (kernel lacks Landlock
+  ABI 6): <test>` on stderr, and pass. The CLI tests still check the
+  contract that does hold there: exit 2 with a message, guest not run.
+- the fail-closed cases, which fake a missing kernel feature, and the
+  seccomp-only cases run on every kernel.
+- `make check` skips its `--sandbox` line with a printed reason.
+- `V8VM_REQUIRE_SANDBOX=1` turns every one of those skips into a failure.
+  Set it where the kernel is known to have support; CI leaves it unset.
+
+The sandbox test binary takes libtest-style arguments: substring filters
+(`--exact` for whole names), `--skip <name>` and `--list`; other flags are
+ignored. A filter that matches nothing exits 0 with "0 run", so
+`cargo test <name of a cli test>` keeps working; an unfiltered run in which
+nothing ran fails.
+
+On other platforms (not Linux x86_64) the sandbox tests compile away, and
+`--sandbox` exits 2 with "--sandbox is only supported on Linux x86_64".
 
 ## Guarantees and limits
 
