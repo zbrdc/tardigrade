@@ -10,6 +10,7 @@ use crate::net::{net_close, net_listen, net_port, net_send};
 use crate::stdin::stdin_read;
 use crate::timers::{clear_timer, set_interval, set_timeout};
 use crate::Config;
+use crate::webapi;
 
 fn make_fn<'s>(
     scope: &mut v8::HandleScope<'s>,
@@ -95,4 +96,6 @@ pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
     put_fn(global, scope, "setInterval", set_interval);
     put_fn(global, scope, "clearTimeout", clear_timer);
     put_fn(global, scope, "clearInterval", clear_timer);
+
+    webapi::install(scope);
 }

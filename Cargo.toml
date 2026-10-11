@@ -37,6 +37,10 @@ name = "cli"
 path = "tests/cli.rs"
 
 [[test]]
+name = "webapi"
+path = "tests/webapi.rs"
+
+[[test]]
 name = "library"
 path = "tests/library.rs"
 

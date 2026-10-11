@@ -28,6 +28,7 @@ mod snapshot;
 mod stdin;
 mod timers;
 mod watchdog;
+mod webapi;
 mod world;
 
 pub mod sandbox;
