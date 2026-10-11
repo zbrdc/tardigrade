@@ -14,6 +14,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod sandbox;
+
 /// Host-side run configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -30,6 +32,9 @@ pub struct Config {
     /// True when the entry source was read from stdin, so guest stdin is
     /// already at EOF.
     pub stdin_consumed: bool,
+    /// Pre-read contents of `preload`, for hosts that read it before applying
+    /// [`sandbox::apply`] (which then denies re-opening the file).
+    pub preload_data: Option<String>,
 }
 
 impl Default for Config {
@@ -41,6 +46,7 @@ impl Default for Config {
             preload: None,
             dump: None,
             stdin_consumed: false,
+            preload_data: None,
         }
     }
 }
@@ -903,6 +909,13 @@ static V8_INIT: LazyLock<()> = LazyLock::new(|| {
     v8::V8::initialize();
 });
 
+/// True once V8 (and its worker threads) exist. The sandbox must be applied
+/// before that point for its restrictions to reach every thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn engine_started() -> bool {
+    LazyLock::get(&V8_INIT).is_some()
+}
+
 fn eval_src<'s>(
     scope: &mut v8::HandleScope<'s>,
     src: &str,
@@ -953,7 +966,13 @@ fn execute_inner(
     }
 
     if let Some(preload) = &cfg.preload {
-        match read_path(preload) {
+        // preload_data is the file the host already read before it applied
+        // the sandbox; the sandbox denies re-opening the path.
+        let state = match &cfg.preload_data {
+            Some(data) => Some(data.clone()),
+            None => read_path(preload),
+        };
+        match state {
             Some(state) => {
                 let key = v8::String::new(scope, "__PRELOAD__").unwrap();
                 let val =

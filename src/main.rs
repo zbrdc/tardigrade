@@ -11,6 +11,7 @@ struct Cli {
     preload: Option<std::path::PathBuf>,
     dump: Option<std::path::PathBuf>,
     serve: bool,
+    sandbox: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Cli, String> {
@@ -23,6 +24,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         preload: None,
         dump: None,
         serve: false,
+        sandbox: false,
     };
     for a in argv {
         if a == "--" {
@@ -39,6 +41,8 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.dump = Some(v.into());
         } else if a == "--serve" {
             c.serve = true;
+        } else if a == "--sandbox" {
+            c.sandbox = true;
         } else if a.starts_with('-') && a != "-" {
             return Err(format!("unknown flag {}", a));
         } else if c.entry.is_empty() {
@@ -48,9 +52,10 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         }
     }
     if c.entry.is_empty() && !c.serve {
-        return Err(format!(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]"
-        ));
+        return Err(
+            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]"
+                .to_string(),
+        );
     }
     if c.serve && c.entry == "-" {
         return Err("--serve needs a file entry; stdin is the command channel".into());
@@ -88,6 +93,25 @@ fn main() {
         eprintln!("v8vm: entry={:?} dump={:?} preload={:?} serve={}", c.entry, c.dump, c.preload, c.serve);
     }
 
+    let mut preload_data = None;
+    if c.sandbox {
+        // The sandbox must come after the host boundary reads (entry source
+        // above, preload here) and before V8 initializes in run()/serve().
+        if let Some(path) = &c.preload {
+            match std::fs::read_to_string(path) {
+                Ok(data) => preload_data = Some(data),
+                Err(_) => {
+                    eprintln!("v8vm: cannot open preload {:?}", path);
+                    std::process::exit(2);
+                }
+            }
+        }
+        if let Err(e) = v8vm::sandbox::apply(c.dump.as_deref()) {
+            eprintln!("v8vm: --sandbox: {}", e);
+            std::process::exit(2);
+        }
+    }
+
     let cfg = v8vm::Config {
         timeout_ms: if c.serve && !c.timeout_set { 0 } else { c.timeout_ms },
         heap_mb: c.heap_mb,
@@ -95,6 +119,7 @@ fn main() {
         preload: c.preload,
         dump: c.dump,
         stdin_consumed,
+        preload_data,
     };
 
 

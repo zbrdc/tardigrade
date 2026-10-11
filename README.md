@@ -22,7 +22,7 @@ Binaries land in the scratch target directory, not the repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]
+    v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
@@ -31,6 +31,7 @@ Binaries land in the scratch target directory, not the repo.
 - "--dump=<file>" write vm.snapshot() to a file when the run ends
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
+- "--sandbox" OS self-containment for hostile code (Linux only), see below
 - uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
 
 ## Library API
@@ -44,6 +45,12 @@ in-process from Rust:
 Note: run()/serve() use process-global world state for the duration of a
 call; one guest at a time per process. serve() reads commands from process
 stdin.
+
+For hostile code call `v8vm::sandbox::apply(dump)` once, before the first
+run()/serve() and before any thread exists; it refuses otherwise. Read a
+--preload file before applying and hand its contents to the library as
+`Config.preload_data`: after apply, the only file the run can write is the
+dump file.
 
 ## Event loop
 
@@ -89,6 +96,44 @@ with --dump, run the driver contract (PASS/FAIL/exit code), let an agent (swap
 the canned edit for your LLM call) patch the workspace, rerun. Swap in
 tsc-rs at this boundary to let agents write TypeScript.
 
+## OS self-sandbox (--sandbox)
+
+For hostile code, `--sandbox` puts kernel-level containment around the run.
+Linux only; on any other OS, or on a kernel missing the features, v8vm
+exits 2 without running the guest.
+
+Two layers are applied after the host reads the entry source and the preload
+file, and before V8 initializes, so V8's worker threads, the watchdog, and
+the stdin reader all inherit them:
+
+- Landlock: no filesystem access at all except the `--dump` file. That file
+  is created before the restrictions and is the only thing the run can write
+  afterwards (the end-of-run snapshot reopens that one file); every other
+  open fails with EACCES, including reads.
+- seccomp-BPF (deny list; denied calls fail with EPERM): all socket calls
+  (socket, connect, bind, listen, accept, send*, recv*), exec (execve,
+  execveat, and fork/vfork on x86_64), ptrace and cross-process memory
+  access, privilege and identity changes, mount/namespace calls, kernel
+  modules, bpf, perf, io_uring, userfaultfd, keyctl, file metadata changes
+  (chmod, chown, setxattr, utime), and clock setting. Everything else stays
+  allowed: threads (clone/clone3), mmap/mprotect for the JIT, futex, clocks,
+  getrandom, and reads/writes on already-open fds.
+- PR_SET_NO_NEW_PRIVS is set, and the filter is installed with TSYNC.
+
+What it does not do: this is not a VM. The guest runs as your user inside
+your process; kernel bugs, hardware side channels, and the already-open
+stdio fds are out of scope, and the `--dump` file is writable by design. A
+compromised guest can still burn CPU until --timeout and clone thread-like
+tasks (clone/clone3 must stay open for V8's workers). At startup V8 probes
+/sys/devices/system/cpu/online, /proc/stat, /proc/self/maps and
+/dev/urandom; all are denied here and V8 falls back to sched_getaffinity
+for its worker pool and getrandom for entropy.
+
+Kernel requirements: Landlock (Linux 5.13+) and seccomp with TSYNC
+(3.17+). Verified on Linux 6.17 reporting Landlock ABI 7; older kernels
+are untested. If Landlock or seccomp is missing the run refuses to start —
+it never falls back to unsandboxed execution.
+
 ## Guarantees and limits
 
 - Guests make no syscalls: the only disk access is at the host boundary
@@ -97,6 +142,7 @@ tsc-rs at this boundary to let agents write TypeScript.
   run. One delivery generation per loop turn.
 - This is an application-level sandbox, not a container: isolation is by
   omission of host APIs, inside one ordinary process per run. For hostile
-  code, run v8vm itself under a container/seccomp profile.
+  code, add `--sandbox` (above) and/or run v8vm itself under a
+  container/seccomp profile.
 - Hitting the heap cap aborts with the V8 out-of-memory report.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).
