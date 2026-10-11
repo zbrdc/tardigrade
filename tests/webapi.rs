@@ -267,3 +267,71 @@ fn atob_and_btoa_fail_like_browsers() {
         "\"A\" \"A\"\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\nInvalidCharacterError\n",
     );
 }
+
+// ---- structuredClone ----
+
+#[test]
+fn structured_clone_round_trips_builtins_and_cyles() {
+    ok(
+        "sc-builtins",
+        r#"
+        const shared = { id: 1 };
+        const orig = {
+          map: new Map([[1, "a"], [true, shared]]),
+          set: new Set(["x", 2]),
+          date: new Date(1234567890),
+          re: /ab+c/gi,
+          u8: new Uint8Array([9, 8, 7]),
+          f64: new Float64Array([1.5]),
+          buf: new ArrayBuffer(4),
+          arr: [1, "two", null],
+          nested: { deep: { deeper: true } },
+        };
+        const c = structuredClone(orig);
+        console.log(c.map.get(1), c.map.get(true) === shared, c.map.size);
+        console.log([...c.set].join("|"), c.date.getTime());
+        console.log(c.re.source, c.re.flags, c.re instanceof RegExp);
+        console.log(c.u8.constructor.name, [...c.u8].join(","), c.u8.byteOffset);
+        console.log([...c.f64].join(","), c.buf.byteLength);
+        console.log(JSON.stringify(c.arr), c.nested.deep.deeper);
+        // Deep: mutations never reach the original.
+        c.map.set(2, "new");
+        c.nested.deep.deeper = false;
+        c.u8[0] = 0;
+        console.log(orig.map.size, orig.nested.deep.deeper, orig.u8[0]);
+        // Shared references stay shared inside the clone (one copy each).
+        const orig2 = { a: shared, b: shared, v: new Uint8Array(new ArrayBuffer(6), 2, 3) };
+        const c2 = structuredClone(orig2);
+        console.log(c2.a === c2.b, c2.a.id, c2.v.byteOffset, c2.v.byteLength);
+        // Cycles clone without recursing forever, and identity holds.
+        const cyc = { name: "cyc" };
+        cyc.self = cyc;
+        const cc = structuredClone(cyc);
+        console.log(cc.self === cc, cc === cyc, cc.name);
+        "#,
+        "a false 2\nx|2 1234567890\nab+c gi true\nUint8Array 9,8,7 0\n1.5 4\n[1,\"two\",null] true\n2 true 9\ntrue 1 2 3\ntrue false cyc\n",
+    );
+}
+
+#[test]
+fn structured_clone_refuses_functions_symbols_and_transfer() {
+    ok(
+        "sc-refuses",
+        r#"
+        for (const bad of [() => 1, function f() {}, Symbol("s"), { fn: () => 1 }]) {
+          try { structuredClone(bad); console.log("cloned"); } catch (err) {
+            console.log(err.name, err instanceof Error, err instanceof TypeError);
+          }
+        }
+        const ab = new ArrayBuffer(8);
+        try { structuredClone(ab, { transfer: [ab] }); } catch (err) {
+          console.log("transfer:", err.name);
+        }
+        // Symbol-keyed properties are dropped (the structured clone
+        // algorithm skips them); symbol VALUES refuse, string keys survive.
+        console.log(structuredClone({ [Symbol.for("k")]: "v", k: 1 })[Symbol.for("k")]);
+        console.log(structuredClone({ k: 1 }).k);
+        "#,
+        "DataCloneError true false\nDataCloneError true false\nDataCloneError true false\nDataCloneError true false\ntransfer: DataCloneError\nundefined\n1\n",
+    );
+}

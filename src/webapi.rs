@@ -460,11 +460,104 @@ guest_cb!(decode_utf8, |args, rv, scope| {
         Err(()) => throw_type(scope, "The encoded data is not valid."),
     }
 });
+// ---- structuredClone ----
+
+/// Serializer delegate: V8 refuses functions, symbols and other
+/// non-cloneable values by asking the delegate to raise the error.
+struct CloneSerializer;
+
+impl v8::ValueSerializerImpl for CloneSerializer {
+    fn throw_data_clone_error<'s>(
+        &self,
+        scope: &mut v8::HandleScope<'s>,
+        message: v8::Local<'s, v8::String>,
+    ) {
+        let exc = v8::Exception::error(scope, message);
+        match v8::Local::<v8::Object>::try_from(exc) {
+            Ok(obj) => {
+                let name_val = v8_str(scope, "DataCloneError");
+                set_prop(obj, scope, "name", name_val.into());
+                scope.throw_exception(obj.into());
+            }
+            Err(_) => {
+                scope.throw_exception(exc);
+            }
+        }
+    }
+
+    fn get_wasm_module_transfer_id(
+        &self,
+        scope: &mut v8::HandleScope<'_>,
+        _module: v8::Local<'_, v8::WasmModuleObject>,
+    ) -> Option<u32> {
+        // There is no transfer registry to move a module within the run,
+        // so it fails the way other uncloneables do.
+        let msg = v8_str(scope, "WebAssembly.Module could not be cloned");
+        self.throw_data_clone_error(scope, msg);
+        None
+    }
+}
+
+/// Deserializer delegate: the ids the defaults refuse (host objects,
+/// shared buffers, wasm modules) are never written by CloneSerializer.
+struct CloneDeserializer;
+impl v8::ValueDeserializerImpl for CloneDeserializer {}
+
+/// True when options carries a non-empty `transfer` list: nothing here can
+/// be transferred (transfers would detach buffers across the clone), so
+/// the call fails the way browsers fail unsupported transfers.
+fn transfer_requested(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> bool {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(*opts) else { return false };
+    let key = v8_str(scope, "transfer");
+    let list = obj.get(scope, key.into()).unwrap_or_else(|| v8::undefined(scope).into());
+    v8::Local::<v8::Array>::try_from(list).is_ok_and(|a| a.length() > 0)
+}
+
+guest_cb!(structured_clone, |args, rv, scope| {
+    if transfer_requested(scope, &args.get(1)) {
+        return throw_named(scope, "DataCloneError", "transfer is not supported");
+    }
+    let value = args.get(0);
+    let context = scope.get_current_context();
+    let ser = v8::ValueSerializer::new(scope, Box::new(CloneSerializer));
+    let mut tc = v8::TryCatch::new(scope);
+    // The wire-format header must precede the value (the v8 crate tests
+    // pair write_header with read_header).
+    use v8::ValueSerializerHelper as _;
+    ser.write_header();
+    if ser.write_value(context, value) != Some(true) {
+        // The delegate already threw DataCloneError; a TryCatch that drops
+        // a caught exception swallows it, so it must be rethrown here.
+        if !tc.has_caught() {
+            throw_named(&mut tc, "DataCloneError", "value could not be cloned");
+        }
+        tc.rethrow();
+        return;
+    }
+    let data = ser.release();
+    let de = v8::ValueDeserializer::new(&mut tc, Box::new(CloneDeserializer), &data);
+    // The header (wire-format version) precedes any value; read it first.
+    use v8::ValueDeserializerHelper as _;
+    if de.read_header(context) != Some(true) {
+        return throw(&mut tc, "structuredClone: could not decode the serialized value");
+    }
+    match de.read_value(context) {
+        Some(v) => rv.set(v),
+        None => {
+            if !tc.has_caught() {
+                throw(&mut tc, "structuredClone: could not deserialize the value");
+            }
+            tc.rethrow();
+        }
+    }
+});
+
 // ---- installation ----
 
 pub(crate) fn install(scope: &mut v8::HandleScope) {
     let global = scope.get_current_context().global(scope);
     put_fn(global, scope, "atob", atob);
+    put_fn(global, scope, "structuredClone", structured_clone);
     put_fn(global, scope, "btoa", btoa);
     // Helper callbacks the prelude's TextEncoder/TextDecoder classes bind
     // and then remove from the global object.
