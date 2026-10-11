@@ -1681,8 +1681,16 @@ fn stdin_from_entry_dash_is_at_eof() {
 /// shared path races writer against reader (an empty read silently skips
 /// the entry script).
 fn serve(entry: &str, commands: &str) -> Run {
+    serve_with(&[], entry, commands)
+}
+
+/// serve() with extra CLI flags (before --serve).
+fn serve_with(flags: &[&str], entry: &str, commands: &str) -> Run {
     let path = script(entry, "globalThis.state = { n: 0 };");
-    v8vm(&["--serve", path.to_str().unwrap()], commands.as_bytes())
+    let mut args = flags.to_vec();
+    args.push("--serve");
+    args.push(path.to_str().unwrap());
+    v8vm(&args, commands.as_bytes())
 }
 
 #[test]
@@ -1715,6 +1723,114 @@ fn serve_reports_thrown_errors_as_json_and_keeps_going() {
 fn serve_settles_timers_between_commands() {
     let r = serve("serve-timers", "setTimeout(() => { state.n = 9 }, 5)\nstate.n\n");
     assert_eq!(r.stdout, "1\n9\n"); // first line is the timer id
+}
+
+#[test]
+fn serve_survives_a_command_that_fails_to_compile() {
+    let r = serve("serve-syntax", "1 +\n40 + 2\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut lines = r.stdout.lines();
+    let first = lines.next().unwrap();
+    assert!(first.contains("$error"), "{}", first);
+    assert!(first.contains("SyntaxError"), "the name is part of the reply: {}", first);
+    assert_eq!(lines.next(), Some("42"), "the session continues");
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn serve_names_thrown_errors_and_thrown_strings() {
+    let r = serve("serve-thrown", "null.f()\nthrow 'str'\n3\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut lines = r.stdout.lines();
+    let named = lines.next().unwrap();
+    assert!(named.starts_with("{\"$error\":\"TypeError: "), "{}", named);
+    assert_eq!(lines.next(), Some("{\"$error\":\"str\"}"));
+    assert_eq!(lines.next(), Some("3"));
+}
+
+#[test]
+fn serve_awaits_promises_and_prints_the_settled_value() {
+    let r = serve(
+        "serve-await",
+        "(async () => { await null; return 21 * 2 })()\nPromise.resolve(7)\nnew Promise((r) => setTimeout(() => r('tick'), 20))\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "42\n7\n\"tick\"\n");
+}
+
+#[test]
+fn serve_replies_error_for_an_async_rejection_and_continues() {
+    let r = serve(
+        "serve-async-reject",
+        "new Promise((_, rej) => setTimeout(() => rej(new Error('later')), 10))\n(async () => { await null; throw 'str' })()\n8\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{\"$error\":\"later\"}\n{\"$error\":\"str\"}\n8\n");
+}
+
+#[test]
+fn serve_command_timeout_bounds_a_never_settling_promise() {
+    let r = serve_with(
+        &["--command-timeout=400"],
+        "serve-never",
+        "new Promise(() => {})\n1 + 1\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{\"$error\":\"command timed out\"}\n2\n");
+}
+
+#[test]
+fn serve_command_timeout_breaks_an_infinite_loop_and_state_survives() {
+    let r = serve_with(
+        &["--command-timeout=400"],
+        "serve-spin-cmd",
+        "state.n = 5\nfor(;;){}\nstate.n\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "5\n{\"$error\":\"command timed out\"}\n5\n");
+}
+
+#[test]
+fn serve_command_timeout_breaks_a_spinning_await_and_state_survives() {
+    // The spin sits inside a promise continuation: the timeout must stop
+    // the event loop's turn, not only the command's own script.
+    let r = serve_with(
+        &["--command-timeout=400"],
+        "serve-spin-await",
+        "state.n = 6\nnew Promise((r) => setTimeout(() => { for(;;){} r(1) }, 10))\nstate.n\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "6\n{\"$error\":\"command timed out\"}\n6\n");
+}
+
+#[test]
+fn serve_accepts_crlf_lines() {
+    let r = serve("serve-crlf", "1 + 1\r\n2 + 2\r\n");
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "2\n4\n");
+}
+
+#[test]
+fn serve_skips_empty_lines_between_commands() {
+    let r = serve("serve-empty", "1\n\n2\n");
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "1\n2\n");
+}
+
+#[test]
+fn an_invalid_utf8_line_ends_the_session_with_exit_0() {
+    let path = script("serve-bad-utf8", "globalThis.state = { n: 0 };");
+    let r = v8vm(&["--serve", path.to_str().unwrap()], b"1 + 1\n\xff\xfe\n2\n");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "2\n", "the bad line and what follows are not replies");
+}
+
+#[test]
+fn a_bad_command_timeout_flag_is_a_usage_error() {
+    let path = script("serve-bad-flag", "globalThis.state = { n: 0 };");
+    let r = v8vm(&["--command-timeout=soon", "--serve", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("bad --command-timeout"), "stderr: {}", r.stderr);
 }
 
 #[test]

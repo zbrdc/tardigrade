@@ -39,11 +39,16 @@ and is not set by this repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
+    v8vm [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
     v8vm --sandbox-check
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
+- "--command-timeout=<ms>" serve only: wall-clock cap per command (default
+  0, off). On expiry the command replies {"$error":"command timed out"},
+  V8's pending termination is cancelled and the session continues with
+  its state intact - unlike --timeout, which ends the run. See Console
+  protocol below
 - "--memory=<mb>" V8 heap cap in MB, minimum 8 (default 256); the CLI
   rejects smaller values with exit 2, library callers have them clamped up;
   a guest whose live JS heap V8 cannot collect below its limit exits 137
@@ -80,8 +85,9 @@ and is not set by this repo.
   Landlock allows writing only the dump file itself, so no temp file can
   be made: the file is truncated and rewritten in place, and a failure
   mid-write can leave it truncated
-- "--serve" console mode: one JS expression per stdin line, one JSON line out
-  (untimed by default; stdin is the command channel, so vm.stdin is EOF)
+- "--serve" console mode: one JS expression per stdin line, one JSON line
+  out (untimed by default; stdin is the command channel, so vm.stdin is
+  EOF; the protocol is specified under Console protocol below)
 - "--sandbox" OS self-containment for hostile code (Linux only), see below
 - "--sandbox-check" (only as the sole argument) exit 0 if --sandbox can work
   here, 2 if not; after the entry it is an ordinary guest argument
@@ -122,8 +128,8 @@ the same size check and `vm.restore` as a file, so legacy and version 2
 snapshots behave identically. After `apply` the dump is rewritten in place
 instead of through a temp file, which Landlock forbids; nothing needs
 configuring for that. Embedders that build a `Config` with a struct
-literal must set the newer fields (`preload_data`, `fs_quota_bytes`, `seed`), or
-use `..Default::default()`.
+literal must set the newer fields (`preload_data`, `fs_quota_bytes`, `seed`,
+`command_timeout_ms`), or use `..Default::default()`.
 
 The restrictions apply to the whole embedding process, not only to v8vm's
 threads. The filters cover every thread (apply refuses unless the caller is
@@ -279,6 +285,61 @@ legacy flat map that contains a file literally named "version" parses as
 a versioned snapshot here, not as a file list. Legacy-key errors show the
 "/"-prefixed key.
 
+## Console protocol (--serve)
+
+Input: one JS expression per line, compiled and run in the global scope
+of one long-lived guest, so state (`var`s, globals, timers, files)
+persists across commands. Empty lines are skipped. One trailing CR is
+stripped, so "cmd", "cmd\r\n" and a final unterminated "cmd\r" are one
+command. A line that is not valid UTF-8 ends the session with exit 0
+(like the old read error); bytes pulled after it are kept for the next
+reader.
+
+Output: one JSON line per command, the value through JSON.stringify
+(undefined and functions become null). A command that fails to compile
+or throws is a reply, not the end of the session:
+
+- {"$error":"<message>"} for a compile error, a thrown value, or a value
+  whose stringification throws (a circular structure). The message is
+  the Error's own for plain Errors, "Name: message" for named ones
+  (SyntaxError, TypeError, ...), and String(value) for anything else - a
+  thrown string says itself
+- a native Promise value that is pending or fulfilled when the
+  expression returns is the async result: the encoders are attached and
+  the event loop runs until it settles; the reply is the fulfillment
+  value as JSON, or {"$error":...} on rejection. The await counts as a
+  handler, so such a rejection is not an unhandled one. Custom thenables
+  are not awaited (they stringify as objects)
+- a promise still sitting unhandled in the run's rejection map when the
+  expression returns - a synchronous Promise.reject(...) with no catch,
+  including an async function that throws before its first await - is
+  left to the run's unhandled-rejection boundary: the reply is {}, and
+  the session fails with exit 1 at the next microtask checkpoint, as
+  before. A rejected promise with a handler attached by the command is
+  awaited like any other
+- a promise nothing can settle any more (the event loop is idle with
+  the promise still pending) replies {"$error":"promise never settled"};
+  with --command-timeout it replies {"$error":"command timed out"} when
+  the deadline fires instead
+- --command-timeout=<ms> bounds each command's wall clock. On expiry
+  the reply above is printed, V8's pending termination is cancelled, and
+  the session continues with its state intact. The watchdog enforcing
+  it is per command and is settled (joined) before the cancel, so a late
+  terminate cannot poison the next command; a run-level reason (vm.exit,
+  --timeout, the heap cap) that races it still ends the session with its
+  own code
+
+Replies rendezvous with the caller's writer, so a reply is on stdout
+before anything the guest prints after it; output the command's own
+microtasks print still comes first, like before. Between commands the
+event loop settles timers, network messages and microtasks.
+
+Only host-level failure ends the session: a stdin I/O error (invalid
+UTF-8), vm.exit (its code), the whole-run --timeout (124), the heap cap
+(137), an unhandled rejection still unhandled at a microtask checkpoint
+(1), or the reply consumer going away (0). At EOF (or such an end) a
+--dump is written as usual.
+
 ## HTTP bridge
 
 serve_bridge owns a real localhost socket (trusted host code) and relays each
@@ -287,7 +348,10 @@ request into a guest handler as one JS expression over the console:
     $(cargo target dir)/release/serve_bridge examples/webapp.js 8077
     curl http://127.0.0.1:8077/
 
-The guest keeps its zero-syscall guarantee: it never sees a socket.
+The guest keeps its zero-syscall guarantee: it never sees a socket. The
+bridge runs the guest with --command-timeout=30000, so one stuck handler
+cannot park it forever: a command that replies $error maps to HTTP 500
+with the error text, a timed-out one to 504.
 
 ## Agent loop
 

@@ -76,6 +76,12 @@ pub struct Config {
     /// same seed draw identical sequences, different seeds differ. None
     /// (the default) keeps V8's own Math.random.
     pub seed: Option<u64>,
+    /// Per-command wall-clock cap in ms for serve mode; 0 disables.
+    /// Default 0. On expiry the command's reply is
+    /// `{"$error":"command timed out"}`, V8's pending termination is
+    /// cancelled and the session continues with its state intact - unlike
+    /// `timeout_ms`, which ends the run.
+    pub command_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -90,6 +96,7 @@ impl Default for Config {
             preload_data: None,
             fs_quota_bytes: DEFAULT_FS_QUOTA_BYTES,
             seed: None,
+            command_timeout_ms: 0,
         }
     }
 }
@@ -321,7 +328,9 @@ fn execute_inner(
     let mut code = eval_entry(scope, spec);
     if code == 0 {
         code = match replies {
-            Some(replies) => serve::serve_loop(scope, replies),
+            Some(replies) => {
+                serve::serve_loop(scope, handle, replies, spec.cfg.command_timeout_ms)
+            }
             None => event_loop(scope),
         };
     }

@@ -33,6 +33,7 @@ pub(crate) struct NetMsg {
 /// A rejection V8 reported without a handler, kept until the next microtask
 /// checkpoint decides whether the run fails (Node semantics: attaching a
 /// handler late in the same tick, or in a microtask, is not a failure).
+#[derive(Clone)]
 pub(crate) struct PendingRejection {
     /// Insertion order, so the first rejection can still be found across
     /// the identity-hash buckets.
@@ -41,11 +42,15 @@ pub(crate) struct PendingRejection {
     pub(crate) value: Option<v8::Global<v8::Value>>,
 }
 
-/// Why a run was terminated from outside guest code.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Why a run was terminated from outside guest code. CommandTimeout is
+/// serve-only: it is set by the per-command watchdog, recovered by
+/// serve_loop, and never delivered as a run-level stop by the run
+/// watchdog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TermReason {
     Timeout,
     Oom,
+    CommandTimeout,
 }
 
 /// Shared termination state: the watchdog thread and the heap callbacks
@@ -72,6 +77,13 @@ pub(crate) enum Wake {
     Reason,
 }
 
+/// A serve command timeout surfaces through the i32 channels as this
+/// sentinel so serve_loop can tell it from every run-level outcome. It is
+/// consumed before the session code is decided and can never escape as a
+/// process exit code (negative vm.exit codes are invisible to the
+/// `>= 0` checks that would otherwise surface them).
+pub(crate) const COMMAND_TIMEOUT_CODE: i32 = -2;
+
 impl Termination {
     pub(crate) fn new() -> Self {
         Termination {
@@ -83,23 +95,34 @@ impl Termination {
 
     /// Marks why the run is being terminated; the first marker wins (an
     /// OOM found before a late watchdog firing still reports as OOM).
-    pub(crate) fn mark(&self, reason: TermReason) {
+    /// True when this call set the reason, so a caller that lost the race
+    /// knows another terminator owns the outcome. Re-marking the reason
+    /// that already holds also wins: the marker agrees with the state.
+    pub(crate) fn mark(&self, reason: TermReason) -> bool {
         let code = match reason {
             TermReason::Timeout => 1,
             TermReason::Oom => 2,
+            TermReason::CommandTimeout => 3,
         };
         // Store and notify under the lock the waiter checks its predicate
         // under: without it, a mark between the waiter's check and its wait
         // is a lost wakeup.
         let _guard = self.wake.0.lock().unwrap();
-        let _ = self.reason.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
-        self.wake.1.notify_all();
+        let won = self
+            .reason
+            .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if won {
+            self.wake.1.notify_all();
+        }
+        won
     }
 
     pub(crate) fn reason(&self) -> Option<TermReason> {
         match self.reason.load(Ordering::SeqCst) {
             1 => Some(TermReason::Timeout),
             2 => Some(TermReason::Oom),
+            3 => Some(TermReason::CommandTimeout),
             _ => None,
         }
     }
@@ -165,7 +188,10 @@ pub(crate) struct World {
     pub(crate) stdin_waiters: Vec<v8::Global<v8::PromiseResolver>>,
     pub(crate) stdin_eof: bool,
     /// This run's subscription to the process-wide stdin hub, created on the
-    /// first vm.stdin.read() and dropped (released) when the run ends.
+    /// first vm.stdin.read() and released when the run ends - or sooner,
+    /// whenever no vm.stdin readers are pending any more (see
+    /// stdin::poll_stdin), so one long-held subscription cannot starve a
+    /// later subscriber.
     pub(crate) stdin_sub: Option<StdinSub>,
     /// Math.random counter for seeded runs (Config.seed); None leaves
     /// V8's own Math.random in place.
@@ -218,6 +244,8 @@ impl World {
 
     /// Concludes a terminated run: a guest vm.exit() code wins, then the
     /// heap cap (137, reported once on stderr), then the watchdog (124).
+    /// A command timeout maps to [COMMAND_TIMEOUT_CODE]: only serve_loop
+    /// sees that value, and it recovers the session instead of ending it.
     /// Exactly one caller concludes the run; `take` makes a stray second
     /// call visibly wrong (124) instead of double-printing the report.
     pub(crate) fn take_terminated_exit(&mut self) -> i32 {
@@ -230,6 +258,7 @@ impl World {
                 eprintln!("v8vm: heap limit exceeded ({} MB)", self.heap_mb);
                 137
             }
+            Some(TermReason::CommandTimeout) => COMMAND_TIMEOUT_CODE,
             _ => 124,
         }
     }
@@ -368,5 +397,22 @@ mod tests {
         w2.set_exit_code(0);
         w2.set_exit_code(9);
         assert_eq!(w2.exit_code(), 0, "an explicit 0 also wins");
+    }
+
+    #[test]
+    fn mark_reports_the_winner() {
+        let term = Arc::new(Termination::new());
+        assert!(term.mark(TermReason::Oom));
+        assert!(!term.mark(TermReason::Timeout), "the first marker wins");
+        assert_eq!(term.reason(), Some(TermReason::Oom));
+    }
+
+    #[test]
+    fn a_command_timeout_maps_to_its_own_code_and_is_consumed() {
+        let mut w = World::new(0);
+        w.term.mark(TermReason::CommandTimeout);
+        assert_eq!(w.take_terminated_exit(), COMMAND_TIMEOUT_CODE);
+        assert_eq!(w.term.reason(), None, "taken, like every reason");
+        assert!(!w.is_leaving(), "the leaving guard fell with it");
     }
 }

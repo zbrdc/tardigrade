@@ -6,6 +6,7 @@ struct Cli {
     entry: String, // "-" means stdin
     timeout_ms: u64,
     timeout_set: bool,
+    command_timeout_ms: u64,
     heap_mb: usize,
     args: Vec<String>,
     preload: Option<std::path::PathBuf>,
@@ -21,6 +22,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         entry: String::new(),
         timeout_ms: 60000,
         timeout_set: false,
+        command_timeout_ms: 0,
         heap_mb: 256,
         args: Vec::new(),
         preload: None,
@@ -37,6 +39,8 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         if let Some(v) = a.strip_prefix("--timeout=") {
             c.timeout_ms = v.parse().map_err(|_| format!("bad --timeout: {}", v))?;
             c.timeout_set = true;
+        } else if let Some(v) = a.strip_prefix("--command-timeout=") {
+            c.command_timeout_ms = v.parse().map_err(|_| format!("bad --command-timeout: {}", v))?;
         } else if let Some(v) = a.strip_prefix("--memory=") {
             c.heap_mb = v.parse().map_err(|_| format!("bad --memory: {}", v))?;
             if c.heap_mb < 8 {
@@ -74,7 +78,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve {
         return Err(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
+            "usage: v8vm [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
                 .to_string(),
         );
     }
@@ -124,6 +128,7 @@ fn main() {
         preload_data,
         fs_quota_bytes: c.fs_quota_bytes,
         seed: c.seed,
+        command_timeout_ms: c.command_timeout_ms,
     };
 
     let code = if c.serve {
