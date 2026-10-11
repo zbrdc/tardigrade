@@ -33,45 +33,67 @@ impl Watchdog {
     /// delivery).
     pub(crate) fn new(iso: v8::IsolateHandle, timeout_ms: u64, term: Arc<Termination>) -> Self {
         let term2 = term.clone();
-        let thread = std::thread::spawn(move || {
-            let deadline = if timeout_ms == 0 {
-                None
-            } else {
-                Some(Instant::now() + Duration::from_millis(timeout_ms))
-            };
-            loop {
-                match term2.wait_for(deadline) {
-                    Wake::Finished => return,
-                    Wake::Deadline => {
-                        if term2.mark(TermReason::Timeout) {
-                            iso.terminate_execution();
-                            return;
-                        }
-                        // A command timeout holds the reason and is about
-                        // to be recovered by serve_loop; re-wait and fire
-                        // again once it is cleared (the deadline, being
-                        // past, fires immediately).
-                        std::thread::sleep(DELIVER_SLICE);
-                    }
-                    Wake::Reason => {
-                        // Deliver a run-level reason, re-checking it every
-                        // slice: serve_loop consumes CommandTimeout reasons
-                        // to recover a session, and a reason read as None
-                        // (consumed between the wake and here) is nobody's
-                        // to deliver - terminating for it would kill a
-                        // healthy session with a bare 124. When the reason
-                        // is gone, fall through and wait for the next one.
-                        while !term2.is_finished()
-                            && matches!(term2.reason(), Some(r) if r != TermReason::CommandTimeout)
-                        {
-                            iso.terminate_execution();
+        let spawned = std::thread::Builder::new()
+            .name("v8vm-run-wd".to_string())
+            .spawn(move || {
+                let deadline = if timeout_ms == 0 {
+                    None
+                } else {
+                    Some(Instant::now() + Duration::from_millis(timeout_ms))
+                };
+                loop {
+                    match term2.wait_for(deadline) {
+                        Wake::Finished => return,
+                        Wake::Deadline => {
+                            if term2.mark(TermReason::Timeout) {
+                                iso.terminate_execution();
+                                return;
+                            }
+                            // A command timeout holds the reason and is about
+                            // to be recovered by serve_loop; re-wait and fire
+                            // again once it is cleared (the deadline, being
+                            // past, fires immediately).
                             std::thread::sleep(DELIVER_SLICE);
+                        }
+                        Wake::Reason => {
+                            // Deliver a run-level reason, re-checking it every
+                            // slice: serve_loop consumes CommandTimeout reasons
+                            // to recover a session, and a reason read as None
+                            // (consumed between the wake and here) is nobody's
+                            // to deliver - terminating for it would kill a
+                            // healthy session with a bare 124.
+                            let run_level = |t: &Termination| {
+                                matches!(t.reason(), Some(r) if r != TermReason::CommandTimeout)
+                            };
+                            if !run_level(&term2) {
+                                // Nothing to deliver (a command timeout being
+                                // recovered, or a reason consumed meanwhile):
+                                // yield a slice. wait_for would return Reason
+                                // again at once while the flag holds - a busy
+                                // spin for as long as the guest sits in an
+                                // interrupt-blind builtin.
+                                std::thread::sleep(DELIVER_SLICE);
+                                continue;
+                            }
+                            while !term2.is_finished() && run_level(&term2) {
+                                iso.terminate_execution();
+                                std::thread::sleep(DELIVER_SLICE);
+                            }
+                            // The reason was consumed: the run's outcome is
+                            // decided, so fall through and wait (for the
+                            // deadline or finish), not deliver.
                         }
                     }
                 }
+            });
+        let thread = match spawned {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("v8vm: cannot spawn run watchdog: {}", e);
+                None
             }
-        });
-        Watchdog { term, thread: Some(thread) }
+        };
+        Watchdog { term, thread }
     }
 }
 

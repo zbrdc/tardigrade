@@ -13,7 +13,9 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use crate::diag::to_rust_string;
-use crate::event_loop::{event_loop, event_loop_while, forget_rejection_of, stopped};
+use crate::event_loop::{
+    event_loop, event_loop_until, forget_rejection_of, settle_due, stopped,
+};
 use crate::eval_src;
 use crate::stdin::{self, StdinSub};
 use crate::watchdog::CommandWatchdog;
@@ -311,7 +313,7 @@ fn settle(
         return Settled::Yes;
     }
     let mut settled = |_s: &mut v8::HandleScope| p.state() != v8::PromiseState::Pending;
-    let code = event_loop_while(scope, &mut settled);
+    let code = event_loop_until(scope, &mut settled);
     if code != 0 {
         return Settled::Ended(code);
     }
@@ -395,12 +397,11 @@ fn evaluate(
     if line.len() >= MAX_LINE {
         return Outcome::Reply(LINE_TOO_LONG.to_string());
     }
-    let r = match eval_step(scope, &build_wrapper(line)) {
+    match eval_step(scope, &build_wrapper(line)) {
         Step::Value(v) => value_outcome(scope, v, wd, deadline),
         Step::Exception(e) => command_exception(scope, e, wd),
         Step::Terminated => terminated(scope, wd),
-    };
-    r
+    }
 }
 
 /// One reply line: JSON.stringify never emits a raw newline, so a
@@ -420,13 +421,20 @@ fn encode_line(s: String) -> String {
 /// already out) with one stderr line, and the session continues. A guest
 /// exit code wins (checked first, before the timeout recovery), then an
 /// outside termination, then an unhandled rejection or an uncaught
-/// exception from the command's work (both exit 1).
+/// exception from the command's work (both exit 1). Under --clock=virtual
+/// only work already due at the reply's virtual time settles (the clock
+/// is never jumped here), so a leftover repeating timer cannot spin
+/// virtual time - and the CPU - without bound between commands.
 fn settle_after_reply(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Option<i32> {
     let exit = world_mut(scope).exit_code();
     if exit >= 0 {
         return Some(exit);
     }
-    let code = event_loop(scope);
+    let code = if world_mut(scope).clock.is_virtual() {
+        settle_due(scope)
+    } else {
+        event_loop(scope)
+    };
     if code != COMMAND_TIMEOUT_CODE
         && world_mut(scope).term.reason() != Some(TermReason::CommandTimeout)
     {

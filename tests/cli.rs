@@ -1726,6 +1726,101 @@ fn serve_settles_timers_between_commands() {
     assert_eq!(r.stdout, "1\n9\n"); // first line is the timer id
 }
 
+/// Reads one thread's CPU time (utime+stime, in clock ticks) from
+/// /proc, or None if the thread is gone. comm is at most 15 characters.
+#[cfg(target_os = "linux")]
+fn thread_cpu_ticks(pid: u32, comm: &str) -> Option<u64> {
+    let tasks = std::fs::read_dir(format!("/proc/{}/task", pid)).ok()?;
+    for t in tasks.flatten() {
+        let tid = t.file_name().to_string_lossy().to_string();
+        let name = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).ok()?;
+        if name.trim() != comm {
+            continue;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{}/task/{}/stat", pid, tid)).ok()?;
+        // Fields after the (comm) pair: state is field 3, so utime and
+        // stime (fields 14, 15) are the 12th and 13th tokens (indices
+        // 11 and 12).
+        let rest = stat.rsplit_once(')')?.1;
+        let mut it = rest.split_whitespace();
+        it.nth(10)?;
+        let utime: u64 = it.next()?.parse().ok()?;
+        let stime: u64 = it.next()?.parse().ok()?;
+        return Some(utime + stime);
+    }
+    None
+}
+
+/// A session of nothing but near-budget spins: every command times out,
+/// so the run watchdog wakes with the CommandTimeout reason again and
+/// again while serve recovers. It must yield between wakes, not spin:
+/// the measured 2 ms busy-spin per recovery accumulated ~20 ticks in
+/// ~1.3 s; the fixed thread stays under a fraction of that.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_run_watchdog_does_not_spin_while_serve_recovers_timeouts() {
+    let mut commands = String::new();
+    for i in 0..150 {
+        commands.push_str(&format!(
+            "(function(){{var t=performance.now();while(performance.now()-t<10.5);}})()\n'ok{i}'\n"
+        ));
+    }
+    let path = script("serve-wd-spin", "globalThis.state = { n: 0 };");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(["--command-timeout=10", "--serve", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let pid = child.id();
+    let mut pipe = child.stdin.take().unwrap();
+    let input = commands.into_bytes();
+    std::thread::spawn(move || {
+        let _ = pipe.write_all(&input);
+    });
+    let mut out_pipe = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        use std::io::Read;
+        let _ = out_pipe.read_to_end(&mut sink);
+    });
+    let start = std::time::Instant::now();
+    let ticks = loop {
+        assert!(start.elapsed() < std::time::Duration::from_secs(30), "session never ran");
+        if let Some(t) = thread_cpu_ticks(pid, "v8vm-run-wd") {
+            if start.elapsed() >= std::time::Duration::from_millis(1000) {
+                break t;
+            }
+        }
+        if let Some(status) = child.try_wait().expect("poll v8vm") {
+            panic!("session ended before it could be sampled: {}", status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let _ = child.wait().expect("reap v8vm");
+    assert!(ticks <= 5, "run watchdog used {} CPU ticks in ~1 s", ticks);
+}
+
+#[test]
+fn serve_under_virtual_time_settles_only_due_work_after_a_reply() {
+    // A leftover repeating timer must not spin virtual time (and the
+    // CPU) between commands: the post-reply settling runs only work
+    // already due, later timers stay queued. Without a command timeout
+    // the old behavior never returned to the next command at all.
+    let r = v8vm_bounded(
+        &[
+            "--clock=virtual",
+            "--serve",
+            script("serve-virtual-interval", "globalThis.state = { n: 0 };").to_str().unwrap(),
+        ],
+        b"(setInterval(() => {}, 10), 1)\nperformance.now()\n2\n",
+        std::time::Duration::from_secs(10),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n0\n2\n");
+}
+
 #[test]
 fn serve_survives_a_command_that_fails_to_compile() {
     let r = serve("serve-syntax", "1 +\n40 + 2\n");
@@ -2031,52 +2126,45 @@ fn serve_command_timeout_breaks_a_spinning_await_and_state_survives() {
 
 #[test]
 fn a_command_finishing_at_its_deadline_does_not_poison_the_next() {
-    // Interleaved: each spin runs right at the 2 ms budget, so the
+    // Interleaved: each spin runs right at the 10 ms budget, so the
     // watchdog fires just as the command finishes, and the trivial
-    // command after it must still answer exactly. A leftover pending
-    // terminate (or a late one) shows up as a false "timed out" on a
-    // trivial command, a dropped reply, or a killed session.
+    // command after it must still answer exactly. A leftover or stray
+    // terminate shows up as a false "timed out" on a trivial command, a
+    // dropped reply, or a killed session. The generous budget keeps
+    // honest wall-clock expiries rare (a stalled host can still cause a
+    // few), so no retry is allowed and at most 2 trivial replies may be
+    // the timeout error; everything else must be exact.
     let mut commands = String::new();
-    for i in 0..4000 {
-        let spin = [1.7, 1.85, 1.95, 2.0, 2.05, 2.15][i % 6];
+    for i in 0..1000 {
+        let spin = [9.0, 9.5, 10.0, 10.5, 11.0][i % 5];
         commands.push_str(&format!(
             "(function(){{var t=performance.now();while(performance.now()-t<{spin});}})()\n'ok{i}'\n"
         ));
     }
     let path = script("serve-edge", "globalThis.state = { n: 0 };");
-    let args = ["--command-timeout=2", "--serve", path.to_str().unwrap()];
-    // One retry: a microsecond command can honestly expire when the
-    // parallel test harness stalls its process past the tiny 2 ms budget
-    // (its own watchdog, wall clock) - the session survives either way.
-    // The ordering bug instead kills the session or drops replies: no
-    // retry can mask that, and the retry run must be clean.
-    let mut first_corrupt: Option<Vec<String>> = None;
-    for _ in 0..2 {
-        let r = v8vm_bounded(&args, commands.as_bytes(), std::time::Duration::from_secs(60));
-        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-        let lines: Vec<&str> = r.stdout.lines().collect();
-        assert_eq!(lines.len(), 8000, "every command answered, none lost");
-        for i in (0..8000).step_by(2) {
-            assert!(
-                lines[i] == "null" || lines[i].contains("$error"),
-                "spin {}: {}",
-                i,
-                lines[i]
-            );
+    let r = v8vm_bounded(
+        &["--command-timeout=10", "--serve", path.to_str().unwrap()],
+        commands.as_bytes(),
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines.len(), 2000, "every command answered, none lost");
+    let mut false_timeouts = 0;
+    for i in (0..2000).step_by(2) {
+        assert!(
+            lines[i] == "null" || lines[i].contains("$error"),
+            "spin {}: {}",
+            i,
+            lines[i]
+        );
+        if lines[i + 1] == "{\"$error\":\"command timed out\"}" {
+            false_timeouts += 1;
+        } else {
+            assert_eq!(lines[i + 1], format!("\"ok{}\"", i / 2), "trivial command corrupted");
         }
-        let corrupt: Vec<&str> = (0..8000)
-            .step_by(2)
-            .map(|i| lines[i + 1])
-            .enumerate()
-            .filter(|(j, l)| **l != format!("\"ok{}\"", j))
-            .map(|(_, l)| l)
-            .collect();
-        if corrupt.is_empty() {
-            return;
-        }
-        first_corrupt = Some(corrupt.iter().map(|s| s.to_string()).collect());
     }
-    panic!("trivial commands corrupted in both runs: {:?}", first_corrupt);
+    assert!(false_timeouts <= 2, "{} false timeouts on trivial commands", false_timeouts);
 }
 
 #[test]

@@ -109,8 +109,12 @@ and is not set by this repo.
   When only a stdin read is pending - no timers, no net - the loop
   waits in real time exactly as without the flag. Under --serve the
   virtual clock is one timeline for the whole session: it persists
-  across commands, and each command's timers settle instantly in the
-  loop turn after it.
+  across commands, each command's timers settle instantly in the loop
+  turn after it, and an awaited promise still jumps to the timer it
+  waits on - but the settling after a reply never jumps the clock
+  (only work already due runs, later timers stay queued; see Console
+  protocol), so a leftover repeating timer cannot spin virtual time
+  and the CPU between commands.
 - "--epoch=<ms>" the Date timeline's zero point under --clock=virtual
   (default 0); a usage error without --clock=virtual, and above the
   ECMAScript maximum time value (8640000000000000) - the Date timeline
@@ -362,10 +366,13 @@ itself reads). Empty lines are skipped. One trailing CR is stripped, so
 line that is not valid UTF-8 ends the session with exit 0 (like the old
 read error); bytes pulled after it are kept for the next reader.
 
-Output: one JSON line per command, the value through JSON.stringify
-(undefined and functions become null). A command that fails to compile,
-throws, or produces a value JSON cannot encode (a BigInt, a circular
-structure) is a reply, not the end of the session:
+Output: exactly one JSON line per command (a guest-replaced intrinsic
+that hands back multi-line text gets the fixed reply
+"{\"$error\":\"<encoding failed>\"}" instead - the one-line reply
+guarantee holds whatever the guest does), the value through
+JSON.stringify (undefined and functions become null). A command that
+fails to compile, throws, or produces a value JSON cannot encode (a
+BigInt, a circular structure) is a reply, not the end of the session:
 
 - {"$error":"<message>"}. The message is the Error's own for plain
   Errors, "Name: message" for named ones (SyntaxError, TypeError,
@@ -402,8 +409,20 @@ structure) is a reply, not the end of the session:
   cap) that races it still ends the session with its own code. An
   uncaught exception thrown by a leftover timer or network listener
   during that settling ends the session with exit 1, as in a plain
-  run. Without the flag, work a command leaves pending (a repeating
-  timer) can hold the session between commands indefinitely, as before
+  run.
+- Work a command leaves pending settles before the next command runs,
+  under the same deadline: a leftover repeating timer means every later
+  command first waits out up to its whole --command-timeout budget
+  while the timer keeps re-arming (one stderr line each), and without
+  the flag the session never reaches the next command at all - for
+  serve_bridge that is one request per command timeout. Clear timers
+  in handlers that schedule them (clearInterval/clearTimeout) unless
+  they are meant to outlive the request. Under --clock=virtual the
+  post-reply settling never jumps the clock: only work already due at
+  the reply's virtual time runs, later timers stay queued until a
+  command's await needs them, so a leftover repeating timer costs
+  nothing between commands (a virtual await still jumps to the timer
+  it waits on)
 
 Replies rendezvous with the caller's writer, so a reply is on stdout
 before anything the guest prints after it; output the command's own
@@ -413,8 +432,9 @@ settles timers, network messages and microtasks.
 Only host-level failure ends the session: a stdin I/O error (invalid
 UTF-8), vm.exit (its code), the whole-run --timeout (124), the heap cap
 (137), an unhandled rejection still unhandled at a microtask checkpoint
-(1), or the reply consumer going away (0). At EOF (or such an end) a
---dump is written as usual.
+(1), an uncaught exception from a leftover timer or listener during the
+post-reply settling (1), or the reply consumer going away (0). At EOF
+(or such an end) a --dump is written as usual.
 
 ## HTTP bridge
 
