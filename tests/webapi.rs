@@ -833,6 +833,70 @@ fn cloning_a_buffer_beyond_memory_reports_data_clone_error() {
 }
 
 #[test]
+fn encoding_past_the_buffer_budget_names_the_allocation() {
+    // The budget refusal message matches vm.fs.readBytes's, so every
+    // budget refusal reads alike (it used to say "encoded data too large").
+    let path = script(
+        "encode-budget",
+        r#"try { new TextEncoder().encode("x".repeat(9 * 1048576)); console.log("encoded"); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout, "caught RangeError Array buffer allocation failed\n",
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn deep_values_stack_overflow_keeps_its_range_error() {
+    // Regression: deserialize_failure used to rename every native Error
+    // to DataCloneError, so a nesting depth that overflows V8's
+    // deserializer recursion surfaced as "DataCloneError: Maximum call
+    // stack size exceeded". Only the budget refusal below is a
+    // DataCloneError; V8's own stack-overflow RangeError keeps its
+    // identity. (Past roughly depth 4000 the serializer overflows
+    // first, which was always kept; where exactly a given depth lands
+    // depends on the thread stack, so both non-renamed outcomes pass.)
+    let path = script(
+        "clone-depth",
+        r#"let v = { leaf: 1 };
+           for (let i = 0; i < 3000; i++) v = { a: v };
+           try { structuredClone(v); console.log("cloned"); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm(&[path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout == "cloned\n" || r.stdout.starts_with("caught RangeError"),
+        "the stack-overflow error must keep its identity, stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn cloning_past_the_buffer_budget_is_a_data_clone_error() {
+    // The rename that must still happen: the run's ArrayBuffer budget
+    // refuses the clone's copy of a live 7 MB buffer under an 8 MB cap,
+    // and that refusal - not V8's own errors - is the DataCloneError.
+    let path = script(
+        "clone-budget",
+        r#"const a = new ArrayBuffer(7 * 1048576);
+           try { structuredClone(a); console.log("cloned"); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("caught DataCloneError"),
+        "a budget refusal is the one clone failure that is a DataCloneError, stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
 fn every_intrinsic_the_decoder_uses_survives_being_replaced() {
     // The ov2 probe shape: swap each intrinsic the prelude classes touch
     // for a throwing boom, run the whole decoder surface, restore, and

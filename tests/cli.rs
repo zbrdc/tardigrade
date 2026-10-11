@@ -1162,8 +1162,9 @@ fn fs_file_too_large_to_read_as_a_string() {
     // Above V8's maximum string length (~536.87 M chars), read must throw
     // a normal guest Error while readBytes still works. Memory-heavy on
     // purpose: nothing smaller can cross the engine's string limit. The
-    // guest's 540 MB buffer and the readBytes copy both count against the
-    // ArrayBuffer budget, so the cap is raised above their sum.
+    // write's 540 MB buffer is garbage once vm.fs.write returns, but the
+    // ArrayBuffer budget releases its charge only after a GC, so the cap
+    // is raised past buffer plus copy at once.
     let path = script(
         "fs-huge-read",
         "vm.fs.write('/f', new Uint8Array(540 * 1024 * 1024));

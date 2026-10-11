@@ -464,6 +464,11 @@ On other platforms (not Linux x86_64) the sandbox tests compile away, and
     Measured peaks: about 150-194 MB at cap 8, about 194 MB at cap 32,
     about 1.67 GB at cap 256. Budget roughly 150 MB plus up to 6x the
     cap; churn stays lower.
+  - Virtual reservations scale with the cap too: V8 sizes the
+    per-isolate CodeRange from the heap limit (min(512 MB, limit)), so
+    the 3x headroom above the cap adds up to ~260 MB of address space
+    per isolate at the default --memory; RLIMIT_AS embedders must
+    budget for it.
   - Worst case: a native builtin that ignores interrupts can keep
     allocating after the callback fired, up to the raised limit of 3 x
     V8's limit, about 9 x the cap (the raise is `limit_ceiling` in

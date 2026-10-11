@@ -137,7 +137,9 @@ guest_cb!(encode_utf8, |args, rv, scope| {
     match encode_to_vec(scope, s) {
         Ok(bytes) => match crate::heap::uint8_array_from(scope, bytes) {
             Some(v) => rv.set(v.into()),
-            None => throw_range(scope, "encoded data too large"),
+            // The budget refused the result buffer; same message as
+            // vm.fs.readBytes, so both budget refusals read alike.
+            None => throw_range(scope, "Array buffer allocation failed"),
         },
         // RangeError, like the platform's allocation failures.
         Err(()) => throw_range(scope, "encoded data too large to allocate"),

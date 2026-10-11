@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use crate::guest_cb;
 use crate::webapi::{throw_named, throw_named_error, throw_type, v8_str};
+use crate::world::world_mut;
 
 /// Set by the serializer delegate when it declines a SharedArrayBuffer:
 /// the only refusal whose error V8 raises directly (unnamed) instead of
@@ -161,6 +162,12 @@ guest_cb!(structured_clone, |args, rv, scope| {
     let de = v8::ValueDeserializer::new(&mut tc, Box::new(CloneDeserializer), &data);
     // The header (wire-format version) precedes any value; read it first.
     use v8::ValueDeserializerHelper as _;
+    // deserialize_failure below names its error DataCloneError only when
+    // the run's ArrayBuffer budget refused a backing store while V8
+    // rebuilt the value: the mark is cleared here and read on failure, so
+    // an earlier refusal is never attributed to this clone.
+    let budget = world_mut(&mut tc).ab_budget.clone();
+    budget.clear_refused();
     if de.read_header(context) != Some(true) {
         return rethrow_or_throw(
             &mut tc,
@@ -178,18 +185,20 @@ guest_cb!(structured_clone, |args, rv, scope| {
             }
             rv.set(v)
         }
-        None => deserialize_failure(&mut tc),
+        None => deserialize_failure(&mut tc, budget.take_refused()),
     }
 });
 
 /// The serializer just produced this data, so a failed read is V8 refusing
-/// an allocation while rebuilding it - in practice an ArrayBuffer the run's
-/// budget would not grant. V8 raises a plain Error for it; give it the
-/// DataCloneError name the write-side refusals carry. A caught exception
-/// that is not an Error object keeps its identity.
-fn deserialize_failure(tc: &mut v8::TryCatch<v8::HandleScope>) {
-    match tc.exception() {
-        Some(exc) if exc.is_native_error() => {
+/// something while rebuilding it - in practice an ArrayBuffer the run's
+/// budget would not grant, which V8 raises as a plain Error and which gets
+/// the DataCloneError name the write-side refusals carry. Every other
+/// failure keeps its identity: a RangeError from V8's own recursion limit
+/// on deeply nested values stays a RangeError (the budget never refused),
+/// and a caught exception that is not an Error object keeps its shape.
+fn deserialize_failure(tc: &mut v8::TryCatch<v8::HandleScope>, budget_refused: bool) {
+    match (tc.exception(), budget_refused) {
+        (Some(exc), true) if exc.is_native_error() => {
             throw_named_error(tc, exc, "DataCloneError");
             tc.rethrow();
         }
