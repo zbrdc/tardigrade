@@ -21,9 +21,10 @@ OUT=${OUT:?set OUT to the v8vm binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 WS=${WS:-$(dirname "$OUT")/agent-ts-ws.json}
 
-# bun is looked up in $BUN, then PATH, then its default install location.
-BUN=${BUN:-bun}
-command -v "$BUN" >/dev/null 2>&1 || BUN=$HOME/.bun/bin/bun
+# bun is looked up in $BUN, then PATH, then its default install location;
+# command -v yields an absolute path so the -x probe below is meaningful.
+BUN=$(command -v "${BUN:-bun}" 2>/dev/null || true)
+[ -n "$BUN" ] || BUN=$HOME/.bun/bin/bun
 
 # The type checker: tsc-rs (pinned, fetched by npx) with tsc as fallback.
 # Both exit 0 when the sources type-check and 2 on type errors; any other
@@ -33,6 +34,27 @@ checker=(npx -y tsc-rs@0.3.0)
 if [ -n "${V8VM_TSC_RS:-}" ]; then read -ra checker <<<"$V8VM_TSC_RS"; fi
 fallback=(tsc)
 if [ -n "${V8VM_TSC:-}" ]; then read -ra fallback <<<"$V8VM_TSC"; fi
+
+# A missing or unusable tool (bun, or every checker) is a loud skip, never
+# a silent pass; V8VM_REQUIRE_TS=1 turns it into a failure. The checker
+# probe is bounded and fetches tsc-rs, so "npx exists but offline with no
+# cache and no tsc" is caught here, not as a confusing exit 2 later.
+missing_tool() { # missing_tool <reason>
+  if [ "${V8VM_REQUIRE_TS:-}" = 1 ]; then
+    echo "agent-loop-ts: V8VM_REQUIRE_TS=1 but $1" >&2
+    exit 1
+  fi
+  echo "SKIPPED ($1): TypeScript agent loop" >&2
+  exit 77
+}
+[ -x "$BUN" ] || missing_tool "bun is not installed (set BUN, or install it)"
+( cd / && timeout 60 "${checker[@]}" --version ) >/dev/null 2>&1 \
+  || ( cd / && timeout 60 "${fallback[@]}" --version ) >/dev/null 2>&1 \
+  || missing_tool "no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)"
+
+# One scratch directory for the whole loop, removed on every exit path.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/v8vm-agent-ts.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
 
 ws_write() { # ws_write <path> <content>: store a file in the workspace
   local preload=()
@@ -82,7 +104,9 @@ typecheck() { # typecheck <dir>
 # back into the workspace. Returns 1 on the FAIL turn (type errors) and
 # exits the whole loop when no type checker can run.
 build_app() {
-  local dir=$1 rc=0
+  local dir="$WORK/turn" rc=0
+  rm -rf "$dir"
+  mkdir -p "$dir"
   extract "$dir"
   if [ ! -f "$dir/app.ts" ]; then
     echo "workspace has no /app/app.ts to build" >&2
@@ -90,10 +114,13 @@ build_app() {
   fi
   # vm.d.ts types the guest API (vm, console, timers, TextEncoder, ...) so
   # the app type-checks against v8vm, not against a DOM or Node lib: the
-  # tsconfig keeps lib.dom out with "lib": ["esnext"].
+  # tsconfig keeps lib.dom out with "lib": ["esnext"]. The rest of the
+  # options pin modern syntax (Set for-of, #private, BigInt) for both
+  # tsc-rs and tsc instead of either one's ES5 defaults, and "types": []
+  # keeps random @types off the guest.
   cp "$DIR/vm.d.ts" "$dir/vm.d.ts"
   cat >"$dir/tsconfig.json" <<'EOF'
-{ "compilerOptions": { "strict": true, "noEmit": true, "lib": ["esnext"] }, "include": ["**/*.ts"] }
+{ "compilerOptions": { "strict": true, "noEmit": true, "lib": ["esnext"], "target": "es2022", "module": "esnext", "moduleResolution": "bundler", "types": [] }, "include": ["**/*.ts"] }
 EOF
   typecheck "$dir" || rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -102,21 +129,37 @@ EOF
   fi
   if [ "$rc" -ne 0 ]; then
     echo "FAIL: TypeScript type errors (see checker output above)"
-    rm -rf "$dir"
     return 1
   fi
   "$BUN" build "$dir/app.ts" --target=browser --format=iife \
     --outfile="$dir/app.js" >/dev/null
-  ws_write /app/app.js "$(cat "$dir/app.js")"
-  rm -rf "$dir"
+  # The bundle travels as base64 on stdin, not as an argv entry: the
+  # kernel caps one argument near 128 KiB and bundles are larger.
+  base64 -w0 "$dir/app.js" \
+    | "$OUT" "$DIR/ts-load-bundle.js" --preload="$WS" --dump="$WS" >/dev/null
 }
 
 app_ts=$(cat <<'EOF'
 import { sum } from "./lib/sum";
+import { Tally } from "./lib/stats";
 // vm comes from vm.d.ts; using it proves the guest API is typed.
 const engine: string = vm.version;
 (globalThis as any).sum = sum;
 (globalThis as any).engine = engine;
+(globalThis as any).total = new Tally().add([1, 2, 3]);
+EOF
+)
+stats_ts=$(cat <<'EOF'
+// Modern syntax on purpose: Set for-of, a #private field and bigint
+// would fail under a checker's ES5 defaults, pinning the generated
+// tsconfig to target es2022.
+export class Tally {
+  #total: bigint = 0n;
+  add(xs: Iterable<number>): bigint {
+    for (const x of new Set(xs)) this.#total += BigInt(x);
+    return this.#total;
+  }
+}
 EOF
 )
 sum_type_error=$(cat <<'EOF'
@@ -132,23 +175,28 @@ export const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
 EOF
 )
 
+# Start from a clean workspace: a stale file from an earlier run must not
+# leak into this one.
+rm -f "$WS"
+
 echo "== seed workspace with an app that does not type-check =="
 ws_write /app/app.ts "$app_ts"
+ws_write /app/lib/stats.ts "$stats_ts"
 ws_write /app/lib/sum.ts "$sum_type_error"
 
 echo "== turn 1: type-check, observe the FAIL turn =="
-if build_app "$(mktemp -d)"; then
+if build_app; then
   echo "unexpected: the seeded app must not type-check"; exit 1
 fi
 
 echo "== turn 2: agent edits the app (swap for an LLM call) =="
 ws_write /app/lib/sum.ts "$sum_types_ok_logic_wrong"
-build_app "$(mktemp -d)"
+build_app
 if "$OUT" --preload="$WS" --dump="$WS" "$DIR/agent-driver.js"; then
   echo "unexpected pass"; exit 1
 fi
 
 echo "== turn 3: agent fixes the logic, rerun =="
 ws_write /app/lib/sum.ts "$sum_fixed"
-build_app "$(mktemp -d)"
+build_app
 "$OUT" --preload="$WS" --dump="$WS" "$DIR/agent-driver.js"

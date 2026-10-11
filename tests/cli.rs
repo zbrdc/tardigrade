@@ -2669,13 +2669,20 @@ fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
         ts_skipped("no type checker: npx and tsc are both missing", test);
         return;
     }
-    let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts-ws.json");
-    let _ = std::fs::remove_file(&ws);
-    let mut cmd = Command::new("bash");
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir loop scratch");
+    let ws = root.join("ws.json");
+    // A stale workspace file must not leak into the run: the loop starts
+    // by removing it.
+    std::fs::write(&ws, b"not json at all").expect("poison the stale workspace");
+    let mut cmd = Command::new("/bin/bash");
     cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh"))
         .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
         .env("WS", &ws)
-        .env("BUN", bun);
+        .env("BUN", bun)
+        // An isolated TMPDIR proves the loop's scratch dir is cleaned up.
+        .env("TMPDIR", &root);
     let out = output_within(cmd, 180);
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -2688,6 +2695,13 @@ fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
         "stdout: {stdout}"
     );
     assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
+    let leftovers: Vec<String> = std::fs::read_dir(&root)
+        .expect("list loop scratch")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("v8vm-agent-ts."))
+        .collect();
+    assert!(leftovers.is_empty(), "loop scratch dirs left behind: {leftovers:?}");
 }
 
 /// The in-guest TypeScript check (examples/ts-in-guest): when
@@ -3010,4 +3024,95 @@ fn ts_extraction_treats_workspace_content_as_data() {
             "nothing may be written for {path}"
         );
     }
+}
+
+/// Bundles travel on stdin as base64, not as one argv entry (the kernel
+/// caps a single argument near 128 KiB): a bundle well past that cap
+/// loads through examples/ts-load-bundle.js exactly the way the loop's
+/// build step does, and the loaded /app/app.js runs.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn ts_bundle_beyond_the_argv_limit_still_loads_and_runs() {
+    let test = "ts_bundle_beyond_the_argv_limit_still_loads_and_runs";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-big-bundle");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir big-bundle scratch");
+    let literal: String = "A".repeat(240_000);
+    std::fs::write(
+        root.join("big.ts"),
+        format!(
+            "export const big = \"{literal}\";\n(globalThis as any).bigLen = big.length;\n"
+        ),
+    )
+    .expect("write big fixture");
+    let mut bun_cmd = Command::new(&bun);
+    bun_cmd
+        .args(["build", "big.ts", "--target=browser", "--format=iife", "--outfile=big.js"])
+        .current_dir(&root);
+    let out = output_within(bun_cmd, 60);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let bundle = std::fs::read(root.join("big.js")).expect("read the bundle");
+    assert!(bundle.len() > 200_000, "bundle only {} bytes", bundle.len());
+
+    let ws = root.join("ws.json");
+    let loader = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-load-bundle.js");
+    let encoded = format!("{}\n", b64(&bundle));
+    let r = v8vm(
+        &[loader, &format!("--dump={}", ws.display())],
+        encoded.as_bytes(),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let probe = script(
+        "ts-big-bundle-probe",
+        "vm.run(\"/app/app.js\");\nconsole.log(globalThis.bigLen);",
+    );
+    let r = v8vm(&[&format!("--preload={}", ws.display()), probe.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "240000\n", "the full bundle must have loaded and run");
+}
+
+/// The loop's fallback checker path: with tsc-rs forced to fail
+/// (V8VM_TSC_RS=/bin/false), the pinned typescript tsc decides, the loop
+/// still passes end to end, and its output names the checker that ran.
+/// This is also where a checker-dependent tsconfig (an ES5 default target
+/// breaks Set for-of, #private and bigint) shows up as a failure.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn agent_loop_ts_with_the_tsc_fallback_passes() {
+    let test = "agent_loop_ts_with_the_tsc_fallback_passes";
+    let Some(bun) = find_bun() else {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but bun is not installed");
+        ts_skipped("bun is not installed", test);
+        return;
+    };
+    if !runs_on_host("npx") {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but npx is missing");
+        ts_skipped("npx is missing (the fallback fetches typescript)", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts-fallback");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir fallback scratch");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agent-loop-ts.sh"))
+        .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
+        .env("WS", root.join("ws.json"))
+        .env("BUN", bun)
+        .env("TMPDIR", &root)
+        .env("V8VM_TSC_RS", "/bin/false")
+        .env("V8VM_TSC", "npx -y -p typescript@5.9.3 tsc");
+    let out = output_within(cmd, 240);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains("checker: npx -y -p typescript@5.9.3 tsc"),
+        "the fallback that ran must be named, stdout: {stdout}"
+    );
+    assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
 }
