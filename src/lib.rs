@@ -911,7 +911,7 @@ static V8_INIT: LazyLock<()> = LazyLock::new(|| {
 
 /// True once V8 (and its worker threads) exist. The sandbox must be applied
 /// before that point for its restrictions to reach every thread.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn engine_started() -> bool {
     LazyLock::get(&V8_INIT).is_some()
 }

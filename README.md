@@ -50,7 +50,8 @@ For hostile code call `v8vm::sandbox::apply(dump)` once, before the first
 run()/serve() and before any thread exists; it refuses otherwise. Read a
 --preload file before applying and hand its contents to the library as
 `Config.preload_data`: after apply, the only file the run can write is the
-dump file.
+dump file. `Config` gained that field in 0.1.0, so embedders building a
+`Config` with a struct literal must add it (or use `..Default::default()`).
 
 ## Event loop
 
@@ -99,40 +100,60 @@ tsc-rs at this boundary to let agents write TypeScript.
 ## OS self-sandbox (--sandbox)
 
 For hostile code, `--sandbox` puts kernel-level containment around the run.
-Linux only; on any other OS, or on a kernel missing the features, v8vm
-exits 2 without running the guest.
+Linux x86_64 only (the deny list and the x32 guard are verified on that ABI);
+on any other platform, or on a kernel missing the features, v8vm exits 2
+without running the guest.
 
-Two layers are applied after the host reads the entry source and the preload
+The layers are applied after the host reads the entry source and the preload
 file, and before V8 initializes, so V8's worker threads, the watchdog, and
-the stdin reader all inherit them:
+the stdin reader all inherit them. Inherited descriptors >= 3 are closed
+first (anything the caller passed in would be a channel out of the sandbox),
+and `PR_SET_NO_NEW_PRIVS` is set; the seccomp filters are installed with
+TSYNC.
 
-- Landlock: no filesystem access at all except the `--dump` file. That file
-  is created before the restrictions and is the only thing the run can write
-  afterwards (the end-of-run snapshot reopens that one file); every other
-  open fails with EACCES, including reads.
-- seccomp-BPF (deny list; denied calls fail with EPERM): all socket calls
-  (socket, connect, bind, listen, accept, send*, recv*), exec (execve,
-  execveat, and fork/vfork on x86_64), ptrace and cross-process memory
-  access, privilege and identity changes, mount/namespace calls, kernel
-  modules, bpf, perf, io_uring, userfaultfd, keyctl, file metadata changes
-  (chmod, chown, setxattr, utime), and clock setting. Everything else stays
-  allowed: threads (clone/clone3), mmap/mprotect for the JIT, futex, clocks,
-  getrandom, and reads/writes on already-open fds.
-- PR_SET_NO_NEW_PRIVS is set, and the filter is installed with TSYNC.
+- Landlock: filesystem access is denied except for two files. `--dump` is
+  created without truncation when the sandbox starts (a run that ends before
+  the snapshot leaves an existing file untouched, or an empty new file) and
+  is the only write the run can perform: the end-of-run snapshot truncates
+  and rewrites that one file, and even reading it back is denied. /dev/urandom
+  is readable because V8 opens it while seeding RNGs. Note what Landlock does
+  not mediate: file metadata, file existence, and symlink targets stay
+  observable through stat/access/readlink/chdir/statfs (xattr calls are
+  denied instead).
+- seccomp-BPF, a deny list where denied calls fail with EPERM: all socket
+  calls, exec (execve, execveat, fork, vfork), ptrace and cross-process
+  memory access, privilege and identity changes, mount and namespace calls,
+  kernel modules, bpf, perf, io_uring, userfaultfd, keyctl, System V and
+  POSIX message queues, personality, modify_ldt, xattr and other file
+  metadata changes, and clock setting. Signals may only be sent to the run's
+  own process (kill/tgkill with any other target, and tkill, are denied).
+  ioctl is denied for the terminal input injection requests TIOCSTI and
+  TIOCLINUX; other ioctl requests remain allowed on already-open descriptors,
+  which is a residual surface.
+- Process creation is filtered, not just denied: clone succeeds only with
+  CLONE_THREAD set and no CLONE_NEW* namespace flag, and clone3 fails with
+  ENOSYS so glibc falls back to clone (which is then checked). Threads still
+  work; fork and user-namespace escapes do not.
+- A small hand-written stacked filter kills the process on any syscall made
+  through a different ABI: a non-x86_64 arch value (int 0x80) or a syscall
+  number in the x32 range, which would otherwise bypass every deny rule.
 
-What it does not do: this is not a VM. The guest runs as your user inside
-your process; kernel bugs, hardware side channels, and the already-open
-stdio fds are out of scope, and the `--dump` file is writable by design. A
-compromised guest can still burn CPU until --timeout and clone thread-like
-tasks (clone/clone3 must stay open for V8's workers). At startup V8 probes
-/sys/devices/system/cpu/online, /proc/stat, /proc/self/maps and
-/dev/urandom; all are denied here and V8 falls back to sched_getaffinity
-for its worker pool and getrandom for entropy.
+Everything the runtime needs stays allowed: threads, mmap/mprotect for the
+JIT, futex, clocks, getrandom, and reads/writes on already-open descriptors.
+At startup V8 probes /sys/devices/system/cpu/online, /proc/stat and
+/proc/self/maps; all are denied and V8 falls back (worker-pool sizing comes
+from sched_getaffinity) — /dev/urandom is allowed as above.
 
-Kernel requirements: Landlock (Linux 5.13+) and seccomp with TSYNC
-(3.17+). Verified on Linux 6.17 reporting Landlock ABI 7; older kernels
-are untested. If Landlock or seccomp is missing the run refuses to start —
-it never falls back to unsandboxed execution.
+What this does not do: it is not a VM. The guest runs as your user inside
+your process; kernel bugs, hardware side channels, the stdio descriptors,
+and the `--dump` file itself are out of scope. A compromised guest can still
+burn CPU until --timeout and read the metadata of the filesystem around it.
+
+Kernel requirements: Landlock ABI 5 (Linux 6.10) and seccomp with TSYNC. A
+ruleset that is not fully enforced is refused rather than degraded. Verified
+on Linux 6.17 reporting Landlock ABI 7; older kernels are untested. If
+Landlock or seccomp is missing the run refuses to start — it never falls
+back to unsandboxed execution.
 
 ## Guarantees and limits
 

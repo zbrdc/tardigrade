@@ -265,6 +265,9 @@ fn sandbox_timeout_kills_a_spinning_guest_with_124() {
 #[test]
 fn sandbox_dump_writes_the_allowed_file() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sb-dump.json");
+    // Start from no file: a leftover snapshot from an earlier run would mask
+    // a broken dump write.
+    let _ = std::fs::remove_file(&dump);
     let path = script("sb-dump-guest", "vm.fs.write('/g', 'v');");
     let r = v8vm(
         &["--sandbox", &format!("--dump={}", dump.display()), path.to_str().unwrap()],
