@@ -1,5 +1,10 @@
 //! Library API: run() owns per-run state, so guests can be reused
 //! sequentially and can also run concurrently in one process.
+//! Every Config here pins a small heap: the tests run many isolates in
+//! parallel inside one process, and each default-cap isolate reserves
+//! GBs of address space (heap limit plus code range), which can exhaust
+//! a bounded RLIMIT_AS before V8 ever allocates a page (see the README's
+//! Guarantees and limits).
 
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
@@ -9,7 +14,7 @@ use v8vm::Config;
 
 #[test]
 fn run_returns_the_guest_exit_code_and_can_run_again() {
-    let cfg = v8vm::Config::new();
+    let cfg = v8vm::Config { heap_mb: 32, ..v8vm::Config::new() };
     assert_eq!(v8vm::run("vm.exit(3)", "a.js", &cfg), 3);
     assert_eq!(v8vm::run("", "empty.js", &cfg), 0);
     assert_eq!(v8vm::run("throw new Error('x')", "b.js", &cfg), 1);
@@ -94,6 +99,7 @@ fn spawn_guest(src: &str, timeout_ms: u64, gate: Arc<Barrier>) -> std::thread::J
         gate.wait();
         let cfg = Config {
             timeout_ms,
+            heap_mb: 32,
             // hermetic: neither guest may consume the test harness stdin
             stdin_consumed: true,
             ..Config::new()
@@ -178,6 +184,7 @@ fn preload_data_alone_seeds_the_filesystem() {
     // A host that pre-read the snapshot (sandboxed runs) sets no preload path.
     let cfg = Config {
         preload_data: Some(r#"{"/k":"v"}"#.to_string()),
+        heap_mb: 32,
         stdin_consumed: true,
         ..Config::new()
     };
@@ -192,6 +199,7 @@ fn preload_data_takes_the_same_restore_path_as_a_preload_file() {
     let run_with = |data: &str, guest: &str| {
         let cfg = Config {
             preload_data: Some(data.to_string()),
+            heap_mb: 32,
             stdin_consumed: true,
             ..Config::new()
         };
@@ -212,6 +220,7 @@ fn fs_quota_boundary_from_the_library_config() {
     let cfg = Config {
         // 64 bookkeeping + 2 key bytes ("/f") + 10 content.
         fs_quota_bytes: 76,
+        heap_mb: 32,
         stdin_consumed: true, // hermetic: never touch the harness stdin
         ..Config::new()
     };
@@ -242,6 +251,7 @@ fn fs_quota_boundary_from_the_library_config() {
 fn seeded_first_draw(seed: u64) -> i32 {
     let cfg = Config {
         timeout_ms: 0,
+        heap_mb: 32,
         // hermetic: the guest must not consume the test harness stdin
         stdin_consumed: true,
         seed: Some(seed),
@@ -285,6 +295,7 @@ fn performance_now_origin_is_the_start_of_each_run() {
     // (a process-wide origin would include the first run's 200 ms).
     let spin = Config {
         timeout_ms: 0,
+        heap_mb: 32,
         stdin_consumed: true,
         ..Config::new()
     };
@@ -295,6 +306,7 @@ fn performance_now_origin_is_the_start_of_each_run() {
     );
     let probe = Config {
         timeout_ms: 0,
+        heap_mb: 32,
         stdin_consumed: true,
         ..Config::new()
     };
