@@ -2623,32 +2623,65 @@ fn ts_smoke_require_flag_fails_when_the_toolchain_is_missing() {
     );
 }
 
-/// Runs a command to completion under a hard wall-clock bound. The child
-/// gets its own process group and a timeout kills the whole group: bun and
-/// npx spawn children of their own, and one left alive would hold the
-/// output pipes open. 180 s covers npx fetching tsc-rs on a cold cache.
+/// Runs a command to completion under a hard wall-clock bound; 180 s
+/// covers npx fetching tsc-rs on a cold cache. Two invariants, from
+/// kill(2), govern the timeout path: the process group a negative pid
+/// names lives only while its leader is unreaped, and this child - whose
+/// id is the asserted pgid - is reaped only after the signal, so the
+/// signal can never name a reused or foreign pgid; and pgid > 1 keeps
+/// init (and pid 0's own group) out of range by construction.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
+    use std::io::Read;
     use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let child = cmd.spawn().expect("spawn");
-    let pgid = child.id() as libc::pid_t;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+    let mut child = cmd.spawn().expect("spawn");
+    let pgid = i32::try_from(child.id()).expect("pid fits in pid_t");
+    assert!(pgid > 1, "refusing to signal pgid {pgid}");
+    // The pipes are drained on their own threads; the Child itself stays
+    // here so only this thread ever reaps it.
+    let mut out_pipe = child.stdout.take().expect("stdout pipe");
+    let mut err_pipe = child.stderr.take().expect("stderr pipe");
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => panic!("wait failed: {e}"),
-        Err(_) => {
-            // libc, not the kill(1) binary: no PATH dependence.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-            panic!("command did not exit within {secs} s");
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Err(e) => panic!("wait failed: {e}"),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                // Signal before reap: the leader's death would dissolve
+                // the group and free the pgid for reuse.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                let status = child.wait().expect("wait after kill");
+                let stdout = out_reader.join().expect("stdout reader");
+                let stderr = err_reader.join().expect("stderr reader");
+                panic!(
+                    "command did not exit within {secs} s (killed pgid {pgid}, status {status})\
+                     stdout: {} stderr: {}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
         }
-    }
+    };
+    let stdout = out_reader.join().expect("stdout reader");
+    let stderr = err_reader.join().expect("stderr reader");
+    std::process::Output { status, stdout, stderr }
 }
 
 /// The full loop against the real tools: the seeded type errors end their
