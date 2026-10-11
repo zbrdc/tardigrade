@@ -14,6 +14,7 @@ mod random;
 mod text;
 
 use crate::api::{put_fn, set};
+use crate::clock;
 use crate::Config;
 
 /// Builds a guest string; realistic lengths always convert, so the
@@ -91,6 +92,12 @@ pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
     // reproducible (per-run state lives in the World).
     if cfg.seed.is_some() {
         math_random_override(scope, global);
+    }
+    // Virtual runs expose the timeline to the prelude, which captures it
+    // and removes it, then rebuilds Date over it (real runs keep V8's
+    // own Date untouched).
+    if cfg.clock.is_virtual() {
+        put_fn(global, scope, "__virtualDateMs", clock::virtual_date_now);
     }
 }
 

@@ -14,6 +14,7 @@
 //! never make a syscall of their own.
 
 mod api;
+mod clock;
 mod console;
 mod diag;
 mod dump;
@@ -40,10 +41,32 @@ use std::io::Write;
 use std::sync::{mpsc, Arc};
 
 use api::install;
+use clock::RunClock;
 use diag::report;
 use event_loop::{event_loop, promise_reject_callback, stopped};
 use watchdog::Watchdog;
 use world::{world_mut, World};
+
+/// The run's clock: real time, or the virtual clock of --clock=virtual
+/// (see the README's Use section for its exact semantics).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Clock {
+    /// Real time: Date reads V8's own clock and performance.now() a
+    /// monotonic Instant (the default).
+    Real,
+    /// Virtual time: Date.now(), new Date() (no argument) and
+    /// performance.now() read a clock that starts at `epoch_ms` for Date
+    /// and at 0 for performance.now(), and advances only when the event
+    /// loop jumps it to the next due timer.
+    Virtual { epoch_ms: u64 },
+}
+
+impl Clock {
+    /// True for the virtual clock.
+    pub fn is_virtual(&self) -> bool {
+        matches!(self, Clock::Virtual { .. })
+    }
+}
 
 /// Host-side run configuration.
 #[derive(Clone, Debug)]
@@ -76,6 +99,10 @@ pub struct Config {
     /// same seed draw identical sequences, different seeds differ. None
     /// (the default) keeps V8's own Math.random.
     pub seed: Option<u64>,
+    /// The guest's clock. Real (the default) keeps real time everywhere;
+    /// Virtual makes Date, performance.now and the timer timeline virtual
+    /// so runs are reproducible and timer-heavy guests finish instantly.
+    pub clock: Clock,
 }
 
 impl Default for Config {
@@ -90,6 +117,7 @@ impl Default for Config {
             preload_data: None,
             fs_quota_bytes: DEFAULT_FS_QUOTA_BYTES,
             seed: None,
+            clock: Clock::Real,
         }
     }
 }
@@ -382,7 +410,11 @@ impl Guest {
 }
 
 fn execute(source: &str, entry: &str, cfg: &Config, replies: Option<&serve::ReplySink>) -> i32 {
-    let mut world = World::new(cfg.fs_quota_bytes);
+    let clock = match cfg.clock {
+        Clock::Real => RunClock::Real(std::time::Instant::now()),
+        Clock::Virtual { epoch_ms } => RunClock::Virtual { epoch_ms, now_ms: 0 },
+    };
+    let mut world = World::new(cfg.fs_quota_bytes, clock);
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
     // Seeded runs keep the PRNG counter in the World, so concurrent runs

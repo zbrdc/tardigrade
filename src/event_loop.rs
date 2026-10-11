@@ -1,7 +1,7 @@
 //! The guest event loop: network generations, timers, microtasks, stdin.
 //! Keeps the process alive while any guest work is pending.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::diag::{rejection_text, report};
 use crate::stdin;
@@ -109,15 +109,15 @@ fn run_net(scope: &mut HandleScope) -> Option<i32> {
 
 fn run_timers(scope: &mut HandleScope) -> Option<i32> {
     loop {
-        let now = Instant::now();
+        let now = world_mut(scope).clock.now_ms();
         let idx = {
             let world = world_mut(scope);
             world
                 .timers
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.when <= now)
-                .min_by_key(|(_, t)| t.when)
+                .filter(|(_, t)| t.when_ms <= now)
+                .min_by_key(|(_, t)| t.when_ms)
                 .map(|(i, _)| i)
         };
         let idx = idx?;
@@ -141,7 +141,10 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
         }
         let world = world_mut(scope);
         if repeat && !world.running_timer.self_cleared() {
-            timer.when = Instant::now() + Duration::from_millis(interval_ms.max(1));
+            timer.when_ms = world
+                .clock
+                .now_ms()
+                .saturating_add(interval_ms.max(1));
             world.timers.push(timer);
         }
     }
@@ -261,10 +264,11 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
                 !world.stdin_waiters.is_empty(),
             )
         };
-        if !has_timers && !has_net && !has_stdin {
-            break;
+        match park_between_turns(scope, has_timers, has_net, has_stdin) {
+            Park::Done => break,
+            Park::Spin => continue,
+            Park::Sleep(wait) => std::thread::sleep(wait),
         }
-        std::thread::sleep(wake_deadline(scope, has_timers, has_stdin));
     }
     // Final sweep: continuations queued by the very last stdin delivery
     // still count, and a termination that landed as the loop wound down
@@ -282,6 +286,50 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     }
 }
 
+/// What the loop does at a turn boundary.
+enum Park {
+    /// Nothing is pending: leave the loop.
+    Done,
+    /// Go straight to the next turn without sleeping.
+    Spin,
+    /// Sleep this long in real time.
+    Sleep(Duration),
+}
+
+/// Decides the turn boundary: exit when nothing is pending, and otherwise
+/// when (and whether) to wait. Real runs sleep until the next timer or the
+/// stdin poll cadence. Virtual time never sleeps to wait for a timer:
+/// runnable network work is delivered on the next turn as-is, and with no
+/// runnable work left the clock jumps straight to the next due timer, so a
+/// timer-heavy run finishes without real waiting. Only a lone pending
+/// stdin read waits, in real time: chunks arrive on the real clock, the
+/// read stays pending until one does, and the clock has no deadline to
+/// jump to anyway.
+fn park_between_turns(
+    scope: &mut HandleScope,
+    has_timers: bool,
+    has_net: bool,
+    has_stdin: bool,
+) -> Park {
+    if !has_timers && !has_net && !has_stdin {
+        return Park::Done;
+    }
+    if world_mut(scope).clock.is_virtual() {
+        if has_net {
+            return Park::Spin;
+        }
+        if has_timers {
+            let world = world_mut(scope);
+            if let Some(next) = world.timers.iter().map(|t| t.when_ms).min() {
+                world.clock.advance_to(next);
+            }
+            return Park::Spin;
+        }
+        return Park::Sleep(Duration::from_millis(2));
+    }
+    Park::Sleep(wake_deadline(scope, has_timers, has_stdin))
+}
+
 /// When to wake for the next loop turn: poll stdin at 2 ms while a reader
 /// waits, else at most 50 ms, never past the earliest timer. The 50 ms
 /// ceiling keeps an otherwise idle run responsive to the watchdog: a far
@@ -290,15 +338,22 @@ fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> 
     let cap = if has_stdin { 2 } else { 50 };
     let mut wake = Duration::from_millis(cap);
     if has_timers {
-        let earliest = world_mut(scope)
+        let world = world_mut(scope);
+        let now = world.clock.now_ms();
+        // A deadline already reached (or saturated past u64) leaves the
+        // poll cadence in charge.
+        if let Some(till) = world
             .timers
             .iter()
-            .map(|t| t.when)
+            .map(|t| t.when_ms)
             .min()
-            .unwrap();
-        let till = earliest.saturating_duration_since(Instant::now());
-        if till < wake {
-            wake = till;
+            .unwrap_or(u64::MAX)
+            .checked_sub(now)
+        {
+            let till = Duration::from_millis(till);
+            if till < wake {
+                wake = till;
+            }
         }
     }
     wake

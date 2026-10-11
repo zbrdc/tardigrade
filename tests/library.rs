@@ -42,6 +42,38 @@ fn a_library_cap_below_the_minimum_is_clamped_up() {
     assert_eq!(v8vm::run(src, "clamped.js", &cfg), 137);
 }
 
+#[test]
+fn virtual_clock_semantics_hold_through_the_library_api() {
+    // Config.clock is the same knob as --clock=virtual: the Date reads,
+    // performance.now and the timer jump all behave identically in an
+    // embedded run, and the 10 s guest finishes far inside its 5 s
+    // wall-clock timeout (it would be killed with 124 otherwise).
+    let src = r#"
+        const t = Date.now();
+        const startOk = t === 100 && performance.now() === 0
+          && new Date().getTime() === 100 && new Date(5).getTime() === 5
+          && Date() === new Date().toString();
+        setTimeout(() => {
+          const firedOk = Date.now() - t === 10000 && performance.now() === 10000
+            && new Date().getTime() === 10100;
+          vm.exit(startOk && firedOk ? 0 : 7);
+        }, 10000);
+    "#;
+    let cfg = Config {
+        timeout_ms: 5000,
+        // A small heap keeps this run's per-isolate reservations modest:
+        // the library tests run many isolates in parallel inside one
+        // process, and under a bounded address space each extra
+        // default-cap isolate adds GBs of virtual reservations (see the
+        // README's Guarantees and limits).
+        heap_mb: 32,
+        stdin_consumed: true,
+        clock: v8vm::Clock::Virtual { epoch_ms: 100 },
+        ..Config::new()
+    };
+    assert_eq!(v8vm::run(src, "vclock-lib.js", &cfg), 0);
+}
+
 /// Joins a guest thread with a bound, so a guest whose watchdog never fires
 /// fails the test instead of hanging it.
 fn join_bounded(handle: std::thread::JoinHandle<i32>, secs: u64) -> i32 {

@@ -149,3 +149,36 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
 }
+
+// --clock=virtual: Date must read the run's virtual clock, never the
+// host clock. The host installs __virtualDateMs only for virtual runs;
+// capture it like the encoder hooks above, delete it, and rebuild Date
+// over the original constructor, which stays reachable only from this
+// closure - no date object, prototype or subclass can hand the guest a
+// constructor bound to the host clock.
+if (typeof globalThis.__virtualDateMs === "function") {
+  const __vnow = globalThis.__virtualDateMs;
+  delete globalThis.__virtualDateMs;
+  const HostDate = Date;
+  // A plain function, not a class, so Date() without new still returns
+  // the time string; Reflect.construct keeps new.target (subclasses,
+  // prototype changes) honest. An explicit argument is passed through
+  // untouched, so new Date(ms) (and every other form) stays exact.
+  const VDate = function Date(...args) {
+    if (new.target === undefined) {
+      // Date() as a function ignores its arguments (ECMA-262 21.4.2.1)
+      // and returns the current time as a string - here the virtual one.
+      return `${new HostDate(__vnow())}`;
+    }
+    return Reflect.construct(HostDate, args.length ? args : [__vnow()], new.target);
+  };
+  VDate.prototype = HostDate.prototype;
+  // The statics (UTC, parse) are inherited from the original; now is
+  // the virtual clock, and Date.prototype.constructor names the visible
+  // constructor instead of the captured original.
+  Object.setPrototypeOf(VDate, HostDate);
+  HostDate.prototype.constructor = VDate;
+  VDate.now = () => __vnow();
+  Object.defineProperty(VDate, "length", { value: 7 });
+  globalThis.Date = VDate;
+}

@@ -8,18 +8,21 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::clock::RunClock;
 use crate::fs::RamFs;
 use crate::heap::AllocState;
 use crate::stdin::StdinSub;
 use crate::timers::RunningTimer;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
-/// survives between loop turns.
+/// survives between loop turns. The deadline sits on the run's clock
+/// timeline (ms since the run started), so real and virtual runs share
+/// one scheduling path.
 pub(crate) struct Timer {
     pub(crate) id: u64,
     pub(crate) repeat: bool,
     pub(crate) interval_ms: u64,
-    pub(crate) when: Instant,
+    pub(crate) when_ms: u64,
     pub(crate) cb: v8::Global<v8::Function>,
 }
 
@@ -170,9 +173,10 @@ pub(crate) struct World {
     /// Math.random counter for seeded runs (Config.seed); None leaves
     /// V8's own Math.random in place.
     pub(crate) random_state: Option<u64>,
-    /// Zero point of this run's performance.now(): the moment the run's
-    /// state was created, i.e. the start of the run.
-    pub(crate) perf_origin: std::time::Instant,
+    /// The run's time source: real, or the virtual clock that advances
+    /// only when the event loop jumps it to the next due timer.
+    /// performance.now and the timer deadlines read it.
+    pub(crate) clock: RunClock,
     /// The timer whose callback is on the stack, if any.
     pub(crate) running_timer: RunningTimer,
     exit_code: AtomicI32,
@@ -193,7 +197,7 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(fs_quota_bytes: u64) -> Self {
+    pub(crate) fn new(fs_quota_bytes: u64, clock: RunClock) -> Self {
         World {
             fs: RamFs::new(fs_quota_bytes),
             timers: Vec::new(),
@@ -205,7 +209,7 @@ impl World {
             stdin_eof: false,
             stdin_sub: None,
             random_state: None,
-            perf_origin: Instant::now(),
+            clock,
             running_timer: RunningTimer::new(),
             exit_code: AtomicI32::new(-1),
             term: Arc::new(Termination::new()),
@@ -360,11 +364,11 @@ mod tests {
 
     #[test]
     fn the_first_exit_code_wins() {
-        let w = World::new(0);
+        let w = World::new(0, RunClock::Real(Instant::now()));
         w.set_exit_code(3);
         w.set_exit_code(4);
         assert_eq!(w.exit_code(), 3);
-        let w2 = World::new(0);
+        let w2 = World::new(0, RunClock::Real(Instant::now()));
         w2.set_exit_code(0);
         w2.set_exit_code(9);
         assert_eq!(w2.exit_code(), 0, "an explicit 0 also wins");

@@ -1,7 +1,5 @@
 //! setTimeout/setInterval/clearTimeout/clearInterval.
 
-use std::time::{Duration, Instant};
-
 use crate::diag::throw;
 use crate::guest_cb;
 use crate::world::{world_mut, Timer};
@@ -71,11 +69,17 @@ fn set_timer_common(
         let world = world_mut(scope);
         let id = world.next_timer_id;
         world.next_timer_id += 1;
+        // Deadline on the run's clock timeline; saturating, because a
+        // guest can ask for a delay no real or virtual clock reaches.
+        let when_ms = world
+            .clock
+            .now_ms()
+            .saturating_add(interval_ms.max(1));
         world.timers.push(Timer {
             id,
             repeat,
             interval_ms,
-            when: Instant::now() + Duration::from_millis(interval_ms.max(1)),
+            when_ms,
             cb,
         });
         id

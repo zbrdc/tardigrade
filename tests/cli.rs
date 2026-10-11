@@ -1829,6 +1829,199 @@ fn serve_answers_a_final_command_without_a_trailing_newline_and_exits() {
     assert_eq!(r.stdout, "2\n");
 }
 
+// ---- --clock=virtual ----
+
+/// run_js_with plus a wall-time bound on the whole run, so a virtual-time
+/// regression that waits in real time fails the test instead of slowing it.
+fn run_js_timed(flags: &[&str], name: &str, source: &str) -> (Run, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let r = run_js_with(flags, name, source);
+    (r, start.elapsed())
+}
+
+#[test]
+fn virtual_time_fires_a_10s_timer_instantly_and_exactly() {
+    let (r, took) = run_js_timed(
+        &["--clock=virtual", "--timeout=5000"],
+        "vclock-10s",
+        "const t = Date.now();\n         setTimeout(() => console.log('fired', Date.now() - t), 10000);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "fired 10000\n");
+    assert!(took < std::time::Duration::from_secs(1), "took {:?}", took);
+}
+
+#[test]
+fn virtual_time_interval_ticks_advance_exactly() {
+    let (r, took) = run_js_timed(
+        &["--clock=virtual", "--timeout=5000"],
+        "vclock-interval",
+        "const t = Date.now(); let n = 0;\n         const iv = setInterval(() => {\n           n++; console.log('tick', n, Date.now() - t);\n           if (n === 3) clearInterval(iv);\n         }, 250);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "tick 1 250\ntick 2 500\ntick 3 750\n");
+    assert!(took < std::time::Duration::from_secs(1), "took {:?}", took);
+}
+
+#[test]
+fn virtual_time_orders_nested_and_interleaved_timers() {
+    let r = run_js_with(
+        &["--clock=virtual", "--timeout=5000"],
+        "vclock-order",
+        "setTimeout(() => { console.log('a', Date.now());\n                            setTimeout(() => console.log('a2', Date.now()), 10); }, 100);\n         setTimeout(() => console.log('b', Date.now()), 50);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "b 50\na 100\na2 110\n");
+}
+
+#[test]
+fn virtual_time_performance_now_is_the_elapsed_virtual_ms() {
+    let r = run_js_with(
+        &["--clock=virtual", "--epoch=1000", "--timeout=5000"],
+        "vclock-perf",
+        "console.log(performance.now(), Date.now());\n         setTimeout(() => console.log(performance.now(), Date.now()), 10000);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "0 1000\n10000 11000\n");
+}
+
+#[test]
+fn virtual_time_epoch_is_honored_by_every_date_read() {
+    // 1234567890123 ms is 2009-02-13 UTC: far from the real clock, so a
+    // host-clock leak through any Date form shows up as a wrong value.
+    let r = run_js_with(
+        &["--clock=virtual", "--epoch=1234567890123", "--timeout=5000"],
+        "vclock-epoch",
+        "const E = 1234567890123;\n         console.log(Date.now() === E, new Date().getTime() === E);\n         console.log(new Date().getUTCFullYear(), new Date(12345).getTime() === 12345);\n         console.log(Date() === new Date().toString(), typeof Date());\n         setTimeout(() => console.log('t', Date.now() - E), 500);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "true true\n2009 true\ntrue string\nt 500\n");
+}
+
+#[test]
+fn virtual_date_is_rebuilt_over_the_original() {
+    // The override must not hand the guest the original constructor (the
+    // host clock) through any of the usual object-graph paths, and it
+    // must keep the Date surface (function form, subclassing, statics)
+    // shaped like the platform's.
+    let r = run_js_with(
+        &["--clock=virtual", "--epoch=77", "--timeout=5000"],
+        "vclock-date-shape",
+        "const E = 77;\n         console.log(new Date().constructor === Date, Date.name, Date.length);\n         console.log(Object.getPrototypeOf(new Date()) === Date.prototype);\n         console.log(typeof globalThis.__virtualDateMs);\n         class D extends Date {}\n         console.log(new D(5).getTime() === 5, new D().getTime() === E, D.now() === E);\n         console.log(Date.UTC(1970, 0, 1) === 0, typeof Date.parse);\n         console.log(Date(999) === Date(), new Date().getUTCFullYear());",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    // 1970-01-01T00:00:00.077Z under epoch 77 ms, in UTC terms.
+    assert_eq!(
+        r.stdout,
+        "true Date 7\ntrue\nundefined\ntrue true true\ntrue function\ntrue 1970\n"
+    );
+}
+
+#[test]
+fn virtual_time_is_fully_deterministic_with_a_seed() {
+    // Math.random (--seed), Date.now/performance.now and the timer
+    // sequence all feed the output; two runs must match byte for byte.
+    let src = "console.log('r', Math.random(), Math.random());\n              console.log('d', Date.now(), performance.now());\n              setTimeout(() => console.log('a', Math.random(), Date.now()), 100);\n              setTimeout(() => console.log('b', Math.random(), Date.now()), 50);\n              const iv = setInterval(() => console.log('i', Math.random(), Date.now()), 30);\n              setTimeout(() => { clearInterval(iv); vm.exit(0); }, 120);";
+    let flags = ["--clock=virtual", "--epoch=99", "--seed=7", "--timeout=5000"];
+    let a = run_js_with(&flags, "vclock-det-a", src);
+    let b = run_js_with(&flags, "vclock-det-b", src);
+    assert_eq!(a.code, 0, "stderr: {}", a.stderr);
+    assert_eq!(b.code, 0, "stderr: {}", b.stderr);
+    assert_eq!(a.stdout, b.stdout, "runs must be identical");
+    assert!(a.stdout.contains("d 99 0"));
+}
+
+#[test]
+fn virtual_time_timeout_still_kills_a_busy_loop_with_124() {
+    // The watchdog measures real time: a guest that busy-loops under
+    // virtual time is stopped exactly like a real-time one.
+    let path = script("vclock-spin", "for (;;) {}");
+    let r = v8vm_bounded(
+        &["--clock=virtual", "--timeout=150", path.to_str().unwrap()],
+        b"",
+        std::time::Duration::from_secs(10),
+    );
+    assert_eq!(r.code, 124);
+}
+
+#[test]
+fn virtual_time_does_not_wait_for_a_pending_stdin_read() {
+    // The clock jumps while a stdin read is pending: the read stays
+    // pending (nothing real has arrived), the timer fires at its virtual
+    // deadline anyway, and the run ends without waiting for stdin. stdin
+    // stays open the whole time, so the read truly never resolves.
+    let path = script(
+        "vclock-stdin",
+        "vm.stdin.read().then((c) => console.log('stdin', JSON.stringify(c)));\n         setTimeout(() => { console.log('timer', Date.now()); vm.exit(0); }, 1000);",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(["--clock=virtual", "--timeout=5000", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let hold = child.stdin.take().unwrap(); // held open: no data, no EOF
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(child.wait_with_output()).unwrap());
+    let out = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("guest finished without waiting for stdin")
+        .expect("wait v8vm");
+    drop(hold);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "timer 1000\n");
+}
+
+#[test]
+fn virtual_time_net_delivery_does_not_advance_the_clock() {
+    // Net delivery is real and unchanged: messages are delivered on the
+    // next loop turn without moving the virtual clock; only timers do.
+    // The second send is queued from inside a timer callback, so it is
+    // pending at the loop's turn boundary - exactly where a virtual-time
+    // implementation would be tempted to advance the clock.
+    let r = run_js_with(
+        &["--clock=virtual", "--timeout=5000"],
+        "vclock-net",
+        "const p = vm.net.port();\n         vm.net.listen(p, (m) => {\n           console.log('net', Date.now(), m);\n           if (m === 'x') setTimeout(() => vm.net.send(p, p, 'y'), 100);\n         });\n         vm.net.send(p, p, 'x');",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "net 0 x\nnet 100 y\n");
+}
+
+#[test]
+fn virtual_time_flags_are_validated() {
+    let path = script("vclock-flags", "");
+    let entry = path.to_str().unwrap();
+    assert_eq!(v8vm(&["--clock=real", entry], b"").code, 2);
+    assert_eq!(v8vm(&["--clock=virtual", "--epoch=abc", entry], b"").code, 2);
+    assert_eq!(v8vm(&["--epoch=5", entry], b"").code, 2);
+    assert_eq!(v8vm(&["--clock=virtual", "--epoch=0", entry], b"").code, 0);
+}
+
+#[test]
+fn real_time_is_the_default_and_reads_the_host_clock() {
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let r = run_js(
+        "vclock-real-default",
+        "console.log(Date.now(), Math.floor(performance.now()), typeof globalThis.__virtualDateMs, typeof Date());",
+    );
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut it = r.stdout.split_whitespace();
+    let now: u64 = it.next().unwrap().parse().unwrap();
+    let perf: u64 = it.next().unwrap().parse().unwrap();
+    assert!(now >= before && now <= after, "Date.now is the host clock: {}", now);
+    assert!(perf < 60_000, "performance.now started with the run: {}", perf);
+    assert_eq!(it.collect::<Vec<_>>(), ["undefined", "string"]);
+}
+
 // ---- --sandbox (OS self-containment) ----
 
 const SANDBOX_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -2058,6 +2251,21 @@ mod sandbox_run {
         let r = v8vm_bounded_started(&args, commands, SANDBOX_LIMIT, wait_for_seccomp);
         assert_eq!(r.code, 0, "stderr: {}", r.stderr);
         assert_eq!(r.stdout, "2\n5\n");
+    }
+
+    /// The virtual clock works under the sandbox layers too: the loop
+    /// jump, the Date override and the epoch all behave the same.
+    #[test]
+    fn sandbox_virtual_time_runs_and_jumps() {
+        let test = "sandbox_virtual_time_runs_and_jumps";
+        let path = script(
+            "sb-vclock",
+            "const E = 4242;\n             console.log('start', Date.now() === E, performance.now());\n             setTimeout(() => { console.log('fired', Date.now() - E); vm.exit(0); }, 10000);",
+        );
+        let args = ["--clock=virtual", "--epoch=4242", "--timeout=5000", path.to_str().unwrap()];
+        let Some(r) = sandboxed(test, &args, b"") else { return; };
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert_eq!(r.stdout, "start true 0\nfired 10000\n");
     }
 
     /// The web-platform globals work under the sandbox layers too (the
