@@ -181,6 +181,14 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
     match result {
         Some(_) => {
             drop(tc);
+            // A vm.exit inside the script can be swallowed along with its
+            // termination; the guest's exit code still wins over the
+            // checkpoint decision (Node: process.exit beats a pending
+            // rejection).
+            let exit = world_mut(scope).exit_code();
+            if exit >= 0 {
+                return exit;
+            }
             // End of the entry tick: V8 has drained the script's
             // microtasks, so the checkpoint decision applies now, before
             // any timer or network turn can rescue a rejection.

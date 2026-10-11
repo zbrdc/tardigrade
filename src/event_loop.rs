@@ -194,8 +194,12 @@ pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) 
 }
 
 /// After a microtask checkpoint: the first (lowest seq) rejection still
-/// missing a handler fails the run with 1.
+/// missing a handler fails the run with 1. A guest exit code (vm.exit)
+/// outranks the decision, matching Node's process.exit.
 pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
+    if world_mut(scope).exit_code() >= 0 {
+        return None;
+    }
     let first = {
         let world = world_mut(scope);
         // Buckets keep insertion order, so each bucket's front is its

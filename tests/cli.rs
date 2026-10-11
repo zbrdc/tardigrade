@@ -160,6 +160,15 @@ fn a_catch_in_a_later_timer_cannot_rescue_within_the_turn() {
 }
 
 #[test]
+fn vm_exit_wins_over_a_pending_rejection() {
+    // Node: process.exit(0) after Promise.reject(1) still exits 0; the
+    // rejection never reaches its tick decision.
+    let r = run_js("rej-then-exit", "Promise.reject(1); vm.exit(0);");
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
 fn a_rejection_from_a_stdin_continuation_fails_the_run() {
     let path = script(
         "rej-stdin",
