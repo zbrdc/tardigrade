@@ -243,7 +243,7 @@ fn atob_and_btoa_fail_like_browsers() {
 // ---- structuredClone ----
 
 #[test]
-fn structured_clone_round_trips_builtins_and_cyles() {
+fn structured_clone_round_trips_builtins_and_cycles() {
     ok(
         "sc-builtins",
         r#"
@@ -708,8 +708,15 @@ fn decoder_options_labels_and_types_convert_like_webidl() {
         const e = new TextDecoder();
         console.log(JSON.stringify(e.decode(new Uint8Array([0xF0]), { stream: {} })),
                     JSON.stringify(e.decode()));
+        // A label converts with the ToString hint: toString beats valueOf.
+        console.log(new TextDecoder({ valueOf() { return "x"; }, toString() { return "utf-8"; } }).encoding);
+        // The constant encoding getters brand-check their receiver.
+        for (const C of [TextEncoder, TextDecoder]) {
+          const get = Object.getOwnPropertyDescriptor(C.prototype, "encoding").get;
+          try { get.call({}); console.log("no brand"); } catch (err) { console.log(err.constructor.name); }
+        }
         "#,
-        "false a\nTypeError\n\"\" \"\u{fffd}\"\n\"\" \"\u{fffd}\"\n",
+        "false a\nTypeError\n\"\" \"\u{fffd}\"\n\"\" \"\u{fffd}\"\nutf-8\nTypeError\nTypeError\n",
     );
 }
 
@@ -815,6 +822,140 @@ fn cloning_a_buffer_beyond_memory_reports_data_clone_error() {
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert!(
         r.stdout.starts_with("caught DataCloneError"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+#[test]
+fn every_intrinsic_the_decoder_uses_survives_being_replaced() {
+    // The ov2 probe shape: swap each intrinsic the prelude classes touch
+    // for a throwing boom, run the whole decoder surface, restore, and
+    // require the same results as with the real ones.
+    ok(
+        "td-intrinsic-overrides",
+        r#"
+        const DP = Object.defineProperty, GOPD = Object.getOwnPropertyDescriptor;
+        const boom = function () { throw new Error("HIJACKED"); };
+        const R = Uint8Array;
+        const d = new TextDecoder();
+        const df = new TextDecoder("utf-8", { fatal: true });
+        const e = new TextEncoder();
+        const bytes = new R([0xF0, 0x9F, 0x98]);
+        const rest = new R([0x80, 0x41]);
+        const bad = new R([0xFF]);
+        const ascii = new R([104, 105]);
+        const targets = [
+          [globalThis, "Uint8Array"], [globalThis, "ArrayBuffer"], [globalThis, "SharedArrayBuffer"],
+          [globalThis, "String"], [globalThis, "TypeError"], [globalThis, "RangeError"],
+          [globalThis, "Symbol"], [globalThis, "Object"], [globalThis, "Array"], [globalThis, "Set"],
+          [Object, "defineProperty"], [Object, "getOwnPropertyNames"],
+          [Object, "getOwnPropertyDescriptor"], [Array, "isArray"], [ArrayBuffer, "isView"],
+          [String.prototype, "replace"], [String.prototype, "toLowerCase"], [Set.prototype, "has"],
+        ];
+        const run = () => {
+          const out = [];
+          const t = (n, f) => { try { out.push(n + "=" + JSON.stringify(f())); }
+                               catch (x) { out.push(n + "!" + (x && x.message)); } };
+          t("s1", () => d.decode(bytes, { stream: true }));
+          t("s2", () => d.decode(rest));
+          t("fatal", () => df.decode(bad));
+          t("badinput", () => d.decode("text"));
+          t("enc", () => e.encode("h").length);
+          t("encInto", () => { const u = new R(4); return e.encodeInto("ab", u).written; });
+          t("ctor", () => new TextDecoder("utf-8").encoding);
+          t("lbl", () => new TextDecoder("latin1"));
+          return out.join(" ");
+        };
+        const base = run();
+        if (base.includes("HIJACKED")) { console.log("baseline broken:", base); vm.exit(1); }
+        for (const [o, k] of targets) {
+          const desc = GOPD(o, k);
+          DP(o, k, { value: boom, configurable: true, writable: true });
+          const now = run();
+          if (desc) DP(o, k, desc); else delete o[k];
+          if (now !== base) { console.log("DIFFERS under", k, ":", now, "|", base); vm.exit(1); }
+        }
+        console.log("stable", base.length > 0);
+        "#,
+        "stable true\n",
+    );
+}
+
+#[test]
+fn atob_decodes_unpadded_input() {
+    ok(
+        "atob-unpadded",
+        r#"
+        console.log(JSON.stringify(atob("QQ")), JSON.stringify(atob("QUI")));
+        console.log(JSON.stringify(atob("AA")), JSON.stringify(atob("AAA")));
+        console.log(JSON.stringify(atob(" Q Q ")));
+        const e = new TextEncoder();
+        // An unpadded round trip: strip the padding, decode, compare bytes.
+        for (const s of ["f", "fo", "foo", "foob"]) {
+          const b64 = btoa(s).replace(/=+$/, "");
+          if (Buffer_check(b64, s)) console.log(s, b64);
+        }
+        function Buffer_check(b64, s) {
+          const bytes = atob(b64);
+          const want = e.encode(s);
+          if (bytes.length !== want.length) return false;
+          for (let i = 0; i < bytes.length; i++)
+            if (bytes.charCodeAt(i) !== want[i]) return false;
+          return true;
+        }
+        "#,
+        "\"A\" \"AB\"\n\"\\u0000\" \"\\u0000\\u0000\"\n\"A\"\nf Zg\nfo Zm8\nfoo Zm9v\nfoob Zm9vYg\n",
+    );
+}
+
+/// Memory-heavy (a 300 MB string): run with `make test-heavy`. A
+/// malformed unit first: pass 1 rejects it before any allocation, so
+/// even under a tight address-space cap the guest sees
+/// InvalidCharacterError, never a RangeError or an abort.
+#[ignore]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn atob_with_a_bad_first_unit_fails_before_allocating() {
+    let path = script(
+        "atob-bad-first",
+        r#"const s = "!" + "A".repeat(300 * 1048576);
+           try { console.log("atob", atob(s).length); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm_capped(
+        1_800_000_000,
+        &["--memory=1024", path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("caught InvalidCharacterError"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+/// Memory-heavy (a 300 MB string): run with `make test-heavy`. The same
+/// holds when the malformed unit is the last one.
+#[ignore]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn atob_with_a_bad_last_unit_fails_before_allocating() {
+    let path = script(
+        "atob-bad-last",
+        r#"const s = "A".repeat(300 * 1048576) + "!";
+           try { console.log("atob", atob(s).length); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm_capped(
+        1_800_000_000,
+        &["--memory=1024", path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("caught InvalidCharacterError"),
         "stdout: {}",
         r.stdout
     );

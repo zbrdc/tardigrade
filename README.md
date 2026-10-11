@@ -173,9 +173,12 @@ Details and limits of the web APIs above:
   on instances).
 - atob / btoa: btoa accepts code units 0..0xFF only; atob decodes
   forgiving-base64 (ASCII whitespace ignored, padding only at the end,
-  trailing bits unchecked). Both throw Errors named
-  InvalidCharacterError, require their argument, and throw RangeError
-  when the result cannot be allocated or exceeds V8's string limit.
+  unpadded tails decoded to their whole bytes, trailing bits
+  unchecked). Both throw Errors named InvalidCharacterError, require
+  their argument, and throw RangeError when the result cannot be
+  allocated or exceeds V8's string limit; atob validates its whole
+  input before allocating anything, so a malformed unit anywhere fails
+  as InvalidCharacterError even under memory pressure.
 - structuredClone handles Map, Set, Date, RegExp, typed arrays and their
   views, ArrayBuffers, cycles and shared references inside one clone.
   Functions, symbols, WebAssembly modules and SharedArrayBuffers throw

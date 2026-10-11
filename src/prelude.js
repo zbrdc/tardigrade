@@ -27,10 +27,28 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
   const Str = String;
   const TErr = TypeError;
   const RErr = RangeError;
-  const UTF8_LABELS = new Set([
+  // Label handling must not depend on mutable builtins at call time
+  // (String.prototype methods, Set, RegExp are all replaceable), so the
+  // trim and ASCII-lowercase are hand-rolled over captured code-unit
+  // readers, and the label table is a plain indexed array.
+  const cca = String.prototype.charCodeAt;
+  const fromC = String.fromCharCode;
+  const UTF8_LABELS = [
     "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8",
     "utf-8", "utf8", "x-unicode20utf8",
-  ]);
+  ];
+  const isWs = (c) => c === 32 || c === 9 || c === 10 || c === 12 || c === 13;
+  const normLabel = (s) => {
+    let a = 0, b = s.length;
+    while (a < b && isWs(cca.call(s, a))) a++;
+    while (b > a && isWs(cca.call(s, b - 1))) b--;
+    let out = "";
+    for (let i = a; i < b; i++) {
+      const c = cca.call(s, i);
+      out += fromC(c >= 65 && c <= 90 ? c + 32 : c);
+    }
+    return out;
+  };
   // WebIDL-style option handling: null/undefined is the empty dictionary,
   // functions are callable objects and count, anything else is a TypeError.
   const asOptions = (options) => {
@@ -41,7 +59,10 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
   };
 
   class TextEncoder {
-    get encoding() { return "utf-8"; }
+    get encoding() {
+      if (!(this instanceof TextEncoder)) throw new TErr("Illegal invocation");
+      return "utf-8";
+    }
     encode(s = "") {
       if (!(this instanceof TextEncoder)) throw new TErr("Illegal invocation");
       return __encode(s);
@@ -58,10 +79,12 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
     #carry;
     #bom;
     constructor(label = "utf-8", options = null) {
-      // label + "" converts like Str() and throws on a symbol, as the
-      // platform's string conversion does.
-      const text = (label + "").replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "").toLowerCase();
-      if (!UTF8_LABELS.has(text))
+      // A template literal converts with the ToString hint (toString
+      // over valueOf) and throws on a symbol, like the platform.
+      const text = normLabel(`${label}`);
+      let known = false;
+      for (let i = 0; i < UTF8_LABELS.length; i++) known = known || UTF8_LABELS[i] === text;
+      if (!known)
         throw new RErr(`The "${Str(label)}" encoding is not supported`);
       const o = asOptions(options);
       this.#fatal = !!o.fatal;
@@ -100,7 +123,10 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
       if (!stream) this.#reset();
       return r.text;
     }
-    get encoding() { return "utf-8"; }
+    get encoding() {
+      if (!(this instanceof TextDecoder)) throw new TErr("Illegal invocation");
+      return "utf-8";
+    }
     get fatal() { return this.#fatal; }
     get ignoreBOM() { return this.#ignoreBOM; }
     #reset() { this.#carry = new U8(0); this.#bom = true; }

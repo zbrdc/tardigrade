@@ -373,7 +373,8 @@ fn decode_chunk(
     opts: &DecodeOpts,
     out: &mut Vec<u8>,
 ) -> Result<(), DecodeFail> {
-    // The carry never exceeds three bytes, so this concat is bounded.
+    // Bounded by construction: the carry is at most three bytes and the
+    // chunk is one decode piece (at most 64 KiB).
     let mut joined = Vec::new();
     if !state.carry.is_empty() {
         joined
@@ -461,6 +462,9 @@ impl ChunkSrc {
     /// None when the argument is not a BufferSource (decode then throws
     /// TypeError). A detached buffer reads as empty.
     fn from_arg(v: &v8::Local<v8::Value>) -> Option<ChunkSrc> {
+        // The JS class applies its default before calling, so undefined
+        // does not normally reach here; the arm keeps a direct helper
+        // call reading as empty input rather than a type error.
         if v.is_undefined() {
             return Some(ChunkSrc::Empty);
         }

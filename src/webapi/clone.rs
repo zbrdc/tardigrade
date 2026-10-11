@@ -169,7 +169,7 @@ guest_cb!(structured_clone, |args, rv, scope| {
     }
     match de.read_value(context) {
         Some(v) => {
-            if buffer_mismatch(&mut tc, value, v) {
+            if buffer_mismatch(value, v) {
                 return throw_named(
                     &mut tc,
                     "DataCloneError",
@@ -185,12 +185,11 @@ guest_cb!(structured_clone, |args, rv, scope| {
 /// True when a buffer-shaped value came back a different size than its
 /// source. V8's serializer can fail its own wire allocation silently
 /// under memory pressure and hand back a truncated buffer; a clone like
-/// that must surface as an error, never as wrong data.
-fn buffer_mismatch(
-    scope: &mut v8::HandleScope,
-    orig: v8::Local<v8::Value>,
-    cloned: v8::Local<v8::Value>,
-) -> bool {
+/// that must surface as an error, never as wrong data. Only the
+/// top-level value is checked: buffers nested deeper have no cheap
+/// oracle, and the top level is where a whole-buffer clone is asked for
+/// by far the most often.
+fn buffer_mismatch(orig: v8::Local<v8::Value>, cloned: v8::Local<v8::Value>) -> bool {
     let size = |v: v8::Local<v8::Value>| -> Option<usize> {
         if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(v) {
             return Some(buffer.byte_length());
@@ -199,13 +198,7 @@ fn buffer_mismatch(
             .ok()
             .map(|view| view.byte_length())
     };
-    match (size(orig), size(cloned)) {
-        (Some(a), Some(b)) => {
-            let _ = scope;
-            a != b
-        }
-        _ => false,
-    }
+    matches!((size(orig), size(cloned)), (Some(a), Some(b)) if a != b)
 }
 
 /// Handles a failed write: guest exceptions (a getter that threw while
