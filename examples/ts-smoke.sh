@@ -10,9 +10,11 @@
 set -u
 OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
-# The same command variables as the loop itself, so an override here and
-# there is one setting (each may be several words).
-TSC_RS=${TARDIGRADE_TSC_RS:-npx -y tsc-rs@0.3.0}
+# The same command variables and the same pin (examples/ts-pin.sh) as the
+# loop itself, so an override here and there is one setting (each command
+# may be several words).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ts-pin.sh"
+TSC_RS=${TARDIGRADE_TSC_RS:-npx -y $TSC_RS_PKG}
 TSC=${TARDIGRADE_TSC:-tsc}
 
 find_bun() {

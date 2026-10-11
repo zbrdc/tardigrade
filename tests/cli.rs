@@ -2575,11 +2575,29 @@ fn runs_on_host(tool: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// A type checker is usable when a bounded probe really runs it - the
-/// same probe as examples/ts-smoke.sh: npx that cannot fetch tsc-rs
-/// (offline, no cache) with no tsc is a skip, not a confusing failure.
+/// The pinned tsc-rs package, the same default examples/ts-pin.sh reads
+/// through TARDIGRADE_TSC_RS_PKG; every test passes it on to the scripts
+/// through that variable, so the probes here and the loop can never
+/// disagree about which checker runs.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn checker_runnable(primary: &str, fallback: &str) -> bool {
+const TSC_RS_PKG: &str = "tsc-rs@0.3.0";
+
+/// The primary checker command built from the pin, exactly as
+/// examples/agent-loop-ts.sh builds it - including the
+/// TARDIGRADE_TSC_RS_PKG override, so a test forced onto another pin
+/// probes and runs the same checker the scripts would.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn tsc_rs_cmd() -> String {
+    let pkg = std::env::var("TARDIGRADE_TSC_RS_PKG").unwrap_or_else(|_| TSC_RS_PKG.to_string());
+    format!("npx -y {pkg}")
+}
+
+/// The first checker command that really runs - the same bounded probe
+/// and the same order (tsc-rs fetched by npx, then tsc) as the loop, so a
+/// test gated here runs the checker that would actually decide. None
+/// means no usable checker: a skip, not a confusing later failure.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn usable_checker(primary: &str, fallback: &str) -> Option<String> {
     let probe = |cmd: &str| {
         Command::new("timeout")
             .arg("60")
@@ -2591,7 +2609,13 @@ fn checker_runnable(primary: &str, fallback: &str) -> bool {
             .output()
             .is_ok_and(|o| o.status.success())
     };
-    probe(primary) || probe(fallback)
+    if probe(primary) {
+        Some(primary.to_string())
+    } else if probe(fallback) {
+        Some(fallback.to_string())
+    } else {
+        None
+    }
 }
 
 /// bun for the loop: $BUN, then PATH, then the default install location -
@@ -2744,16 +2768,11 @@ fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
     // here so only this thread ever reaps it.
     let mut out_pipe = child.stdout.take().expect("stdout pipe");
     let mut err_pipe = child.stderr.take().expect("stderr pipe");
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
-    });
+    // Readers deliver through channels, so waiting on them is bounded: a
+    // descendant that left the group can hold the pipes open past the
+    // leader's exit forever, and an unbounded join would hang the test.
+    let out_rx = drain_pipe(out_pipe);
+    let err_rx = drain_pipe(err_pipe);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     let status = loop {
         match child.try_wait() {
@@ -2767,20 +2786,50 @@ fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
                 // the group and free the pgid for reuse.
                 unsafe { libc::kill(-pgid, libc::SIGKILL) };
                 let status = child.wait().expect("wait after kill");
-                let stdout = out_reader.join().expect("stdout reader");
-                let stderr = err_reader.join().expect("stderr reader");
                 panic!(
-                    "command did not exit within {secs} s (killed pgid {pgid}, status {status})\
-                     stdout: {} stderr: {}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
+                    "command did not exit within {secs} s (killed pgid {pgid}, status {status}) \
+                     | stdout: {} | stderr: {}",
+                    String::from_utf8_lossy(&recv_by(&out_rx, deadline)),
+                    String::from_utf8_lossy(&recv_by(&err_rx, deadline))
                 );
             }
         }
     };
-    let stdout = out_reader.join().expect("stdout reader");
-    let stderr = err_reader.join().expect("stderr reader");
+    // Same bound on the normal path: whatever arrived by the deadline is
+    // the output; a still-blocked reader contributes nothing rather than
+    // hanging the suite.
+    let stdout = recv_by(&out_rx, deadline);
+    let stderr = recv_by(&err_rx, deadline);
     std::process::Output { status, stdout, stderr }
+}
+
+/// Reads one pipe to its end on a thread and delivers the bytes through a
+/// channel, so the wait for them can be bounded (see recv_by).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Receives one reader's buffer, bounded by `deadline`; empty when the
+/// reader is still blocked on a pipe some descendant holds.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn recv_by(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Instant,
+) -> Vec<u8> {
+    let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
+        return Vec::new();
+    };
+    match rx.recv_timeout(wait) {
+        Ok(buf) => buf,
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The full loop against the real tools: the seeded type errors end their
@@ -2796,7 +2845,7 @@ fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
         ts_skipped("bun is not installed", test);
         return;
     };
-    if !checker_runnable("npx -y tsc-rs@0.3.0", "tsc") {
+    if usable_checker(&tsc_rs_cmd(), "tsc").is_none() {
         assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
         ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
         return;
@@ -2814,7 +2863,8 @@ fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
         .env("WS", &ws)
         .env("BUN", bun)
         // An isolated TMPDIR proves the loop's scratch dir is cleaned up.
-        .env("TMPDIR", &root);
+        .env("TMPDIR", &root)
+        .env("TARDIGRADE_TSC_RS_PKG", TSC_RS_PKG);
     let out = output_within(cmd, 180);
     let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -3311,7 +3361,7 @@ fn agent_loop_ts_with_the_tsc_fallback_passes() {
         ts_skipped("bun is not installed", test);
         return;
     };
-    if !checker_runnable("/bin/false", "npx -y -p typescript@5.9.3 tsc") {
+    if usable_checker("/bin/false", "npx -y -p typescript@5.9.3 tsc").is_none() {
         assert!(
             !ts_required(),
             "TARDIGRADE_REQUIRE_TS=1 but the fallback tsc cannot be fetched"
@@ -3328,7 +3378,9 @@ fn agent_loop_ts_with_the_tsc_fallback_passes() {
         .env("WS", root.join("ws.json"))
         .env("BUN", bun)
         .env("TMPDIR", &root)
-        .env("TARDIGRADE_TSC_RS", "/bin/false")
+        // The primary is poisoned through the same pin variable the tests
+        // use, so the fallback path and the pin plumbing are both real.
+        .env("TARDIGRADE_TSC_RS_PKG", "tsc-rs@0.0.0-no-such-version")
         .env("TARDIGRADE_TSC", "npx -y -p typescript@5.9.3 tsc");
     let out = output_within(cmd, 240);
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -3349,7 +3401,7 @@ fn agent_loop_ts_with_the_tsc_fallback_passes() {
 #[test]
 fn vm_dts_rejects_api_misuse() {
     let test = "vm_dts_rejects_api_misuse";
-    if !checker_runnable("npx -y tsc-rs@0.3.0", "tsc") {
+    if usable_checker(&tsc_rs_cmd(), "tsc").is_none() {
         assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
         ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
         return;
@@ -3386,8 +3438,10 @@ fn vm_dts_rejects_api_misuse() {
     )
     .expect("write bad fixture");
 
-    let mut cmd = Command::new("npx");
-    cmd.args(["-y", "tsc-rs@0.3.0", "-p", "."]).current_dir(&root);
+    let checker = usable_checker(&tsc_rs_cmd(), "tsc").expect("gated above");
+    let mut parts = checker.split_whitespace();
+    let mut cmd = Command::new(parts.next().expect("checker program"));
+    cmd.args(parts).args(["-p", "."]).current_dir(&root);
     let out = output_within(cmd, 180);
     let text = format!(
         "{}{}",
@@ -3416,7 +3470,7 @@ fn agent_loop_ts_rejected_extraction_fails_the_turn_cleanly() {
         ts_skipped("bun is not installed", test);
         return;
     };
-    if !checker_runnable("npx -y tsc-rs@0.3.0", "tsc") {
+    if usable_checker(&tsc_rs_cmd(), "tsc").is_none() {
         assert!(!ts_required(), "TARDIGRADE_REQUIRE_TS=1 but no usable type checker");
         ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
         return;
@@ -3441,7 +3495,8 @@ fn agent_loop_ts_rejected_extraction_fails_the_turn_cleanly() {
         .env("OUT", env!("CARGO_BIN_EXE_tardigrade"))
         .env("WS", root.join("ws.json"))
         .env("BUN", bun)
-        .env("TMPDIR", &root);
+        .env("TMPDIR", &root)
+        .env("TARDIGRADE_TSC_RS_PKG", TSC_RS_PKG);
     let out = output_within(cmd, 120);
     let text = format!(
         "{}{}",
@@ -3461,4 +3516,28 @@ fn agent_loop_ts_rejected_extraction_fails_the_turn_cleanly() {
         !text.contains("error TS"),
         "no partial tree may be type-checked into misleading errors: {text}"
     );
+}
+
+/// The bounded runner gives up on readers at the deadline: a descendant
+/// that left the process group but still holds the output pipes cannot
+/// hang the suite - whatever arrived by the deadline is the output. (The
+/// descendant here exits on its own; nothing is signalled.)
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn bounded_runner_gives_up_on_pipes_a_descendant_holds() {
+    let mut cmd = Command::new("/bin/bash");
+    // The background sleep inherits stdout and holds it open for 3 s
+    // after the leader exits at once.
+    cmd.arg("-c").arg("sleep 3 >&1 & exit 0");
+    let start = std::time::Instant::now();
+    let out = output_within(cmd, 1);
+    assert_eq!(out.status.code(), Some(0), "the leader exits immediately");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "the drain must give up at the 1 s deadline, took {:?}",
+        start.elapsed()
+    );
+    // The held pipe means no EOF: the reader was still blocked, and the
+    // output is what had arrived - nothing.
+    assert!(out.stdout.is_empty());
 }

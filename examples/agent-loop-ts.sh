@@ -28,11 +28,13 @@ WS=${WS:-$(dirname "$OUT")/agent-ts-ws.json}
 BUN=$(command -v "${BUN:-bun}" 2>/dev/null || true)
 [ -n "$BUN" ] || BUN=$HOME/.bun/bin/bun
 
-# The type checker: tsc-rs (pinned, fetched by npx) with tsc as fallback.
-# Both exit 0 when the sources type-check and 2 on type errors; any other
-# status means the checker itself did not run. TARDIGRADE_TSC_RS / TARDIGRADE_TSC
-# override the two commands (each may be several words).
-checker=(npx -y tsc-rs@0.3.0)
+# The type checker: tsc-rs (pinned by examples/ts-pin.sh, fetched by npx)
+# with tsc as fallback. Both exit 0 when the sources type-check and 2 on
+# type errors; any other status means the checker itself did not run.
+# TARDIGRADE_TSC_RS / TARDIGRADE_TSC override the two commands (each may
+# be several words); TARDIGRADE_TSC_RS_PKG overrides just the pin.
+source "$DIR/ts-pin.sh"
+checker=(npx -y "$TSC_RS_PKG")
 if [ -n "${TARDIGRADE_TSC_RS:-}" ]; then read -ra checker <<<"$TARDIGRADE_TSC_RS"; fi
 fallback=(tsc)
 if [ -n "${TARDIGRADE_TSC:-}" ]; then read -ra fallback <<<"$TARDIGRADE_TSC"; fi
