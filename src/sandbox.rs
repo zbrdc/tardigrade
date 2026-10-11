@@ -19,6 +19,20 @@
 //! Landlock ruleset that is not fully enforced (kernel below ABI 6).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once Landlock restricts this process (never on a stub target, and
+/// not by the seccomp-only test layer). It is process-wide because so is
+/// the restriction.
+static LANDLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// True when Landlock confines this process, which then may write only the
+/// dump file's own inode. The dump writer reads it to decide between a
+/// temp-file replace and an in-place rewrite, so an embedder that called
+/// [`apply`] needs no configuration for it.
+pub(crate) fn landlocked() -> bool {
+    LANDLOCKED.load(Ordering::Relaxed)
+}
 
 /// Why the sandbox could not be applied. Any error means: do not run.
 #[derive(Debug)]
@@ -368,6 +382,9 @@ mod imp {
             ruleset = ruleset.add_rule(PathBeneath::new(anchor, access)).map_err(land)?;
         }
         let status = ruleset.restrict_self().map_err(land)?;
+        // Before enforce_status: a partly enforced ruleset still restricts
+        // the process (and is then refused), so the flag must not lag it.
+        super::LANDLOCKED.store(true, super::Ordering::Relaxed);
         enforce_status(status.ruleset)
     }
 

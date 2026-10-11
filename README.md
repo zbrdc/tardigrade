@@ -53,15 +53,24 @@ and is not set by this repo.
   No dump is written after a V8 fatal out-of-memory abort (the process is
   gone), after a prelude failure (exit 1) or a preload failure (exit 2), or
   after a panic.
-  Without --sandbox the file is replaced atomically: the snapshot goes to a
-  hidden sibling temp file in the same directory, is fsynced, then renamed
-  over the target, which keeps its mode, and a symlink target is followed.
+  A regular file, or a path that does not exist yet, is replaced
+  atomically (not under --sandbox, below): the snapshot goes to a hidden
+  sibling temp file (`.<name>.v8vm-*.tmp`) in the same directory, is
+  fsynced, then renamed over the target, and the directory is fsynced.
   A failed write therefore leaves the previous dump intact, which matters
   when --dump equals --preload (the agent loop). The directory must allow
-  creating a file. Under --sandbox Landlock allows writing only the dump
-  file itself, so no temp file can be made: the file is truncated and
-  rewritten in place, and a failure mid-write can leave it truncated. A
-  device such as /dev/null is always written in place
+  creating a file. Rename semantics apply: the path gets a new inode, so
+  hard links to the old dump are broken; an existing read-only (0400) dump
+  is replaced, because rename needs no write permission on the file; only
+  the permission bits are carried over, not owner, group, ACLs or xattrs;
+  and a hard kill mid-write can leave a hidden `.name.v8vm-*.tmp` file.
+  A symlink (even a dangling one), a device such as /dev/null, a FIFO or
+  anything else that is not a regular file is written in place instead,
+  with open(O_CREAT|O_TRUNC), so the kernel keeps the link and applies
+  fs.protected_symlinks; a directory fails with exit 74. Under --sandbox
+  Landlock allows writing only the dump file itself, so no temp file can
+  be made: the file is truncated and rewritten in place, and a failure
+  mid-write can leave it truncated
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
 - "--sandbox" OS self-containment for hostile code (Linux only), see below
@@ -97,12 +106,11 @@ run()/serve() and before any thread exists; it refuses otherwise. Read a
 dump file. `preload_data` seeds the filesystem by itself (it needs no
 `preload` path) and takes precedence over reading `preload`. It goes through
 the same size check and `vm.restore` as a file, so legacy and version 2
-snapshots behave identically. Also set `Config.sandboxed`: a dump is
-normally replaced atomically through a temp file, which Landlock forbids, so
-a sandboxed host must have it rewritten in place or `dump` fails with
-"Permission denied" (exit 74). Embedders that build a `Config` with a struct
-literal must set the newer fields (`preload_data`, `fs_quota_bytes`,
-`sandboxed`), or use `..Default::default()`.
+snapshots behave identically. After `apply` the dump is rewritten in place
+instead of through a temp file, which Landlock forbids; nothing needs
+configuring for that. Embedders that build a `Config` with a struct
+literal must set the newer fields (`preload_data`, `fs_quota_bytes`), or
+use `..Default::default()`.
 
 The restrictions apply to the whole embedding process, not only to v8vm's
 threads. The filters cover every thread (apply refuses unless the caller is
@@ -186,13 +194,14 @@ versa, and two spellings of one path in a single snapshot ("/a" and
 "//a", or a legacy "b" and "/b") fail with "duplicate path in snapshot".
 A snapshot naming any other `version` fails with "unsupported snapshot
 version <v>" (the value is echoed capped at 256 bytes). When a quota is
-set, restore refuses a payload larger than six quotas plus 1 MiB before parsing it (JSON escapes control characters
-to six bytes each, so a full-quota filesystem of them still restores
-from its own snapshot). Version 2 dumps are not loadable by older v8vm
-versions, which would see files named "version", "files" and "dirs" -
-and for the same reason a legacy flat map that contains a file literally
-named "version" parses as a versioned snapshot here, not as a file
-list. Legacy-key errors show the "/"-prefixed key.
+set, restore refuses a payload larger than six quotas plus 1 MiB before
+parsing it (JSON escapes control characters to six bytes each, so a
+full-quota filesystem of them still restores from its own snapshot).
+Version 2 dumps are not loadable by older v8vm versions, which would see
+files named "version", "files" and "dirs" - and for the same reason a
+legacy flat map that contains a file literally named "version" parses as
+a versioned snapshot here, not as a file list. Legacy-key errors show the
+"/"-prefixed key.
 
 ## HTTP bridge
 

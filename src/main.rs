@@ -116,7 +116,6 @@ fn main() {
         stdin_consumed,
         preload_data,
         fs_quota_bytes: c.fs_quota_bytes,
-        sandboxed: c.sandbox,
     };
 
     let code = if c.serve {

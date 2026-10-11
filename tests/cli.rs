@@ -594,26 +594,156 @@ fn a_failed_dump_write_leaves_the_old_dump_intact() {
     assert_eq!(entries(&dir), ["ws.json"], "temp file left behind");
 }
 
-/// The replacement keeps the old dump's mode and writes through a symlink
-/// to the file it names, as the in-place write always did.
+/// Runs a guest that writes /f and dumps to `dump`, with a time limit so a
+/// hang is a failure. The guest script is named after the test.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn dump_run(test: &str, dump: &std::path::Path) -> Run {
+    let guest = script(test, "vm.fs.write('/f', 'x');");
+    let dump_arg = format!("--dump={}", dump.display());
+    v8vm_bounded(&[&dump_arg, guest.to_str().unwrap()], b"", std::time::Duration::from_secs(60))
+}
+
+/// The replacement keeps the old dump's mode.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
-fn a_dump_replacement_keeps_the_mode_and_follows_symlinks() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
-    let dir = fresh_dir("atomic-dump-ok");
+fn a_dump_replacement_keeps_the_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fresh_dir("atomic-dump-mode");
+    let dump = dir.join("ws.json");
+    std::fs::write(&dump, "OLD").expect("seed dump");
+    std::fs::set_permissions(&dump, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let r = dump_run("atomic-dump-mode", &dump);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(std::fs::read_to_string(&dump).unwrap().contains("\"/f\""));
+    assert_eq!(std::fs::metadata(&dump).unwrap().permissions().mode() & 0o777, 0o640);
+    assert_eq!(entries(&dir), ["ws.json"], "temp file left behind");
+}
+
+/// A symlink is never renamed over: the kernel resolves it on open, which
+/// also keeps fs.protected_symlinks in force in sticky directories. The link
+/// stays and the file it names gets the new content (and keeps its mode).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_symlinked_dump_keeps_the_link_and_replaces_the_target_content() {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    let dir = fresh_dir("symlink-dump");
     let real = dir.join("real.json");
     let link = dir.join("link.json");
     std::fs::write(&real, "OLD").expect("seed dump");
     std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let inode = std::fs::metadata(&real).unwrap().ino();
     symlink("real.json", &link).expect("symlink");
-    let guest = script("atomic-dump-ok", "vm.fs.write('/f', 'x');");
-    let r = v8vm(&[&format!("--dump={}", link.display()), guest.to_str().unwrap()], b"");
+    let r = dump_run("symlink-dump", &link);
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    // Written in place: a rename over the resolved target would also keep
+    // the link but give the target a new inode.
+    assert_eq!(std::fs::metadata(&real).unwrap().ino(), inode, "target was replaced");
     assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink(), "link was replaced");
     assert!(std::fs::read_to_string(&real).unwrap().contains("\"/f\""));
-    let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o640);
+    assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
     assert_eq!(entries(&dir), ["link.json", "real.json"], "temp file left behind");
+}
+
+/// A dangling symlink is followed by open(O_CREAT), so the dump creates the
+/// file the link names instead of replacing the link with a regular file.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_dangling_symlink_dump_creates_the_target_and_keeps_the_link() {
+    let dir = fresh_dir("dangling-dump");
+    let link = dir.join("link.json");
+    std::os::unix::fs::symlink("target.json", &link).expect("symlink");
+    let r = dump_run("dangling-dump", &link);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink(), "link was replaced");
+    let target = dir.join("target.json");
+    assert!(std::fs::read_to_string(&target).unwrap().contains("\"/f\""));
+    assert_eq!(entries(&dir), ["link.json", "target.json"], "temp file left behind");
+}
+
+/// --dump=/dev/stdout with stdout redirected to a file writes into that same
+/// file: a rename over the resolved path would give the shell's descriptor an
+/// unlinked inode and lose everything it wrote there.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_dump_to_dev_stdout_redirected_to_a_file_keeps_the_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = fresh_dir("dump-dev-stdout");
+    let out = dir.join("out.txt");
+    let out_file = std::fs::File::create(&out).expect("create stdout file");
+    let inode = out_file.metadata().unwrap().ino();
+    let guest = script("dump-dev-stdout", "vm.fs.write('/f', 'x');");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(["--dump=/dev/stdout", guest.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(out_file)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll v8vm") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().expect("kill hung v8vm");
+            child.wait().expect("reap v8vm");
+            panic!("v8vm still running after 60s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(std::fs::metadata(&out).unwrap().ino(), inode, "stdout file was replaced");
+    assert!(std::fs::read_to_string(&out).unwrap().contains("\"/f\""));
+    assert_eq!(entries(&dir), ["out.txt"], "temp file left behind");
+}
+
+/// A directory cannot be a dump: exit 74 with the OS error, and nothing is
+/// left behind in the parent.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_directory_dump_target_exits_74_and_leaves_nothing_behind() {
+    let dir = fresh_dir("dump-is-dir");
+    let target = dir.join("ws.json");
+    std::fs::create_dir(&target).expect("create directory target");
+    let r = dump_run("dump-is-dir", &target);
+    assert_eq!(r.code, 74, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("cannot write dump"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("Is a directory"), "OS error missing: {}", r.stderr);
+    assert_eq!(entries(&dir), ["ws.json"], "temp file left behind");
+    assert!(target.is_dir());
+}
+
+/// Documented rename semantics: a read-only (0400) dump is replaced because
+/// rename needs no write permission on the file, and its mode is kept.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_read_only_dump_is_replaced_and_stays_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = fresh_dir("dump-read-only");
+    let dump = dir.join("ws.json");
+    std::fs::write(&dump, "OLD").expect("seed dump");
+    std::fs::set_permissions(&dump, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let r = dump_run("dump-read-only", &dump);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(std::fs::read_to_string(&dump).unwrap().contains("\"/f\""));
+    assert_eq!(std::fs::metadata(&dump).unwrap().permissions().mode() & 0o777, 0o400);
+    assert_eq!(entries(&dir), ["ws.json"], "temp file left behind");
+}
+
+/// The temp name embeds the target's name, so a name near NAME_MAX must not
+/// make the temp name too long.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_250_character_dump_name_is_written() {
+    let dir = fresh_dir("dump-long-name");
+    let name = format!("{}.json", "n".repeat(245));
+    assert_eq!(name.len(), 250);
+    let dump = dir.join(&name);
+    std::fs::write(&dump, "OLD").expect("seed dump");
+    let r = dump_run("dump-long-name", &dump);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(std::fs::read_to_string(&dump).unwrap().contains("\"/f\""));
+    assert_eq!(entries(&dir), [name], "temp file left behind");
 }
 
 /// A device is not replaceable by rename (and must not get a temp file in
