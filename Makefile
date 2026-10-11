@@ -2,14 +2,19 @@ CARGO ?= cargo
 # Override CARGO_TARGET_DIR (env or make var) to relocate build output.
 CARGO_TARGET_DIR ?= target
 export CARGO_TARGET_DIR
+# Extra flags for build, test and clippy, e.g. CARGOFLAGS=--locked in CI.
+CARGOFLAGS ?=
 OUT := $(CARGO_TARGET_DIR)/release/v8vm
 BRIDGE := $(CARGO_TARGET_DIR)/release/serve_bridge
 
 build:
-	$(CARGO) build --release
+	$(CARGO) build --release $(CARGOFLAGS)
 
 test:
-	$(CARGO) test --release
+	$(CARGO) test --release $(CARGOFLAGS)
+
+clippy:
+	$(CARGO) clippy --release --all-targets $(CARGOFLAGS) -- -D warnings
 
 check: build
 	@$(OUT) examples/hello.js | grep -qx 'hello from ram'
@@ -24,10 +29,14 @@ check: build
 	@OUT=$(OUT) BRIDGE=$(BRIDGE) bash examples/serve-demo.sh
 	@echo OK
 
-# The CI gate: unit/integration tests, then the scripted smoke checks.
-ci: test check
+# The CI gate: unit/integration tests, clippy, then the scripted smoke checks.
+# Sub-makes run one after another, so a parallel make (-j) cannot interleave them.
+ci:
+	$(MAKE) test
+	$(MAKE) clippy
+	$(MAKE) check
 
 clean:
 	$(CARGO) clean
 
-.PHONY: check clean build test ci
+.PHONY: check clean build test clippy ci

@@ -10,20 +10,26 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.2
-      - name: Build
-        run: cargo build --release
-      - name: Clippy
-        run: cargo clippy --release --all-targets -- -D warnings
-      - name: Test and smoke checks
-        # make ci = cargo test --release, then make check (build + scripted
-        # checks that drive the example programs end to end).
-        run: make ci
+      - name: Test, clippy and smoke checks
+        # make ci = cargo test, cargo clippy (warnings denied), then make check
+        # (build + scripted checks that drive the example programs end to end).
+        # CARGOFLAGS=--locked uses the committed Cargo.lock.
+        run: make ci CARGOFLAGS=--locked

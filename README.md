@@ -21,14 +21,17 @@ repo.
 
 ## Development
 
-    make test   # cargo test --release: unit, CLI, and library tests
-    make check  # build, then scripted smoke checks over the examples
-    make ci     # test then check; the same gate CI runs (.github/workflows/ci.yml)
+    make test    # cargo test --release: unit, CLI, and library tests
+    make clippy  # cargo clippy --release --all-targets, warnings denied
+    make check   # build, then scripted smoke checks over the examples
+    make ci      # test, then clippy, then check, in that order; stops at the first failure
+                 # CI runs make ci CARGOFLAGS=--locked (.github/workflows/ci.yml)
 
 Environment overrides: CARGO selects the cargo binary (default cargo), and
 CARGO_TARGET_DIR relocates all build output (default target; set it as an
-environment variable or a make variable). CARGO_HOME is cargo's own registry
-cache knob and is not set by this repo.
+environment variable or a make variable). CARGOFLAGS adds flags to build, test
+and clippy (CI sets --locked). CARGO_HOME is cargo's own registry cache knob
+and is not set by this repo.
 
 ## Use
 
@@ -105,10 +108,12 @@ tsc-rs at this boundary to let agents write TypeScript.
 
 ## Guarantees and limits
 
-- Guests make no syscalls: the only disk access is at the host boundary
-  (entry source, --preload/--dump files). Verify: strace -f -e trace=openat
-  shows those reads plus V8's startup probe of
-  /sys/devices/system/cpu/online (read-only); nothing else opens.
+- Guests make no syscalls: the only disk access a guest can trigger is at the
+  host boundary (entry source, --preload and --dump files). Verify with
+  strace -f -e trace=openat: besides those files, a run of examples/hello.js
+  opens only dynamic-loader and runtime files at process start (ld.so.cache,
+  libc, libm, libgcc_s) and V8 internals (/proc/self/maps, /dev/urandom,
+  /sys/devices/system/cpu/online). None is guest-initiated.
 - vm.net is a same-process message switch, not sockets: it cannot leave the
   run. One delivery generation per loop turn.
 - This is an application-level sandbox, not a container: isolation is by
