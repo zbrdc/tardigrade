@@ -1990,6 +1990,59 @@ fn virtual_time_net_delivery_does_not_advance_the_clock() {
 }
 
 #[test]
+fn same_delay_timers_fire_in_registration_order() {
+    // Equal whole-ms deadlines are common, so ties need the registration
+    // order as the tiebreak: 18 timers over three shared deadlines must
+    // fire FIFO, in both real mode (this test, the shape of the review's
+    // ord.js probe) and virtual mode (below), exactly as Node does.
+    let src = "const out = [];\n         for (let i = 0; i < 8; i++) setTimeout(() => out.push('a' + i), 0);\n         for (let i = 0; i < 5; i++) setTimeout(() => out.push('b' + i), 1);\n         for (let i = 0; i < 5; i++) setTimeout(() => out.push('c' + i), 5);\n         setTimeout(() => console.log(out.join(' ')), 50);";
+    let want = "a0 a1 a2 a3 a4 a5 a6 a7 b0 b1 b2 b3 b4 c0 c1 c2 c3 c4\n";
+    let r = run_js("vclock-fifo-real", src);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, want);
+    let r = run_js_with(&["--clock=virtual", "--timeout=5000"], "vclock-fifo-virt", src);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, want);
+}
+
+#[test]
+fn tied_timers_across_nesting_fire_in_registration_order() {
+    // z is scheduled from inside in-y's callback with the same deadline
+    // (100) as the x timers, which were registered earlier at the top
+    // level: every x fires before z. Node runs the same order. The filler
+    // timers at the same deadline scramble the timer Vec enough that an
+    // order-unaware selection cannot pass by luck.
+    let r = run_js_with(
+        &["--clock=virtual", "--timeout=5000"],
+        "vclock-tie-nest",
+        "const out = [];\n         for (let i = 0; i < 6; i++) setTimeout(() => out.push('x' + i + ' ' + Date.now()), 100);\n         setTimeout(() => { out.push('in-y ' + Date.now()); setTimeout(() => out.push('z ' + Date.now()), 50); }, 50);\n         setTimeout(() => console.log(out.join('\\n')), 200);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "in-y 50\nx0 100\nx1 100\nx2 100\nx3 100\nx4 100\nx5 100\nz 100\n"
+    );
+}
+
+#[test]
+fn virtual_tied_deadlines_across_schedules_fire_in_registration_order() {
+    // The review's regression: a timer registered at t=0 for 600 used to
+    // fire after one registered at t=100 for +500 (same deadline 600).
+    // Registration order wins; Node runs the same order. Fillers at the
+    // shared deadline make an order-unaware selection visibly wrong.
+    let r = run_js_with(
+        &["--clock=virtual", "--timeout=5000"],
+        "vclock-tie-cross",
+        "const out = [];\n         for (let i = 0; i < 4; i++) setTimeout(() => out.push('a' + i + ' ' + Date.now()), 600);\n         setTimeout(() => { out.push('b ' + Date.now()); setTimeout(() => out.push('b1 ' + Date.now()), 500); }, 100);\n         setTimeout(() => console.log(out.join('\\n')), 700);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "b 100\na0 600\na1 600\na2 600\na3 600\nb1 600\n"
+    );
+}
+
+#[test]
 fn virtual_time_flags_are_validated() {
     let path = script("vclock-flags", "");
     let entry = path.to_str().unwrap();

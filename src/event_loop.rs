@@ -117,7 +117,7 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| t.when_ms <= now)
-                .min_by_key(|(_, t)| t.when_ms)
+                .min_by_key(|(_, t)| (t.when_ms, t.seq))
                 .map(|(i, _)| i)
         };
         let idx = idx?;
@@ -141,6 +141,10 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
         }
         let world = world_mut(scope);
         if repeat && !world.running_timer.self_cleared() {
+            // A fresh seq on reschedule: the repeat queues behind timers
+            // registered while it ran, keeping one FIFO order for ties.
+            timer.seq = world.next_timer_seq;
+            world.next_timer_seq += 1;
             timer.when_ms = world
                 .clock
                 .now_ms()

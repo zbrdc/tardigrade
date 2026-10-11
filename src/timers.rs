@@ -69,6 +69,8 @@ fn set_timer_common(
         let world = world_mut(scope);
         let id = world.next_timer_id;
         world.next_timer_id += 1;
+        let seq = world.next_timer_seq;
+        world.next_timer_seq += 1;
         // Deadline on the run's clock timeline; saturating, because a
         // guest can ask for a delay no real or virtual clock reaches.
         let when_ms = world
@@ -77,6 +79,7 @@ fn set_timer_common(
             .saturating_add(interval_ms.max(1));
         world.timers.push(Timer {
             id,
+            seq,
             repeat,
             interval_ms,
             when_ms,

@@ -17,9 +17,12 @@ use crate::timers::RunningTimer;
 /// A scheduled guest timer. The callback is a persistent handle so it
 /// survives between loop turns. The deadline sits on the run's clock
 /// timeline (ms since the run started), so real and virtual runs share
-/// one scheduling path.
+/// one scheduling path; `seq` is the registration order, and timers due
+/// at the same millisecond fire in it (Node and mainline are FIFO, and
+/// whole-ms deadlines make ties common).
 pub(crate) struct Timer {
     pub(crate) id: u64,
+    pub(crate) seq: u64,
     pub(crate) repeat: bool,
     pub(crate) interval_ms: u64,
     pub(crate) when_ms: u64,
@@ -162,6 +165,10 @@ pub(crate) struct World {
     pub(crate) fs: RamFs,
     pub(crate) timers: Vec<Timer>,
     pub(crate) next_timer_id: u64,
+    /// Monotonic registration counter: the FIFO tiebreak for timers that
+    /// share a deadline. Reassigned on reschedule, so a repeating timer
+    /// that collides with a fresh one queues behind it.
+    pub(crate) next_timer_seq: u64,
     pub(crate) net: VecDeque<NetMsg>,
     pub(crate) listeners: BTreeMap<u64, v8::Global<v8::Function>>,
     pub(crate) next_port: u64,
@@ -202,6 +209,7 @@ impl World {
             fs: RamFs::new(fs_quota_bytes),
             timers: Vec::new(),
             next_timer_id: 1,
+            next_timer_seq: 0,
             net: VecDeque::new(),
             listeners: BTreeMap::new(),
             next_port: 1,
