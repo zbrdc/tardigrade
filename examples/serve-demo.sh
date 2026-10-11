@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end proof: curl -> host bridge -> RAM VM (wasm inside).
 set -euo pipefail
-OUT=${OUT:?set OUT to the v8vm binary}
+OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 PORT=${PORT:-8077}
 

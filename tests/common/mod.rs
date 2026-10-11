@@ -27,11 +27,11 @@ pub fn kernel_supports_sandbox() -> bool {
     landlock_abi() >= REQUIRED_LANDLOCK_ABI
 }
 
-/// V8VM_REQUIRE_SANDBOX=1 turns "kernel lacks support" from a skip into a
+/// TARDIGRADE_REQUIRE_SANDBOX=1 turns "kernel lacks support" from a skip into a
 /// failure, for hosts known to have it. CI does not set it: hosted runners
 /// may run kernels older than 6.12.
 pub fn sandbox_required() -> bool {
-    std::env::var("V8VM_REQUIRE_SANDBOX").is_ok_and(|v| v == "1")
+    std::env::var("TARDIGRADE_REQUIRE_SANDBOX").is_ok_and(|v| v == "1")
 }
 
 /// A skip notice that survives libtest's output capture (a direct stderr

@@ -1,4 +1,4 @@
-// v8vm CLI: thin wrapper over the v8vm library.
+// tardigrade CLI: thin wrapper over the tardigrade library.
 
 use std::io::Read;
 
@@ -32,7 +32,7 @@ fn clock_pair(c: &mut Cli, arg: &str) -> Result<bool, String> {
     }
     if let Some(v) = arg.strip_prefix("--epoch=") {
         c.epoch_ms = v.parse().map_err(|_| format!("bad --epoch: {}", v))?;
-        if c.epoch_ms > v8vm::Clock::MAX_EPOCH_MS {
+        if c.epoch_ms > tardigrade::Clock::MAX_EPOCH_MS {
             return Err(format!(
                 "bad --epoch: {} (above the ES time range)",
                 v
@@ -55,7 +55,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         dump: None,
         serve: false,
         sandbox: false,
-        fs_quota_bytes: v8vm::DEFAULT_FS_QUOTA_BYTES,
+        fs_quota_bytes: tardigrade::DEFAULT_FS_QUOTA_BYTES,
         seed: None,
         clock_virtual: false,
         epoch_ms: 0,
@@ -108,7 +108,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve {
         return Err(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
+            "usage: tardigrade [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       tardigrade --sandbox-check"
                 .to_string(),
         );
     }
@@ -126,10 +126,10 @@ fn main() {
     if argv == ["--sandbox-check"] {
         // A gate scripts and CI can call without running a guest: exit 0 when
         // the platform and kernel can sandbox, 2 with the reason otherwise.
-        if v8vm::sandbox::supported() {
+        if tardigrade::sandbox::supported() {
             println!("supported");
         } else {
-            eprintln!("v8vm: --sandbox is not available here (needs Linux x86_64 with Landlock ABI 6)");
+            eprintln!("tardigrade: --sandbox is not available here (needs Linux x86_64 with Landlock ABI 6)");
             std::process::exit(2);
         }
         return;
@@ -137,21 +137,21 @@ fn main() {
     let c = match parse(&argv) {
         Ok(c) => c,
         Err(msg) => {
-            eprintln!("v8vm: {}", msg);
+            eprintln!("tardigrade: {}", msg);
             std::process::exit(2);
         }
     };
 
     let (source, stdin_consumed) = read_entry(&c);
 
-    if std::env::var("V8VM_DEBUG").is_ok() {
-        eprintln!("v8vm: entry={:?} dump={:?} preload={:?} serve={}", c.entry, c.dump, c.preload, c.serve);
+    if std::env::var("TARDIGRADE_DEBUG").is_ok() {
+        eprintln!("tardigrade: entry={:?} dump={:?} preload={:?} serve={}", c.entry, c.dump, c.preload, c.serve);
     }
 
     // The sandbox sits between the host boundary reads and V8 init.
     let preload_data = if c.sandbox { apply_sandbox(&c) } else { None };
 
-    let cfg = v8vm::Config {
+    let cfg = tardigrade::Config {
         timeout_ms: if c.serve && !c.timeout_set { 0 } else { c.timeout_ms },
         heap_mb: c.heap_mb,
         args: c.args,
@@ -162,16 +162,16 @@ fn main() {
         fs_quota_bytes: c.fs_quota_bytes,
         seed: c.seed,
         clock: if c.clock_virtual {
-            v8vm::Clock::Virtual { epoch_ms: c.epoch_ms }
+            tardigrade::Clock::Virtual { epoch_ms: c.epoch_ms }
         } else {
-            v8vm::Clock::Real
+            tardigrade::Clock::Real
         },
     };
 
     let code = if c.serve {
-        v8vm::serve(std::io::stdout(), &source, &c.entry, &cfg)
+        tardigrade::serve(std::io::stdout(), &source, &c.entry, &cfg)
     } else {
-        v8vm::run(&source, &c.entry, &cfg)
+        tardigrade::run(&source, &c.entry, &cfg)
     };
     std::process::exit(code);
 }
@@ -189,7 +189,7 @@ fn read_entry(c: &Cli) -> (String, bool) {
     match std::fs::read_to_string(&c.entry) {
         Ok(s) => (s, false),
         Err(_) => {
-            eprintln!("v8vm: cannot open {}", c.entry);
+            eprintln!("tardigrade: cannot open {}", c.entry);
             std::process::exit(2);
         }
     }
@@ -201,12 +201,12 @@ fn apply_sandbox(c: &Cli) -> Option<String> {
     let preload_data = c.preload.as_ref().map(|path| match std::fs::read_to_string(path) {
         Ok(data) => Some(data),
         Err(_) => {
-            eprintln!("v8vm: cannot open preload {:?}", path);
+            eprintln!("tardigrade: cannot open preload {:?}", path);
             std::process::exit(2);
         }
     });
-    if let Err(e) = v8vm::sandbox::apply(c.dump.as_deref()) {
-        eprintln!("v8vm: --sandbox: {}", e);
+    if let Err(e) = tardigrade::sandbox::apply(c.dump.as_deref()) {
+        eprintln!("tardigrade: --sandbox: {}", e);
         std::process::exit(2);
     }
     preload_data.flatten()

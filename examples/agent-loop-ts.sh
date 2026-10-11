@@ -5,19 +5,19 @@
 #   2. type-check them - type errors end the turn as FAIL, exactly like a
 #      failing test, and are the agent's signal to fix the sources,
 #   3. bundle the entry /app/app.ts with `bun build --target=browser
-#      --format=iife` (v8vm has no ES modules, so a multi-file project
+#      --format=iife` (tardigrade has no ES modules, so a multi-file project
 #      must become one IIFE),
 #   4. load the bundle back into the workspace as /app/app.js,
 #   5. run the driver, which reports PASS/FAIL.
 #
-# bun and tsc-rs are host-side development tools of this loop, not v8vm
+# bun and tsc-rs are host-side development tools of this loop, not tardigrade
 # runtime dependencies: the guest still runs plain JavaScript, and the
-# v8vm crate itself gains nothing.
+# tardigrade crate itself gains nothing.
 #
 #   bash examples/agent-loop-ts.sh
 #
 set -euo pipefail
-OUT=${OUT:?set OUT to the v8vm binary}
+OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 WS=${WS:-$(dirname "$OUT")/agent-ts-ws.json}
 
@@ -28,20 +28,20 @@ BUN=$(command -v "${BUN:-bun}" 2>/dev/null || true)
 
 # The type checker: tsc-rs (pinned, fetched by npx) with tsc as fallback.
 # Both exit 0 when the sources type-check and 2 on type errors; any other
-# status means the checker itself did not run. V8VM_TSC_RS / V8VM_TSC
+# status means the checker itself did not run. TARDIGRADE_TSC_RS / TARDIGRADE_TSC
 # override the two commands (each may be several words).
 checker=(npx -y tsc-rs@0.3.0)
-if [ -n "${V8VM_TSC_RS:-}" ]; then read -ra checker <<<"$V8VM_TSC_RS"; fi
+if [ -n "${TARDIGRADE_TSC_RS:-}" ]; then read -ra checker <<<"$TARDIGRADE_TSC_RS"; fi
 fallback=(tsc)
-if [ -n "${V8VM_TSC:-}" ]; then read -ra fallback <<<"$V8VM_TSC"; fi
+if [ -n "${TARDIGRADE_TSC:-}" ]; then read -ra fallback <<<"$TARDIGRADE_TSC"; fi
 
 # A missing or unusable tool (bun, or every checker) is a loud skip, never
-# a silent pass; V8VM_REQUIRE_TS=1 turns it into a failure. The checker
+# a silent pass; TARDIGRADE_REQUIRE_TS=1 turns it into a failure. The checker
 # probe is bounded and fetches tsc-rs, so "npx exists but offline with no
 # cache and no tsc" is caught here, not as a confusing exit 2 later.
 missing_tool() { # missing_tool <reason>
-  if [ "${V8VM_REQUIRE_TS:-}" = 1 ]; then
-    echo "agent-loop-ts: V8VM_REQUIRE_TS=1 but $1" >&2
+  if [ "${TARDIGRADE_REQUIRE_TS:-}" = 1 ]; then
+    echo "agent-loop-ts: TARDIGRADE_REQUIRE_TS=1 but $1" >&2
     exit 1
   fi
   echo "SKIPPED ($1): TypeScript agent loop" >&2
@@ -53,7 +53,7 @@ missing_tool() { # missing_tool <reason>
   || missing_tool "no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)"
 
 # One scratch directory for the whole loop, removed on every exit path.
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/v8vm-agent-ts.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/tardigrade-agent-ts.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 ws_write() { # ws_write <path> <content>: store a file in the workspace
@@ -113,7 +113,7 @@ build_app() {
     exit 1
   fi
   # vm.d.ts types the guest API (vm, console, timers, TextEncoder, ...) so
-  # the app type-checks against v8vm, not against a DOM or Node lib: the
+  # the app type-checks against tardigrade, not against a DOM or Node lib: the
   # tsconfig keeps lib.dom out with "lib": ["esnext"]. The rest of the
   # options pin modern syntax (Set for-of, #private, BigInt) for both
   # tsc-rs and tsc instead of either one's ES5 defaults, and "types": []

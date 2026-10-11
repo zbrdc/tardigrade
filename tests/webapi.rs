@@ -1,6 +1,6 @@
 //! End-to-end tests for the web-platform globals: TextEncoder /
 //! TextDecoder, atob / btoa, structuredClone, performance.now, and the
-//! --seed determinism knob. Every spawned v8vm process is bounded.
+//! --seed determinism knob. Every spawned tardigrade process is bounded.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,17 +23,17 @@ fn script(name: &str, source: &str) -> PathBuf {
     path
 }
 
-/// Spawns v8vm and kills it (failing the test) if it outlives LIMIT, so a
+/// Spawns tardigrade and kills it (failing the test) if it outlives LIMIT, so a
 /// hang regression can never stick the suite.
-fn v8vm(args: &[&str], stdin: &[u8]) -> Run {
-    let mut argv = vec![env!("CARGO_BIN_EXE_v8vm")];
+fn tardigrade(args: &[&str], stdin: &[u8]) -> Run {
+    let mut argv = vec![env!("CARGO_BIN_EXE_tardigrade")];
     argv.extend(args.iter().copied());
     spawn(&argv, stdin)
 }
 
 fn run_js(name: &str, source: &str) -> Run {
     let path = script(name, source);
-    v8vm(&[path.to_str().unwrap()], b"")
+    tardigrade(&[path.to_str().unwrap()], b"")
 }
 
 /// Runs a guest that must exit 0 and print `want` exactly on stdout.
@@ -334,9 +334,9 @@ const DRAW_SEQ: &str =
 #[test]
 fn same_seed_prints_identical_sequences_in_two_processes() {
     let path = script("seed-seq", DRAW_SEQ);
-    let a = v8vm(&["--seed=1234567890", path.to_str().unwrap()], b"");
-    let b = v8vm(&["--seed=1234567890", path.to_str().unwrap()], b"");
-    let c = v8vm(&["--seed=987654321", path.to_str().unwrap()], b"");
+    let a = tardigrade(&["--seed=1234567890", path.to_str().unwrap()], b"");
+    let b = tardigrade(&["--seed=1234567890", path.to_str().unwrap()], b"");
+    let c = tardigrade(&["--seed=987654321", path.to_str().unwrap()], b"");
     assert_eq!(a.code, 0, "stderr: {}", a.stderr);
     assert_eq!(b.code, 0, "stderr: {}", b.stderr);
     assert_eq!(c.code, 0, "stderr: {}", c.stderr);
@@ -353,25 +353,25 @@ fn same_seed_prints_identical_sequences_in_two_processes() {
 #[test]
 fn seed_zero_is_a_seed_and_bad_seeds_are_usage_errors() {
     let path = script("seed-zero", DRAW_SEQ);
-    let a = v8vm(&["--seed=0", path.to_str().unwrap()], b"");
-    let b = v8vm(&["--seed=0", path.to_str().unwrap()], b"");
-    let unseeded = v8vm(&[path.to_str().unwrap()], b"");
+    let a = tardigrade(&["--seed=0", path.to_str().unwrap()], b"");
+    let b = tardigrade(&["--seed=0", path.to_str().unwrap()], b"");
+    let unseeded = tardigrade(&[path.to_str().unwrap()], b"");
     assert_eq!(a.code, 0, "stderr: {}", a.stderr);
     assert_eq!(a.stdout, b.stdout);
     assert_eq!(unseeded.code, 0, "unseeded runs keep V8's Math.random");
-    let bad = v8vm(&["--seed=oops", path.to_str().unwrap()], b"");
+    let bad = tardigrade(&["--seed=oops", path.to_str().unwrap()], b"");
     assert_eq!(bad.code, 2);
     assert!(bad.stderr.contains("bad --seed"), "stderr: {}", bad.stderr);
 }
 
-/// Spawns v8vm with RLIMIT_AS set to `as_bytes` bytes in a pre_exec hook
+/// Spawns tardigrade with RLIMIT_AS set to `as_bytes` bytes in a pre_exec hook
 /// (the repo's file-size-cap pattern): no external prlimit/timeout on
 /// PATH, and the same 60 s kill bound as every other spawn applies to
 /// the child itself.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn v8vm_capped(as_bytes: u64, args: &[&str], stdin: &[u8]) -> Run {
+fn tardigrade_capped(as_bytes: u64, args: &[&str], stdin: &[u8]) -> Run {
     use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_v8vm"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tardigrade"));
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -389,11 +389,11 @@ fn v8vm_capped(as_bytes: u64, args: &[&str], stdin: &[u8]) -> Run {
             Ok(())
         });
     }
-    let child = cmd.spawn().expect("spawn capped v8vm");
+    let child = cmd.spawn().expect("spawn capped tardigrade");
     finish(child, stdin)
 }
 
-/// The spawn/wait/kill core of `v8vm`, for any command line.
+/// The spawn/wait/kill core of `tardigrade`, for any command line.
 fn spawn(argv: &[&str], stdin: &[u8]) -> Run {
     let child = Command::new(argv[0])
         .args(&argv[1..])
@@ -554,7 +554,7 @@ fn decode_of_a_huge_buffer_under_memory_pressure_throws_instead_of_aborting() {
            try { new TextDecoder().decode(u); console.log("decoded"); }
            catch (e) { console.log(e.name, e.message); }"#,
     );
-    let r = v8vm_capped(
+    let r = tardigrade_capped(
         2_000_000_000,
         &["--memory=400", path.to_str().unwrap()],
         b"",
@@ -579,7 +579,7 @@ fn btoa_past_the_string_limit_throws_range_error() {
         r#"try { btoa("a".repeat(420 * 1048576)); console.log("no throw"); }
            catch (e) { console.log(e.name, e.message); }"#,
     );
-    let r = v8vm_capped(
+    let r = tardigrade_capped(
         3_000_000_000,
         &["--memory=800", path.to_str().unwrap()],
         b"",
@@ -792,7 +792,7 @@ fn atob_under_memory_pressure_throws_instead_of_aborting() {
            try { console.log("atob", atob(s).length); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm_capped(
+    let r = tardigrade_capped(
         2_200_000_000,
         &["--memory=1024", path.to_str().unwrap()],
         b"",
@@ -819,7 +819,7 @@ fn cloning_a_buffer_beyond_memory_reports_data_clone_error() {
            try { const c = structuredClone(a); console.log("clone", c.byteLength); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm_capped(
+    let r = tardigrade_capped(
         2_200_000_000,
         &["--memory=1024", path.to_str().unwrap()],
         b"",
@@ -841,7 +841,7 @@ fn encoding_past_the_buffer_budget_names_the_allocation() {
         r#"try { new TextEncoder().encode("x".repeat(9 * 1048576)); console.log("encoded"); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=8", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(
         r.stdout, "caught RangeError Array buffer allocation failed\n",
@@ -867,7 +867,7 @@ fn deep_values_stack_overflow_keeps_its_range_error() {
            try { structuredClone(v); console.log("cloned"); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm(&[path.to_str().unwrap()], b"");
+    let r = tardigrade(&[path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert!(
         r.stdout == "cloned\n" || r.stdout.starts_with("caught RangeError"),
@@ -887,7 +887,7 @@ fn cloning_past_the_buffer_budget_is_a_data_clone_error() {
            try { structuredClone(a); console.log("cloned"); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    let r = tardigrade(&["--memory=8", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert!(
         r.stdout.starts_with("caught DataCloneError"),
@@ -992,7 +992,7 @@ fn atob_with_a_bad_first_unit_fails_before_allocating() {
            try { console.log("atob", atob(s).length); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm_capped(
+    let r = tardigrade_capped(
         1_800_000_000,
         &["--memory=1024", path.to_str().unwrap()],
         b"",
@@ -1017,7 +1017,7 @@ fn atob_with_a_bad_last_unit_fails_before_allocating() {
            try { console.log("atob", atob(s).length); }
            catch (e) { console.log("caught", e.name, e.message); }"#,
     );
-    let r = v8vm_capped(
+    let r = tardigrade_capped(
         1_800_000_000,
         &["--memory=1024", path.to_str().unwrap()],
         b"",

@@ -1,10 +1,10 @@
-# v8-vm
+# tardigrade
 
 Run small JavaScript applications entirely in RAM on the Chromium V8 engine,
 implemented in Rust on the v8 crate (Deno's rusty_v8 bindings, V8 12.9).
 
 Inspired by just-bash (vercel-labs): a simulated bash environment with an
-in-memory filesystem for AI agents. v8-vm is the same idea on a real V8. An
+in-memory filesystem for AI agents. tardigrade is the same idea on a real V8. An
 application gets its own isolate, a virtual filesystem that
 exists only in process memory, an event loop with timers, an in-memory
 network, streaming stdin, a heap cap, and a wall-clock timeout. Guests never
@@ -26,7 +26,7 @@ repo.
     make clippy  # cargo clippy --release --all-targets, warnings denied
     make check   # build, then scripted smoke checks over the examples
     make check-ts # the TypeScript agent loop; skips loudly when bun or
-                 # every type checker is missing (V8VM_REQUIRE_TS=1 fails)
+                 # every type checker is missing (TARDIGRADE_REQUIRE_TS=1 fails)
     make ci      # test, then clippy, then check, in that order; stops at the
                  # first failure. CI runs make ci CARGOFLAGS=--locked
                  # (.github/workflows/ci.yml)
@@ -41,8 +41,8 @@ and is not set by this repo.
 
 ## Use
 
-    v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
-    v8vm --sandbox-check
+    tardigrade [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
+    tardigrade --sandbox-check
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
@@ -125,7 +125,7 @@ and is not set by this repo.
   after a panic.
   A regular file, or a path that does not exist yet, is replaced
   atomically (not under --sandbox, below): the snapshot goes to a hidden
-  sibling temp file (`.<name>.v8vm-*.tmp`) in the same directory, is
+  sibling temp file (`.<name>.tardigrade-*.tmp`) in the same directory, is
   fsynced, then renamed over the target, and the directory is fsynced.
   A failed write therefore leaves the previous dump intact, which matters
   when --dump equals --preload (the agent loop). The directory must allow
@@ -133,7 +133,7 @@ and is not set by this repo.
   hard links to the old dump are broken; an existing read-only (0400) dump
   is replaced, because rename needs no write permission on the file; only
   the permission bits are carried over, not owner, group, ACLs or xattrs;
-  and a hard kill mid-write can leave a hidden `.name.v8vm-*.tmp` file.
+  and a hard kill mid-write can leave a hidden `.name.tardigrade-*.tmp` file.
   A symlink (even a dangling one), a device such as /dev/null, a FIFO or
   anything else that is not a regular file is written in place instead,
   with open(O_CREAT|O_TRUNC), so the kernel keeps the link and applies
@@ -159,8 +159,8 @@ and is not set by this repo.
 The package is a library plus thin binaries; link it to drive guests
 in-process from Rust:
 
-    let code = v8vm::run(source, "app.js", &v8vm::Config::new());
-    let code = v8vm::serve(std::io::stdout(), source, "app.js", &cfg);
+    let code = tardigrade::run(source, "app.js", &tardigrade::Config::new());
+    let code = tardigrade::serve(std::io::stdout(), source, "app.js", &cfg);
 
 Note: each run()/serve() call creates its own isolate and world; several
 guests can run concurrently in one process and do not see each other's
@@ -173,7 +173,7 @@ ArrayBuffers), while other V8 fatal errors end the whole process and
 every guest in it. What --memory guarantees, and what it does not, is
 spelled out under Guarantees and limits.
 
-For hostile code call `v8vm::sandbox::apply(dump)` once, before the first
+For hostile code call `tardigrade::sandbox::apply(dump)` once, before the first
 run()/serve() and before any thread exists; it refuses otherwise. Read a
 --preload file before applying and hand its contents to the library as
 `Config.preload_data`: after apply, the only file the run can write is the
@@ -186,7 +186,7 @@ configuring for that. Embedders that build a `Config` with a struct
 literal must set the newer fields (`preload_data`, `fs_quota_bytes`, `seed`,
 `clock`), or use `..Default::default()`.
 
-The restrictions apply to the whole embedding process, not only to v8vm's
+The restrictions apply to the whole embedding process, not only to tardigrade's
 threads. The filters cover every thread (apply refuses unless the caller is
 the only one) and every thread started later inherits them, so all code of
 the embedder after `apply` runs under the same denials, including the rule
@@ -339,7 +339,7 @@ version <v>" (the value is echoed capped at 256 bytes). When a quota is
 set, restore refuses a payload larger than six quotas plus 1 MiB before
 parsing it (JSON escapes control characters to six bytes each, so a
 full-quota filesystem of them still restores from its own snapshot).
-Version 2 dumps are not loadable by older v8vm versions, which would see
+Version 2 dumps are not loadable by older tardigrade versions, which would see
 files named "version", "files" and "dirs" - and for the same reason a
 legacy flat map that contains a file literally named "version" parses as
 a versioned snapshot here, not as a file list. Legacy-key errors show the
@@ -365,13 +365,13 @@ TypeScript below.
 
 ## TypeScript
 
-v8vm itself runs plain JavaScript and gains no dependency for TypeScript:
+tardigrade itself runs plain JavaScript and gains no dependency for TypeScript:
 the support lives at the agent-loop boundary, on the host. Two external
-tools do the work (both are development tools of the loop, never v8vm
+tools do the work (both are development tools of the loop, never tardigrade
 runtime dependencies, and the guest never sees them):
 
 - bun (1.3.5 tested) bundles the app with
-  `bun build <entry> --target=browser --format=iife`. v8vm has no ES module
+  `bun build <entry> --target=browser --format=iife`. tardigrade has no ES module
   resolution, so a multi-file project must become one IIFE before it can
   run: bundling is required, not an optimization. bun does not type-check.
 - tsc-rs (pinned 0.3.0, fetched by npx) type-checks the sources with
@@ -392,11 +392,11 @@ and run.
 
 `make check-ts` smoke-tests the loop: it skips with a printed reason when
 bun (required) or every checker (npx for tsc-rs, or tsc) is missing -
-never a silent pass - and V8VM_REQUIRE_TS=1 makes a missing toolchain
+never a silent pass - and TARDIGRADE_REQUIRE_TS=1 makes a missing toolchain
 fail.
 
 The loop honors three overrides: BUN selects the bun executable (also
-found via PATH or ~/.bun/bin/bun), and V8VM_TSC_RS / V8VM_TSC replace the
+found via PATH or ~/.bun/bin/bun), and TARDIGRADE_TSC_RS / TARDIGRADE_TSC replace the
 two checker commands (each may be several words, for example a pinned
 standalone build or a specific tsc); examples/ts-smoke.sh reads the same
 variables.
@@ -407,9 +407,9 @@ can also run inside the guest itself, though: examples/ts-in-guest loads a
 WebAssembly build of ts-rust (its crates/ts_wasm, built for
 wasm32-wasip1) from vm.fs, bridges the compiler's eight host-fs
 operations onto vm.fs and answers its WASI imports from a ~60-line shim,
-so the whole compiler runs under v8vm's timeout and --sandbox (~0.6 s
+so the whole compiler runs under tardigrade's timeout and --sandbox (~0.6 s
 for a two-file project). --memory does not cap it: the wasm linear memory
-is outside the JS heap cap (like every WebAssembly.Memory in v8vm), and a
+is outside the JS heap cap (like every WebAssembly.Memory in tardigrade), and a
 one-file project peaks near 207 MB of process RSS. Its emit is one file
 per module with import/export kept, so vm.run of it throws SyntaxError -
 a bundler is still needed to run a multi-file project's emit. The 5.9 MB
@@ -422,9 +422,9 @@ is not a stable interface; the agent loop above is the supported path.
 examples/vm.d.ts types the guest API for TypeScript guests - vm and its
 fs, net and stdin namespaces, console, the timers, queueMicrotask,
 TextEncoder/TextDecoder, atob/btoa, structuredClone and performance - so
-a project type-checks against v8vm instead of picking up DOM or Node
+a project type-checks against tardigrade instead of picking up DOM or Node
 types: it assumes "lib": ["esnext"] (which the loop's generated tsconfig
-sets), because v8vm is not a DOM environment - the same file declares the
+sets), because tardigrade is not a DOM environment - the same file declares the
 WebAssembly surface (Module, Instance, Memory, compile, instantiate,
 validate) that lib esnext lacks. It is compared with the runtime by
 tests/cli.rs (vm_dts_members_match_the_runtime): every vm.* member it
@@ -434,7 +434,7 @@ names exists in a live guest, and every runtime member is named.
 
 For hostile code, `--sandbox` puts kernel-level containment around the run.
 Linux x86_64 only (the deny list and the x32 guard are verified on that ABI);
-on any other platform, or on a kernel missing the features, v8vm exits 2
+on any other platform, or on a kernel missing the features, tardigrade exits 2
 without running the guest.
 
 The layers are applied after the host reads the entry source and the preload
@@ -540,9 +540,9 @@ cannot exercise the real layers, so they skip instead of failing:
 - the fail-closed cases, which fake a missing kernel feature, and the
   seccomp-only cases run on every kernel.
 - `make check` skips its `--sandbox` line with a printed reason.
-- `V8VM_REQUIRE_SANDBOX=1` turns every one of those skips into a failure.
+- `TARDIGRADE_REQUIRE_SANDBOX=1` turns every one of those skips into a failure.
   Set it where the kernel is known to have support; CI leaves it unset.
-- `v8vm --sandbox-check` exits 0 when this platform and kernel can sandbox
+- `tardigrade --sandbox-check` exits 0 when this platform and kernel can sandbox
   (x86_64 Linux with Landlock ABI 6) and 2 with a message otherwise; scripts
   gate their skips on it instead of guessing from a refusal message.
 
@@ -580,7 +580,7 @@ On other platforms (not Linux x86_64) the sandbox tests compile away, and
   omission of host APIs, per isolate inside one ordinary process. A V8
   fatal error (see the aborts listed first above) ends the whole
   process and every guest in it. For hostile code, add `--sandbox`
-  (above) and/or run v8vm itself under a container/seccomp profile.
+  (above) and/or run tardigrade itself under a container/seccomp profile.
 - The heap cap terminates the guest, not the process. --memory=N caps the
   JS heap and, separately, ArrayBuffer memory, each at N MB.
   - JS heap: the guest is stopped (exit 137, one-line report on stderr)

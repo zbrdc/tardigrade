@@ -36,8 +36,8 @@ pub(crate) fn report(tc: &mut v8::TryCatch<'_, v8::HandleScope<'_>>) {
             let line = msg.get_line_number(tc).unwrap_or(0);
             let m: v8::Local<v8::Value> = msg.get(tc).into();
             let text = to_rust_string(tc, &m);
-            eprintln!("v8vm: uncaught exception: {}:{}: {}", resource, line, text);
+            eprintln!("tardigrade: uncaught exception: {}:{}: {}", resource, line, text);
         }
-        None => eprintln!("v8vm: uncaught exception"),
+        None => eprintln!("tardigrade: uncaught exception"),
     }
 }

@@ -4,7 +4,7 @@ CARGO_TARGET_DIR ?= target
 export CARGO_TARGET_DIR
 # Extra flags for build, test and clippy, e.g. CARGOFLAGS=--locked in CI.
 CARGOFLAGS ?=
-OUT := $(CARGO_TARGET_DIR)/release/v8vm
+OUT := $(CARGO_TARGET_DIR)/release/tardigrade
 BRIDGE := $(CARGO_TARGET_DIR)/release/serve_bridge
 
 build:
@@ -33,7 +33,7 @@ check: build
 # The TypeScript agent loop (examples/agent-loop-ts.sh): bun bundles the
 # app, tsc-rs (or tsc) type-checks it. Both are host-side dev tools; when
 # they are missing, or present but unusable, this skips loudly (77 becomes
-# TS-SKIPPED, never a silent pass) and V8VM_REQUIRE_TS=1 fails instead.
+# TS-SKIPPED, never a silent pass) and TARDIGRADE_REQUIRE_TS=1 fails instead.
 check-ts: build
 	@OUT=$(OUT) bash examples/ts-smoke.sh; status=$$?; \
 	case $$status in \

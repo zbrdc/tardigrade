@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Host side of the in-guest TypeScript check: embed a ts_rust.wasm build
 # and a project into one RAM-fs snapshot, then run the whole compiler
-# inside a v8vm guest (tsc-guest.js). The guest's exit code is tsc's own.
+# inside a tardigrade guest (tsc-guest.js). The guest's exit code is tsc's own.
 #
-# usage: OUT=<v8vm> TSC_RUST_WASM=<ts_rust.wasm> bash run.sh <project-dir> [workspace.json]
+# usage: OUT=<tardigrade> TSC_RUST_WASM=<ts_rust.wasm> bash run.sh <project-dir> [workspace.json]
 #
 # The project directory needs a tsconfig.json; tsc runs as `-p .` with /app
 # as its working directory, so outDir and include are relative to it. Paths
 # with a newline in them are not supported (the find listing is
 # newline-delimited).
 set -euo pipefail
-OUT=${OUT:?set OUT to the v8vm binary}
+OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 WASM=${TSC_RUST_WASM:?set TSC_RUST_WASM to a ts_rust.wasm build}
 PROJ=${1:?usage: run.sh <project-dir> [workspace.json]}

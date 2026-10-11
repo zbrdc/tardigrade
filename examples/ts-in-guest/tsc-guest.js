@@ -1,6 +1,6 @@
-// The ts-rust WebAssembly build running INSIDE a v8vm guest: it type-checks
+// The ts-rust WebAssembly build running INSIDE a tardigrade guest: it type-checks
 // (and, per the project's tsconfig, transpiles) /app, with the whole
-// compiler under v8vm's timeout and --sandbox (--memory does not cap the
+// compiler under tardigrade's timeout and --sandbox (--memory does not cap the
 // wasm linear memory; see the README's Caveats). The host side is
 // examples/ts-in-guest/run.sh; the wasm artifact is never committed (see
 // examples/ts-in-guest/README.md).

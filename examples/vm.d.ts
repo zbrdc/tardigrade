@@ -1,12 +1,12 @@
-// Type definitions for the v8vm guest API, compared with the runtime by
+// Type definitions for the tardigrade guest API, compared with the runtime by
 // tests/cli.rs (vm_dts_members_match_the_runtime): every vm.* member
 // named here exists in a live guest, and every runtime member is named.
 //
-// v8vm guests are not DOM environments: the tsconfig should not pull in
+// tardigrade guests are not DOM environments: the tsconfig should not pull in
 // lib.dom (the tsconfig that examples/agent-loop-ts.sh generates sets
 // "lib": ["esnext"]), or TextEncoder, WebAssembly and friends would be
 // declared twice - under lib esnext they are otherwise absent, so this
-// file declares the WebAssembly surface v8vm promises.
+// file declares the WebAssembly surface tardigrade promises.
 
 declare namespace vm {
   /** The V8 engine version string. */

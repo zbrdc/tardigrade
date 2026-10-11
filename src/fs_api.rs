@@ -221,7 +221,7 @@ fn check_view(
 /// DataView's contents, or a whole (possibly shared) ArrayBuffer. Views
 /// are copied with their byte_offset/length honored, so a small view over
 /// a large buffer writes only what it can see. SharedArrayBuffer contents
-/// are read as a snapshot; v8vm guests are single-threaded, so no other
+/// are read as a snapshot; tardigrade guests are single-threaded, so no other
 /// thread can mutate them concurrently.
 fn arg_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Result<Vec<u8>, String> {
     if v.is_string() {

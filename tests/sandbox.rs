@@ -32,7 +32,7 @@
 //! Kernel support: cases that need the full Landlock ABI 6 print "SKIPPED
 //! (kernel lacks Landlock ABI 6): <case>" on stderr and pass when the kernel
 //! lacks it. The fail-closed cases fake the missing feature themselves and
-//! run everywhere. V8VM_REQUIRE_SANDBOX=1 turns every such skip into a
+//! run everywhere. TARDIGRADE_REQUIRE_SANDBOX=1 turns every such skip into a
 //! failure.
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -48,12 +48,12 @@ mod run {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::time::{Duration, Instant};
-    use v8vm::sandbox::{apply_layer, apply_probe, denied_syscalls, Layer, PROBE_DENY_ERRNO};
+    use tardigrade::sandbox::{apply_layer, apply_probe, denied_syscalls, Layer, PROBE_DENY_ERRNO};
 
     const PROBE_PREFIX: &str = "--probe-mode=";
     /// Set on the children the harness case spawns, so they do not run the
     /// harness case again (the process chain would never end).
-    const HARNESS_CHILD: &str = "V8VM_SANDBOX_HARNESS_CHILD";
+    const HARNESS_CHILD: &str = "TARDIGRADE_SANDBOX_HARNESS_CHILD";
 
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -135,7 +135,7 @@ mod run {
     fn mode_apply(layer: Option<Layer>, dump: PathBuf, escape_dir: PathBuf) {
         println!("PROBE|threads|{}", thread_count());
         let applied = match layer {
-            None => v8vm::sandbox::apply(Some(&dump)),
+            None => tardigrade::sandbox::apply(Some(&dump)),
             Some(layer) => apply_layer(layer, Some(&dump)),
         };
         if let Err(e) = applied {
@@ -534,14 +534,14 @@ mod run {
         let keeper = std::thread::spawn(move || {
             let _ = rx.recv();
         });
-        report_apply("late-thread", v8vm::sandbox::apply(None));
+        report_apply("late-thread", tardigrade::sandbox::apply(None));
         drop(tx);
         let _ = keeper.join();
     }
 
     fn mode_late_v8() {
-        let _ = v8vm::run("", "noop.js", &v8vm::Config::new());
-        report_apply("late-v8", v8vm::sandbox::apply(None));
+        let _ = tardigrade::run("", "noop.js", &tardigrade::Config::new());
+        report_apply("late-v8", tardigrade::sandbox::apply(None));
     }
 
     /// Simulates a kernel without a layer: the layer's setup syscall fails
@@ -553,7 +553,7 @@ mod run {
             // hide the seccomp refusal under test.
             apply_layer(Layer::Seccomp, None)
         } else {
-            v8vm::sandbox::apply(None)
+            tardigrade::sandbox::apply(None)
         };
         report_apply(name, applied);
     }
@@ -567,7 +567,7 @@ mod run {
         run_tests(&Options::parse(&args))
     }
 
-    fn report_apply(name: &str, applied: Result<(), v8vm::sandbox::SandboxError>) {
+    fn report_apply(name: &str, applied: Result<(), tardigrade::sandbox::SandboxError>) {
         match applied {
             Err(e) => println!("PROBE|{}|refused:{}", name, e),
             Ok(()) => println!("PROBE|{}|ok", name),
@@ -634,7 +634,7 @@ mod run {
     /// unexpectedly successful call damages nothing that matters.
     fn new_syscall_probes(dump: &Path) -> Vec<Probe> {
         let path = CString::new(path_string(dump)).expect("dump path");
-        let name = addr(c"user.v8vm".as_ptr());
+        let name = addr(c"user.tardigrade".as_ptr());
         // struct xattr_args { u64 value; u32 size; u32 flags; }
         let mut args = [0u8; 16];
         args[0..8].copy_from_slice(&1u64.to_ne_bytes());
@@ -718,7 +718,7 @@ mod run {
             let path = addr(c"/".as_ptr());
             sys(libc::SYS_fanotify_mark, [-1, libc::FAN_MARK_ADD as _, 0, libc::AT_FDCWD as _, path])
         }),
-        ("mq-open", || sys(libc::SYS_mq_open, [addr(c"/v8vm-probe-none".as_ptr()), libc::O_RDONLY as _, 0, 0, 0])),
+        ("mq-open", || sys(libc::SYS_mq_open, [addr(c"/tardigrade-probe-none".as_ptr()), libc::O_RDONLY as _, 0, 0, 0])),
         ("mq-timedsend", || sys(libc::SYS_mq_timedsend, [-1, addr(c"x".as_ptr()), 1, 0, 0])),
         ("mq-timedreceive", || {
             let mut buf = [0u8; 8192];
@@ -903,14 +903,14 @@ mod run {
     // ---- fixtures the probes aim at in the parent ----
 
     fn fixture_queue_name(owner: i32) -> String {
-        format!("/v8vm-probe-{}", owner)
+        format!("/tardigrade-probe-{}", owner)
     }
 
     /// Abstract unix socket address named after its owner's pid.
     fn abstract_addr(owner: i32) -> (libc::sockaddr_un, libc::socklen_t) {
         let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let name = format!("v8vm-probe-{}", owner);
+        let name = format!("tardigrade-probe-{}", owner);
         for (slot, byte) in address.sun_path[1..].iter_mut().zip(name.bytes()) {
             *slot = byte as libc::c_char;
         }
@@ -1335,7 +1335,7 @@ mod run {
         if case.needs_kernel && !common::kernel_supports_sandbox() {
             if common::sandbox_required() {
                 println!(
-                    "test {} ... FAILED (kernel lacks Landlock ABI {} and V8VM_REQUIRE_SANDBOX=1)",
+                    "test {} ... FAILED (kernel lacks Landlock ABI {} and TARDIGRADE_REQUIRE_SANDBOX=1)",
                     case.name,
                     common::REQUIRED_LANDLOCK_ABI
                 );
@@ -1460,7 +1460,7 @@ mod run {
     }
 
     /// On a kernel without Landlock, cases that need it print SKIPPED and
-    /// pass, the fail-closed case still runs, and V8VM_REQUIRE_SANDBOX=1
+    /// pass, the fail-closed case still runs, and TARDIGRADE_REQUIRE_SANDBOX=1
     /// turns the skip into a failure.
     fn harness_old_kernel() {
         let needs_kernel = "full_sandbox_denies_exec_network_process_and_signals";
@@ -1468,7 +1468,7 @@ mod run {
         let mut cmd = harness_command();
         cmd.arg(format!("{}old-kernel", PROBE_PREFIX)).args([needs_kernel, fail_closed]);
 
-        let lenient = run_bounded(cmd.env_remove("V8VM_REQUIRE_SANDBOX"));
+        let lenient = run_bounded(cmd.env_remove("TARDIGRADE_REQUIRE_SANDBOX"));
         let stdout = String::from_utf8_lossy(&lenient.stdout);
         let stderr = String::from_utf8_lossy(&lenient.stderr);
         assert!(lenient.status.success(), "skip must pass: {} {}", stdout, stderr);
@@ -1476,8 +1476,8 @@ mod run {
         assert!(stderr.contains(&notice), "missing skip notice: {}", stderr);
         assert!(stdout.contains("1 run; 0 failed; 1 skipped"), "fail-closed case must run: {}", stdout);
 
-        let strict = run_bounded(cmd.env("V8VM_REQUIRE_SANDBOX", "1"));
-        assert!(!strict.status.success(), "V8VM_REQUIRE_SANDBOX=1 must fail the skip");
+        let strict = run_bounded(cmd.env("TARDIGRADE_REQUIRE_SANDBOX", "1"));
+        assert!(!strict.status.success(), "TARDIGRADE_REQUIRE_SANDBOX=1 must fail the skip");
         assert!(String::from_utf8_lossy(&strict.stdout).contains("FAILED (kernel lacks Landlock"));
     }
 
@@ -1673,12 +1673,12 @@ mod run {
     fn live_threads_restricted() {
         const LIMIT: Duration = Duration::from_secs(60);
         let script = write_guest("alive", "setTimeout(() => console.log('done'), 1500);");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_v8vm"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tardigrade"));
         cmd.args(["--sandbox", script.to_str().unwrap()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn v8vm");
+        let mut child = cmd.spawn().expect("spawn tardigrade");
         let deadline = Instant::now() + LIMIT;
         let statuses = wait_for_statuses(child.id(), 8, Duration::from_secs(2));
         assert!(statuses.len() > 1, "V8 worker threads must exist");
@@ -1692,15 +1692,15 @@ mod run {
             assert_eq!(count, 3, "filter count: {}", first_lines(status));
         }
         drop(child.stdin.take()); // release stdin so the guest can finish
-        while child.try_wait().expect("poll v8vm").is_none() {
+        while child.try_wait().expect("poll tardigrade").is_none() {
             if Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("v8vm still running after {:?}", LIMIT);
+                panic!("tardigrade still running after {:?}", LIMIT);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let out = child.wait_with_output().expect("collect v8vm output");
+        let out = child.wait_with_output().expect("collect tardigrade output");
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     }
 
@@ -1713,7 +1713,7 @@ mod run {
         std::fs::write(&dump, "OLD").expect("seed dump");
         std::fs::write(&preload, "{ not json").expect("bad preload");
         let script = write_guest("early", "console.log('ran');");
-        let out = v8vm_output(&[
+        let out = tardigrade_output(&[
             "--sandbox",
             &format!("--preload={}", preload.display()),
             &format!("--dump={}", dump.display()),
@@ -1724,7 +1724,7 @@ mod run {
         assert_eq!(std::fs::read_to_string(&dump).unwrap(), "OLD");
 
         let ok = write_guest("early-ok", "vm.fs.write('/k', 'v');");
-        let out = v8vm_output(&["--sandbox", &format!("--dump={}", dump.display()), ok.to_str().unwrap()]);
+        let out = tardigrade_output(&["--sandbox", &format!("--dump={}", dump.display()), ok.to_str().unwrap()]);
         assert_eq!(out.status.code(), Some(0));
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dump).unwrap()).expect("dump json");
@@ -1734,8 +1734,8 @@ mod run {
         );
     }
 
-    fn v8vm_output(args: &[&str]) -> Output {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_v8vm"));
+    fn tardigrade_output(args: &[&str]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tardigrade"));
         run_bounded(cmd.args(args))
     }
 

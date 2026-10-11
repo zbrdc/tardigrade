@@ -4,16 +4,16 @@
 # usable: the npx probe must actually fetch tsc-rs (bounded by timeout 60,
 # so offline with no cache counts as missing), or tsc must run. Either
 # missing is a loud skip - exit 77, the automake skip code, reason on
-# stderr - never a silent pass; V8VM_REQUIRE_TS=1 makes the skip a
-# failure. bun and the checker are host-side dev tools, not v8vm runtime
+# stderr - never a silent pass; TARDIGRADE_REQUIRE_TS=1 makes the skip a
+# failure. bun and the checker are host-side dev tools, not tardigrade runtime
 # dependencies.
 set -u
-OUT=${OUT:?set OUT to the v8vm binary}
+OUT=${OUT:?set OUT to the tardigrade binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 # The same command variables as the loop itself, so an override here and
 # there is one setting (each may be several words).
-TSC_RS=${V8VM_TSC_RS:-npx -y tsc-rs@0.3.0}
-TSC=${V8VM_TSC:-tsc}
+TSC_RS=${TARDIGRADE_TSC_RS:-npx -y tsc-rs@0.3.0}
+TSC=${TARDIGRADE_TSC:-tsc}
 
 find_bun() {
   if [ -n "${BUN:-}" ] && command -v "$BUN" >/dev/null 2>&1; then
@@ -28,8 +28,8 @@ find_bun() {
 }
 
 skip() {
-  if [ "${V8VM_REQUIRE_TS:-}" = 1 ]; then
-    echo "ts smoke: V8VM_REQUIRE_TS=1 but $1" >&2
+  if [ "${TARDIGRADE_REQUIRE_TS:-}" = 1 ]; then
+    echo "ts smoke: TARDIGRADE_REQUIRE_TS=1 but $1" >&2
     exit 1
   fi
   echo "SKIPPED ($1): TypeScript agent-loop smoke check" >&2
