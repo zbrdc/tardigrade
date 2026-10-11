@@ -90,15 +90,21 @@ impl HeapGuard {
 /// limit, with the limit about to block an allocation. Mark the OOM
 /// termination, request it, and raise the limit generously so the pending
 /// allocation succeeds and JavaScript resumes into the termination
-/// instead of dying inside V8's retry.
+/// instead of dying inside V8's retry. After the run has concluded only
+/// the raise happens (see the finished check below).
 pub(crate) extern "C" fn on_near_heap_limit(
     data: *mut c_void,
     current: usize,
     _initial: usize,
 ) -> usize {
     let guard = unsafe { &*(data as *const HeapGuard) };
-    guard.term.mark(TermReason::Oom);
-    guard.handle.terminate_execution();
+    // Once the run has concluded (teardown GCs, end-of-run work that still
+    // runs V8) a mark would be consumed by nobody and a termination would
+    // be swallowed by that work: raise the limit and stay out of the way.
+    if !guard.term.is_finished() {
+        guard.term.mark(TermReason::Oom);
+        guard.handle.terminate_execution();
+    }
     guard.limit_ceiling.max(current)
 }
 

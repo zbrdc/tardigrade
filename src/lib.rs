@@ -235,6 +235,7 @@ fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
         }
         None if tc.is_execution_terminating() => {
             tc.cancel_terminate_execution();
+            eprintln!("v8vm: terminated while snapshotting; dump not written");
         }
         None => {
             report(&mut tc);
@@ -345,8 +346,10 @@ fn execute(source: &str, entry: &str, cfg: &Config, replies: Option<&serve::Repl
         let mut scope = v8::ContextScope::new(&mut hs, context);
         execute_inner(&mut scope, &handle, &spec, replies)
     };
-    // The run has concluded: heap callbacks for the teardown GC stay
-    // inert from here on, and the guard drops after the isolate.
+    // Normally Watchdog::drop already finished the run; the early returns
+    // (prelude or preload failure) get here without one. Either way heap
+    // callbacks for the teardown GC stay inert, and the guard drops after
+    // the isolate.
     term.finish();
     code
 }

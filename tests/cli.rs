@@ -272,8 +272,8 @@ fn memory_below_eight_is_a_usage_error() {
 
 #[test]
 fn map_number_growth_reports_137_not_v8s_fatal_oom() {
-    // Table growth never reached the near-heap-limit callback on the old
-    // single-layer design: V8 aborted the process instead.
+    // Table growth must end in the near-heap-limit callback (137), not in
+    // V8's fatal out-of-memory abort.
     let path = script("oom-map", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
     for cap in ["32", "64"] {
         let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
@@ -292,8 +292,8 @@ fn map_number_growth_reports_137_not_v8s_fatal_oom() {
 
 #[test]
 fn small_object_growth_reports_137() {
-    // Fine-grained growth never reaches the near-heap-limit callback in
-    // this V8; the GC epilogue is what catches it at the cap.
+    // Fine-grained growth of small live objects must end in the
+    // near-heap-limit callback too.
     let path = script("oom-objects", "const a = []; for (;;) a.push({});");
     let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
@@ -435,7 +435,7 @@ fn a_live_set_with_map_copies_under_the_cap_never_reports_137() {
 #[test]
 fn arraybuffer_budget_fractions_of_the_cap() {
     // Held buffers at 25/50/90 percent of the cap with churn on top must
-    // all pass; the shared budget refuses only past the cap.
+    // all pass; the allocator budget refuses only past the cap.
     for (live, cap) in [("16", "64"), ("32", "64"), ("57", "64")] {
         let source = "const keep = []; let n = 0;
              for (let i = 0; i < 200; i++) {
@@ -623,6 +623,25 @@ fn dump_is_skipped_after_an_oom() {
         r.stderr
     );
     assert!(!dump.exists(), "no dump may be written from an exhausted heap");
+}
+
+#[test]
+fn a_dump_that_crosses_the_heap_limit_is_still_written() {
+    // 'x'.repeat builds cons strings, so the run itself stays tiny; the
+    // end-of-run snapshot flattens them past V8's limit at this cap. The
+    // heap callback must stay silent once the run has finished: marking
+    // and terminating there silently dropped the dump with exit 0.
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("late-oom-dump.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script(
+        "late-oom-dump",
+        "for (let i = 0; i < 6; i++) vm.fs.write('/f' + i, String.fromCharCode(97 + i).repeat(12 * 1024 * 1024));",
+    );
+    let r = v8vm(&["--memory=16", &format!("--dump={}", dump.display()), path.to_str().unwrap()], b"");
+    assert!(dump.exists(), "dump missing; code {} stderr: {}", r.code, r.stderr);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let json = std::fs::read_to_string(&dump).unwrap();
+    assert!(json.contains("/f5"), "all six files in the dump");
 }
 
 #[test]
