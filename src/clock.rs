@@ -26,31 +26,33 @@ pub(crate) enum RunClock {
 }
 
 impl RunClock {
-    /// Milliseconds elapsed on the run's timeline: the timers' timeline
-    /// and performance.now()'s value.
-    pub(crate) fn now_ms(&self) -> u64 {
+    /// The current point on the run's timer timeline, in the timeline's
+    /// own ticks: nanoseconds since the run started under Real (so a
+    /// deadline can sit exactly `delay` away, neither rounded up to a
+    /// millisecond nor truncated), whole milliseconds under Virtual.
+    /// Timers, the loop's park decision and wake deadlines all use these
+    /// ticks; ticks of one clock are only ever compared within a run.
+    pub(crate) fn now(&self) -> u64 {
         match self {
-            RunClock::Real(origin) => origin.elapsed().as_millis() as u64,
+            RunClock::Real(origin) => origin.elapsed().as_nanos() as u64,
             RunClock::Virtual { now_ms, .. } => *now_ms,
         }
     }
 
-    /// A deadline `delay_ms` into the future on the run's timeline. Real
-    /// time rounds the elapsed time up first: now_ms floors, and a
-    /// deadline built on a floored now could let a timer fire a fraction
-    /// of a millisecond before its full delay has passed. Virtual time is
-    /// exact already, so it just adds.
+    /// A deadline `delay_ms` into the future on the same timeline: exact
+    /// addition, so a timer never fires before its full delay (the +1 ns
+    /// covers the sub-nanosecond fraction the clock floors away) and
+    /// never pays rounding on top of the delay.
     pub(crate) fn deadline_after(&self, delay_ms: u64) -> u64 {
         match self {
-            RunClock::Real(origin) => {
-                // Nanosecond ceil: even a sub-microsecond fractional part
-                // must push the deadline to the next whole millisecond.
-                // Nanosecond ceil: even a sub-microsecond fractional part
-                // must push the deadline to the next whole millisecond.
-                let nanos = origin.elapsed().as_nanos();
-                u64::try_from(nanos.div_ceil(1_000_000) + u128::from(delay_ms))
-                    .unwrap_or(u64::MAX)
-            }
+            RunClock::Real(origin) => u64::try_from(
+                origin
+                    .elapsed()
+                    .as_nanos()
+                    .saturating_add(u128::from(delay_ms).saturating_mul(1_000_000))
+                    + 1,
+            )
+            .unwrap_or(u64::MAX),
             RunClock::Virtual { now_ms, .. } => now_ms.saturating_add(delay_ms),
         }
     }
@@ -109,18 +111,18 @@ mod tests {
     #[test]
     fn the_virtual_clock_advances_only_through_advance_to() {
         let mut c = RunClock::Virtual { epoch_ms: 5, now_ms: 0 };
-        assert_eq!(c.now_ms(), 0);
+        assert_eq!(c.now(), 0);
         assert_eq!(c.perf_ms(), 0.0);
         assert_eq!(c.date_ms(), 5, "the epoch is the Date zero point");
         c.advance_to(300);
-        assert_eq!((c.now_ms(), c.perf_ms(), c.date_ms()), (300, 300.0, 305));
+        assert_eq!((c.now(), c.perf_ms(), c.date_ms()), (300, 300.0, 305));
     }
 
     #[test]
     fn advance_to_never_moves_the_clock_backwards() {
         let mut c = RunClock::Virtual { epoch_ms: 0, now_ms: 100 };
         c.advance_to(40);
-        assert_eq!(c.now_ms(), 100, "a stale deadline must not rewind time");
+        assert_eq!(c.now(), 100, "a stale deadline must not rewind time");
     }
 
     #[test]
@@ -135,24 +137,34 @@ mod tests {
             Clock::MAX_EPOCH_MS,
             "past the ECMAScript maximum the Date timeline clamps"
         );
-        assert_eq!(c.now_ms(), 10, "the timeline itself keeps counting");
+        assert_eq!(c.now(), 10, "the timeline itself keeps counting");
     }
 
     #[test]
-    fn real_deadlines_round_the_elapsed_time_up() {
-        // A deadline must never be in the past of the exact elapsed time:
-        // scheduling at elapsed 0.9 ms for +1 must not be due at 1 ms
-        // (0.1 ms early). The fractional part here is whatever the
-        // scheduler left, and the assertion must hold for all of them.
+    fn real_deadlines_add_the_delay_exactly() {
+        // Two properties, pinned without a millisecond timeline in the
+        // way: the deadline is never before the scheduling instant plus
+        // the delay (a timer cannot fire early), and it carries no
+        // rounding on top (a hop does not pay an extra millisecond). The
+        // nanosecond ticks cover both exactly; the +1 ns is the
+        // floored-fraction allowance.
         let origin = std::time::Instant::now();
-        let exact_now = origin.elapsed();
-        let deadline = RunClock::Real(origin).deadline_after(5);
-        let as_duration = std::time::Duration::from_millis(deadline);
+        let clock = RunClock::Real(origin);
+        let before = origin.elapsed().as_nanos();
+        let deadline = clock.deadline_after(5) as u128;
+        let after = origin.elapsed().as_nanos();
+        let delay_ns = 5_000_000u128;
         assert!(
-            as_duration >= exact_now + std::time::Duration::from_millis(5),
-            "deadline {:?} covers exact elapsed {:?} + 5 ms",
-            as_duration,
-            exact_now
+            deadline + 1 >= before + delay_ns,
+            "deadline {} does not cover {} + 5 ms",
+            deadline,
+            before
+        );
+        assert!(
+            deadline <= after + delay_ns + 1,
+            "deadline {} pads beyond {} + 5 ms",
+            deadline,
+            after
         );
     }
 
@@ -168,15 +180,16 @@ mod tests {
     fn a_real_clock_measures_elapsed_time() {
         let before = std::time::Instant::now();
         let c = RunClock::Real(before);
-        assert_eq!(c.now_ms(), 0, "a fresh real clock starts at zero");
+        assert!(c.now() < 1_000_000, "a fresh real clock is under a millisecond in");
         assert!(!c.is_virtual());
         std::thread::sleep(std::time::Duration::from_millis(15));
-        assert!(c.now_ms() >= 10, "roughly the slept time has passed");
+        // Real ticks are nanoseconds; 10 ms past the sleep is 10 ms of ns.
+        assert!(c.now() >= 10_000_000, "roughly the slept time has passed");
         assert!(c.perf_ms() >= 10.0);
         assert_eq!(c.date_ms(), 0, "real runs never read the virtual Date");
         // Mutating a real clock is a no-op, so shared loop code stays safe.
         let mut c2 = RunClock::Real(std::time::Instant::now());
-        c2.advance_to(1000);
-        assert!(c2.now_ms() < 1000);
+        c2.advance_to(1_000_000_000_000);
+        assert!(c2.now() < 1_000_000_000_000);
     }
 }

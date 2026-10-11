@@ -16,16 +16,17 @@ use crate::timers::RunningTimer;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
 /// survives between loop turns. The deadline sits on the run's clock
-/// timeline (ms since the run started), so real and virtual runs share
-/// one scheduling path; `seq` is the registration order, and timers due
-/// at the same millisecond fire in it (Node and mainline are FIFO, and
-/// whole-ms deadlines make ties common).
+/// timeline in its own ticks (nanoseconds under Real, milliseconds
+/// under Virtual), so real and virtual runs share one scheduling path;
+/// `seq` is the registration order, and timers due at the same instant
+/// fire in it (Node and mainline are FIFO, and equal deadlines are
+/// common in virtual mode's whole milliseconds).
 pub(crate) struct Timer {
     pub(crate) id: u64,
     pub(crate) seq: u64,
     pub(crate) repeat: bool,
     pub(crate) interval_ms: u64,
-    pub(crate) when_ms: u64,
+    pub(crate) when: u64,
     pub(crate) cb: v8::Global<v8::Function>,
 }
 

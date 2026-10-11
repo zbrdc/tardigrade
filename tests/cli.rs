@@ -2096,20 +2096,61 @@ fn virtual_tied_deadlines_across_schedules_fire_in_registration_order() {
 }
 
 #[test]
-fn real_mode_never_fires_a_timer_before_its_delay() {
-    // Chained timers compound any per-timer earliness: 100 hops of 5 ms
-    // must span at least 500 ms of measured time (performance.now is
-    // the same monotonic clock the deadlines round up from). Deadadlines
-    // used to floor the elapsed time, letting each hop start early by
-    // its fractional millisecond.
+fn real_mode_timers_are_exact_neither_early_nor_padded() {
+    // Round-2 regression: whole-millisecond deadlines rounded up made
+    // every hop pay up to one extra millisecond (300 chained setTimeout(0)
+    // measured 617 ms where main and Node take ~316; 100 x 5 ms measured
+    // 601 against 502). Real deadlines are exact nanoseconds from the
+    // run's clock now, so the two pinned properties are: never early
+    // (the 100 x 5 ms chain spans at least 500 ms) and no padding (the
+    // 300 x 0 ms chain - each hop clamped to 1 ms - finishes well under
+    // the 450 ms CI bound; ~320 ms measured), with interval drift close
+    // to the asked period.
     let r = run_js(
-        "vclock-no-early",
-        "const t0 = performance.now(); let n = 0;\n         const hop = () => {\n           if (++n === 100) { console.log(Math.round(performance.now() - t0)); return; }\n           setTimeout(hop, 5);\n         };\n         setTimeout(hop, 5);",
+        "vclock-exact",
+        r#"
+        const done = [];
+        const t0 = performance.now(); let n = 0;
+        (function step() {
+          if (++n < 300) setTimeout(step, 0);
+          else done.push("chain0", Math.round(performance.now() - t0));
+        })();
+        const t5 = performance.now(); let m = 0;
+        (function hop() {
+          if (++m < 100) setTimeout(hop, 5);
+          else done.push("chain5", Math.round(performance.now() - t5));
+        })();
+        const ti = performance.now(); let k = 0;
+        const iv = setInterval(() => {
+          if (++k === 30) { clearInterval(iv); done.push("iv30", Math.round(performance.now() - ti)); }
+        }, 10);
+        setTimeout(() => console.log(done.join(" ")), 4000);
+        "#,
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    let ms: u64 = r.stdout.trim().parse().unwrap();
-    assert!(ms >= 500, "timers fired early: 100 x 5 ms spanned only {} ms", ms);
-    assert!(ms < 5000, "timers fired far too late: {} ms", ms);
+    // Completion order varies with the three chains' lengths; find each
+    // measurement by its label.
+    let toks: Vec<&str> = r.stdout.split_whitespace().collect();
+    let labeled = |want: &str| -> u64 {
+        let i = toks.iter().position(|t| *t == want).unwrap_or_else(|| {
+            panic!("label {} missing from {:?}", want, toks)
+        });
+        toks[i + 1].parse().unwrap()
+    };
+    let chain0_ms = labeled("chain0");
+    let chain5_ms = labeled("chain5");
+    let iv30_ms = labeled("iv30");
+    // Each 0-delay hop waits its clamped 1 ms: at least 300 ms, and the
+    // padding bound would catch the old +1 ms per hop (~617 ms).
+    assert!((300..450).contains(&chain0_ms), "chain0 {} ms", chain0_ms);
+    // Never early: 100 hops of a full 5 ms each.
+    assert!(chain5_ms >= 500, "chain5 {} ms", chain5_ms);
+    assert!(chain5_ms < 650, "chain5 {} ms", chain5_ms);
+    // 30 interval ticks at 10 ms: no early fire, and drift close to the
+    // asked period (the old ms-rounded timeline measured ~11.07 ms per
+    // tick, i.e. ~332 ms here).
+    assert!(iv30_ms >= 299, "iv30 {} ms", iv30_ms);
+    assert!(iv30_ms < 325, "iv30 {} ms (mean tick {} ms)", iv30_ms, iv30_ms / 30);
 }
 
 #[test]

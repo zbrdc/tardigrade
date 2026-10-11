@@ -109,15 +109,15 @@ fn run_net(scope: &mut HandleScope) -> Option<i32> {
 
 fn run_timers(scope: &mut HandleScope) -> Option<i32> {
     loop {
-        let now = world_mut(scope).clock.now_ms();
+        let now = world_mut(scope).clock.now();
         let idx = {
             let world = world_mut(scope);
             world
                 .timers
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.when_ms <= now)
-                .min_by_key(|(_, t)| (t.when_ms, t.seq))
+                .filter(|(_, t)| t.when <= now)
+                .min_by_key(|(_, t)| (t.when, t.seq))
                 .map(|(i, _)| i)
         };
         let idx = idx?;
@@ -145,7 +145,7 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
             // registered while it ran, keeping one FIFO order for ties.
             timer.seq = world.next_timer_seq;
             world.next_timer_seq += 1;
-            timer.when_ms = world.clock.deadline_after(interval_ms.max(1));
+            timer.when = world.clock.deadline_after(interval_ms.max(1));
             world.timers.push(timer);
         }
     }
@@ -321,7 +321,7 @@ fn park_between_turns(
         }
         if has_timers {
             let world = world_mut(scope);
-            if let Some(next) = world.timers.iter().map(|t| t.when_ms).min() {
+            if let Some(next) = world.timers.iter().map(|t| t.when).min() {
                 world.clock.advance_to(next);
             }
             return Park::Spin;
@@ -340,18 +340,19 @@ fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> 
     let mut wake = Duration::from_millis(cap);
     if has_timers {
         let world = world_mut(scope);
-        let now = world.clock.now_ms();
+        let now = world.clock.now();
         // A deadline already reached (or saturated past u64) leaves the
-        // poll cadence in charge.
+        // poll cadence in charge. Ticks are nanoseconds in real mode,
+        // the only mode that sleeps to a timer.
         if let Some(till) = world
             .timers
             .iter()
-            .map(|t| t.when_ms)
+            .map(|t| t.when)
             .min()
             .unwrap_or(u64::MAX)
             .checked_sub(now)
         {
-            let till = Duration::from_millis(till);
+            let till = Duration::from_nanos(till);
             if till < wake {
                 wake = till;
             }
