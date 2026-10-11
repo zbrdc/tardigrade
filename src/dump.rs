@@ -110,7 +110,7 @@ fn create_temp_from(dump: &Path, suffixes: impl Iterator<Item = String>) -> io::
 fn temp_sibling(dump: &Path, suffix: &str) -> PathBuf {
     let name = dump.file_name().unwrap_or_default().to_string_lossy();
     let name = truncate_at_char(&name, TEMP_NAME_PART_MAX);
-    dump.with_file_name(format!(".{}.v8vm-{}-{}.tmp", name, std::process::id(), suffix))
+    dump.with_file_name(format!(".{}.tardigrade-{}-{}.tmp", name, std::process::id(), suffix))
 }
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a
@@ -132,7 +132,7 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Scratch {
-            let dir = std::env::temp_dir().join(format!("v8vm-dump-{}-{}", name, std::process::id()));
+            let dir = std::env::temp_dir().join(format!("tardigrade-dump-{}-{}", name, std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("create scratch dir");
             Scratch(dir)

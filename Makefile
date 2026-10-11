@@ -4,7 +4,7 @@ CARGO_TARGET_DIR ?= target
 export CARGO_TARGET_DIR
 # Extra flags for build, test and clippy, e.g. CARGOFLAGS=--locked in CI.
 CARGOFLAGS ?=
-OUT := $(CARGO_TARGET_DIR)/release/v8vm
+OUT := $(CARGO_TARGET_DIR)/release/tardigrade
 BRIDGE := $(CARGO_TARGET_DIR)/release/serve_bridge
 
 build:

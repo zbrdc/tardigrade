@@ -238,7 +238,7 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
         }
         None => "unknown".to_string(),
     };
-    eprintln!("v8vm: unhandled promise rejection: {}", text);
+    eprintln!("tardigrade: unhandled promise rejection: {}", text);
     Some(1)
 }
 

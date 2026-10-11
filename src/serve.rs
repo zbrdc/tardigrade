@@ -443,7 +443,7 @@ fn settle_after_reply(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> 
     if let Some(code) = recover_command_timeout(scope, wd) {
         return Some(code);
     }
-    eprintln!("v8vm: command timed out after its reply");
+    eprintln!("tardigrade: command timed out after its reply");
     None
 }
 

@@ -1,4 +1,4 @@
-# CI for v8vm. The v8 crate downloads a prebuilt static V8 into
+# CI for tardigrade. The v8 crate downloads a prebuilt static V8 into
 # target/release/gn_out on its first build, so the first uncached run is
 # slow. The workflow caches that directory explicitly with cache-directories
 # on Swatinem/rust-cache, because rust-cache's target cleanup would otherwise
@@ -39,9 +39,9 @@ jobs:
         # --sandbox needs Landlock ABI 6 (Linux 6.12). Hosted runners may run
         # an older kernel, so the sandbox runtime tests and the make check
         # sandbox line report a skip and pass there, gated on the kernel's
-        # actual Landlock ABI (v8vm --sandbox-check), never on a refusal
+        # actual Landlock ABI (tardigrade --sandbox-check), never on a refusal
         # message: a kernel that can sandbox but refuses fails the gate.
-        # V8VM_REQUIRE_SANDBOX=1 would make a missing kernel feature fail
+        # TARDIGRADE_REQUIRE_SANDBOX=1 would make a missing kernel feature fail
         # instead; set it in this step's env only on a runner known to have
         # the support, so a silent skip cannot hide a regression. It is
         # deliberately unset here.

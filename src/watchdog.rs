@@ -34,7 +34,7 @@ impl Watchdog {
     pub(crate) fn new(iso: v8::IsolateHandle, timeout_ms: u64, term: Arc<Termination>) -> Self {
         let term2 = term.clone();
         let spawned = std::thread::Builder::new()
-            .name("v8vm-run-wd".to_string())
+            .name("tardigrade-run-wd".to_string())
             .spawn(move || {
                 let deadline = if timeout_ms == 0 {
                     None
@@ -89,7 +89,7 @@ impl Watchdog {
         let thread = match spawned {
             Ok(t) => Some(t),
             Err(e) => {
-                eprintln!("v8vm: cannot spawn run watchdog: {}", e);
+                eprintln!("tardigrade: cannot spawn run watchdog: {}", e);
                 None
             }
         };
@@ -169,7 +169,7 @@ fn spawn_guard(iso: v8::IsolateHandle, term: Arc<Termination>, deadline: Instant
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let parked = stop.clone();
     let thread = std::thread::Builder::new()
-        .name("v8vm-command-watchdog".to_string())
+        .name("tardigrade-command-watchdog".to_string())
         .spawn(move || command_thread(iso, term, parked, deadline));
     match thread {
         Ok(t) => Guard {
@@ -177,7 +177,7 @@ fn spawn_guard(iso: v8::IsolateHandle, term: Arc<Termination>, deadline: Instant
             thread: Some(t),
         },
         Err(e) => {
-            eprintln!("v8vm: cannot spawn command watchdog: {}", e);
+            eprintln!("tardigrade: cannot spawn command watchdog: {}", e);
             Guard { stop, thread: None }
         }
     }

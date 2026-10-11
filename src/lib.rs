@@ -1,4 +1,4 @@
-//! v8vm: run small JavaScript applications entirely in RAM on the Chromium
+//! tardigrade: run small JavaScript applications entirely in RAM on the Chromium
 //! V8 engine, embedded through the v8 crate.
 //!
 //! Library surface: [run] executes one guest program and returns its exit
@@ -239,7 +239,7 @@ fn preload_text(cfg: &Config) -> Result<Option<(String, String)>, i32> {
     match read_path(path) {
         Some(state) => Ok(Some((state, name))),
         None => {
-            eprintln!("v8vm: cannot open preload {}", name);
+            eprintln!("tardigrade: cannot open preload {}", name);
             Err(2)
         }
     }
@@ -257,7 +257,7 @@ fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
         Some(v) => v,
         // Past V8's maximum string length: refuse the run, do not panic.
         None => {
-            eprintln!("v8vm: preload {} is too large to load", name);
+            eprintln!("tardigrade: preload {} is too large to load", name);
             return Some(2);
         }
     };
@@ -326,14 +326,14 @@ fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
     let json = match snapshot::encode(&fs.files, &fs.dirs) {
         Ok(json) => json,
         Err(e) => {
-            eprintln!("v8vm: snapshot failed; dump not written: {}", e);
+            eprintln!("tardigrade: snapshot failed; dump not written: {}", e);
             return false;
         }
     };
     match dump::write(dump, &json) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("v8vm: cannot write dump {}: {}", dump.display(), e);
+            eprintln!("tardigrade: cannot write dump {}: {}", dump.display(), e);
             false
         }
     }
@@ -465,7 +465,7 @@ pub fn run(source: &str, entry: &str, cfg: &Config) -> i32 {
         replies: None,
         done,
     });
-    finish(rx.recv().expect("v8vm guest finished"))
+    finish(rx.recv().expect("tardigrade guest finished"))
 }
 
 /// Resumes a guest panic on the calling thread, preserving its payload.
@@ -498,5 +498,5 @@ pub fn serve<W: Write>(mut output: W, source: &str, entry: &str, cfg: &Config) -
         let _ = output.flush();
         let _ = ack.send(());
     }
-    finish(rx.recv().expect("v8vm guest finished"))
+    finish(rx.recv().expect("tardigrade guest finished"))
 }

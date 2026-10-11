@@ -10,48 +10,48 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use v8vm::Config;
+use tardigrade::Config;
 
 #[test]
 fn run_returns_the_guest_exit_code_and_can_run_again() {
-    let cfg = v8vm::Config { heap_mb: 32, ..v8vm::Config::new() };
-    assert_eq!(v8vm::run("vm.exit(3)", "a.js", &cfg), 3);
-    assert_eq!(v8vm::run("", "empty.js", &cfg), 0);
-    assert_eq!(v8vm::run("throw new Error('x')", "b.js", &cfg), 1);
-    assert_eq!(v8vm::run("for (;;) {}", "spin.js", &v8vm::Config { timeout_ms: 50, ..cfg }), 124);
+    let cfg = tardigrade::Config { heap_mb: 32, ..tardigrade::Config::new() };
+    assert_eq!(tardigrade::run("vm.exit(3)", "a.js", &cfg), 3);
+    assert_eq!(tardigrade::run("", "empty.js", &cfg), 0);
+    assert_eq!(tardigrade::run("throw new Error('x')", "b.js", &cfg), 1);
+    assert_eq!(tardigrade::run("for (;;) {}", "spin.js", &tardigrade::Config { timeout_ms: 50, ..cfg }), 124);
 }
 
 #[test]
 fn the_default_config_has_no_per_command_timeout() {
     // 0 keeps serve untimed unless the host asks for a bound.
-    assert_eq!(v8vm::Config::default().command_timeout_ms, 0);
-    assert_eq!(v8vm::Config::new().command_timeout_ms, 0);
+    assert_eq!(tardigrade::Config::default().command_timeout_ms, 0);
+    assert_eq!(tardigrade::Config::new().command_timeout_ms, 0);
 }
 
 #[test]
 fn heap_cap_oom_returns_137_and_later_runs_still_work() {
-    let cfg = v8vm::Config {
+    let cfg = tardigrade::Config {
         heap_mb: 32,
         // hermetic: the guest may not consume the test harness stdin
         stdin_consumed: true,
         ..Config::new()
     };
     let src = "const a = []; for (;;) a.push(new Array(1e5).fill(1));";
-    assert_eq!(v8vm::run(src, "oom.js", &cfg), 137);
+    assert_eq!(tardigrade::run(src, "oom.js", &cfg), 137);
     // The OOM run's isolate died with its run; a later guest in the same
     // process must be unaffected (no leaked termination or callback data).
-    assert_eq!(v8vm::run("1 + 1", "after.js", &Config::new()), 0);
+    assert_eq!(tardigrade::run("1 + 1", "after.js", &Config::new()), 0);
 }
 
 #[test]
 fn a_library_cap_below_the_minimum_is_clamped_up() {
-    let cfg = v8vm::Config {
+    let cfg = tardigrade::Config {
         heap_mb: 4,
         stdin_consumed: true,
         ..Config::new()
     };
     let src = "const m = new Map(); for (let i = 0;; i++) m.set(i, i);";
-    assert_eq!(v8vm::run(src, "clamped.js", &cfg), 137);
+    assert_eq!(tardigrade::run(src, "clamped.js", &cfg), 137);
 }
 
 #[test]
@@ -80,10 +80,10 @@ fn virtual_clock_semantics_hold_through_the_library_api() {
         // README's Guarantees and limits).
         heap_mb: 32,
         stdin_consumed: true,
-        clock: v8vm::Clock::Virtual { epoch_ms: 100 },
+        clock: tardigrade::Clock::Virtual { epoch_ms: 100 },
         ..Config::new()
     };
-    assert_eq!(v8vm::run(src, "vclock-lib.js", &cfg), 0);
+    assert_eq!(tardigrade::run(src, "vclock-lib.js", &cfg), 0);
 }
 
 /// Joins a guest thread with a bound, so a guest whose watchdog never fires
@@ -111,7 +111,7 @@ fn spawn_guest(src: &str, timeout_ms: u64, gate: Arc<Barrier>) -> std::thread::J
             stdin_consumed: true,
             ..Config::new()
         };
-        v8vm::run(&src, "guest.js", &cfg)
+        tardigrade::run(&src, "guest.js", &cfg)
     })
 }
 
@@ -196,7 +196,7 @@ fn preload_data_alone_seeds_the_filesystem() {
         ..Config::new()
     };
     let guest = "if (vm.fs.read('/k') !== 'v') vm.exit(9);";
-    assert_eq!(v8vm::run(guest, "preload-data.js", &cfg), 0);
+    assert_eq!(tardigrade::run(guest, "preload-data.js", &cfg), 0);
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn preload_data_takes_the_same_restore_path_as_a_preload_file() {
             stdin_consumed: true,
             ..Config::new()
         };
-        v8vm::run(guest, "preload-data-paths.js", &cfg)
+        tardigrade::run(guest, "preload-data-paths.js", &cfg)
     };
     let v2 = r#"{"dirs":["/","/d"],"files":{"/d/b.bin":{"b64":"AP8="}},"version":2}"#;
     let check_v2 = "const b = vm.fs.readBytes('/d/b.bin');
@@ -236,10 +236,10 @@ fn fs_quota_boundary_from_the_library_config() {
     // next stack-guard check, so later statements would overwrite the
     // exit code (a separate branch owns that fix).
     let exact = "vm.fs.write('/f', '0123456789');";
-    assert_eq!(v8vm::run(exact, "quota-exact.js", &cfg), 0);
+    assert_eq!(tardigrade::run(exact, "quota-exact.js", &cfg), 0);
     // One byte over, on a fresh fs: the write must throw (exit 1).
     let over = "vm.fs.write('/f', '01234567890');";
-    assert_eq!(v8vm::run(over, "quota-over.js", &cfg), 1);
+    assert_eq!(tardigrade::run(over, "quota-over.js", &cfg), 1);
     // Failure leaves the filesystem unchanged: still the original content.
     let unchanged = "vm.fs.write('/f', '0123456789');
                     let ok = false;
@@ -249,7 +249,7 @@ fn fs_quota_boundary_from_the_library_config() {
                         && vm.fs.read('/f') === '0123456789';
                     }
                     if (!ok) throw new Error('fs changed by a failed write');";
-    assert_eq!(v8vm::run(unchanged, "quota-unchanged.js", &cfg), 0);
+    assert_eq!(tardigrade::run(unchanged, "quota-unchanged.js", &cfg), 0);
 }
 
 /// The seed drive for a run: exit code of the first draw, scaled into a
@@ -264,7 +264,7 @@ fn seeded_first_draw(seed: u64) -> i32 {
         seed: Some(seed),
         ..Config::new()
     };
-    v8vm::run(
+    tardigrade::run(
         "vm.exit(Math.floor(Math.random() * 1000));",
         "seeded.js",
         &cfg,
@@ -306,7 +306,7 @@ fn performance_now_origin_is_the_start_of_each_run() {
         stdin_consumed: true,
         ..Config::new()
     };
-    v8vm::run(
+    tardigrade::run(
         "const t0 = performance.now(); let s = 0; while (performance.now() - t0 < 200) s += 1; vm.exit(s > 0 ? 0 : 1);",
         "spin.js",
         &spin,
@@ -317,7 +317,7 @@ fn performance_now_origin_is_the_start_of_each_run() {
         stdin_consumed: true,
         ..Config::new()
     };
-    let code = v8vm::run(
+    let code = tardigrade::run(
         "vm.exit(performance.now() < 100 ? 0 : 1);",
         "probe.js",
         &probe,

@@ -1,7 +1,7 @@
-//! HTTP face for a v8vm guest app.
+//! HTTP face for a tardigrade guest app.
 //!
 //! Owns the real localhost socket (trusted host code) and relays each
-//! request into the guest as one JS expression over the v8vm --serve
+//! request into the guest as one JS expression over the tardigrade --serve
 //! console. The guest keeps its zero-syscall guarantee.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,15 +18,15 @@ struct Guest {
 const BRIDGE_COMMAND_TIMEOUT_MS: u64 = 30_000;
 
 impl Guest {
-    fn new(v8vm: &str, app: &str) -> Guest {
-        let proc = Command::new(v8vm)
+    fn new(tardigrade: &str, app: &str) -> Guest {
+        let proc = Command::new(tardigrade)
             .arg("--serve")
             .arg(format!("--command-timeout={}", BRIDGE_COMMAND_TIMEOUT_MS))
             .arg(app)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn v8vm --serve");
+            .expect("spawn tardigrade --serve");
         Guest { proc }
     }
 
@@ -136,16 +136,16 @@ fn relay(stream: &mut TcpStream, guest: &mut Guest, req: &Request) {
 }
 
 fn main() {
-    let v8vm = std::env::var("OUT").unwrap_or_else(|_| "v8vm".to_string());
+    let tardigrade = std::env::var("OUT").unwrap_or_else(|_| "tardigrade".to_string());
     let app = std::env::args().nth(1).unwrap_or_else(|| "examples/webapp.js".to_string());
     let port: u16 = std::env::args()
         .nth(2)
         .and_then(|p| p.parse().ok())
         .unwrap_or(8077);
 
-    let mut guest = Guest::new(&v8vm, &app);
+    let mut guest = Guest::new(&tardigrade, &app);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
-    println!("serving {} from v8vm on http://127.0.0.1:{}", app, port);
+    println!("serving {} from tardigrade on http://127.0.0.1:{}", app, port);
 
     for stream in listener.incoming() {
         let mut stream = match stream {
