@@ -145,10 +145,7 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
             // registered while it ran, keeping one FIFO order for ties.
             timer.seq = world.next_timer_seq;
             world.next_timer_seq += 1;
-            timer.when_ms = world
-                .clock
-                .now_ms()
-                .saturating_add(interval_ms.max(1));
+            timer.when_ms = world.clock.deadline_after(interval_ms.max(1));
             world.timers.push(timer);
         }
     }

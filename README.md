@@ -83,16 +83,26 @@ and is not set by this repo.
   byte-for-byte reproducible across runs.
 - Wall-clock rules are unchanged under "--clock=virtual": --timeout
   measures real time and still kills a busy-looping guest with 124, and
-  an endless timer schedule (a never-cleared setInterval) runs until
-  --timeout because the clock jumps instantly. stdin and net delivery
+  an endless timer schedule (a never-cleared setInterval) runs at full
+  CPU until --timeout, because the clock jumps instantly. A
+  self-sustaining net ping-pong is the same trap with the roles
+  swapped: while runnable net work is pending the loop never jumps, so
+  pending timers starve until --timeout - and between net generations
+  the loop spins without the 50 ms poll pause real time takes, so keep
+  --timeout set for such guests. stdin and net delivery
   stay real: net messages are delivered on the next loop turn without
   advancing the clock, and a pending stdin read stays pending while the
   clock jumps (the read resolves when its data arrives in real time; a
   run whose other work ends first exits with the read still pending).
   When only a stdin read is pending - no timers, no net - the loop
-  waits in real time exactly as without the flag.
+  waits in real time exactly as without the flag. Under --serve the
+  virtual clock is one timeline for the whole session: it persists
+  across commands, and each command's timers settle instantly in the
+  loop turn after it.
 - "--epoch=<ms>" the Date timeline's zero point under --clock=virtual
-  (default 0); a usage error without --clock=virtual
+  (default 0); a usage error without --clock=virtual, and above the
+  ECMAScript maximum time value (8640000000000000) - the timeline
+  clamps there instead of leaving the Date range
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write the snapshot to a file when the run ends: normal
   exit, vm.exit (also from a timer, microtask or stdin read), uncaught

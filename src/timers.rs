@@ -73,10 +73,7 @@ fn set_timer_common(
         world.next_timer_seq += 1;
         // Deadline on the run's clock timeline; saturating, because a
         // guest can ask for a delay no real or virtual clock reaches.
-        let when_ms = world
-            .clock
-            .now_ms()
-            .saturating_add(interval_ms.max(1));
+        let when_ms = world.clock.deadline_after(interval_ms.max(1));
         world.timers.push(Timer {
             id,
             seq,

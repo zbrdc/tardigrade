@@ -57,7 +57,9 @@ pub enum Clock {
     /// Virtual time: Date.now(), new Date() (no argument) and
     /// performance.now() read a clock that starts at `epoch_ms` for Date
     /// and at 0 for performance.now(), and advances only when the event
-    /// loop jumps it to the next due timer.
+    /// loop jumps it to the next due timer. Epochs beyond
+    /// [Clock::MAX_EPOCH_MS] are the CLI's to refuse; the Date timeline
+    /// itself clamps there.
     Virtual { epoch_ms: u64 },
 }
 
@@ -66,6 +68,12 @@ impl Clock {
     pub fn is_virtual(&self) -> bool {
         matches!(self, Clock::Virtual { .. })
     }
+
+    /// The largest epoch --epoch accepts and Date.now() reports under the
+    /// virtual clock: the ECMAScript maximum time value (ES2023 21.4.2,
+    /// 8.64e15 ms). A virtual Date timeline saturates here instead of
+    /// leaving the Date range.
+    pub const MAX_EPOCH_MS: u64 = 8_640_000_000_000_000;
 }
 
 /// Host-side run configuration.

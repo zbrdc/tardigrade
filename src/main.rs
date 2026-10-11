@@ -32,6 +32,12 @@ fn clock_pair(c: &mut Cli, arg: &str) -> Result<bool, String> {
     }
     if let Some(v) = arg.strip_prefix("--epoch=") {
         c.epoch_ms = v.parse().map_err(|_| format!("bad --epoch: {}", v))?;
+        if c.epoch_ms > v8vm::Clock::MAX_EPOCH_MS {
+            return Err(format!(
+                "bad --epoch: {} (above the ES time range)",
+                v
+            ));
+        }
         c.epoch_set = true;
         return Ok(true);
     }

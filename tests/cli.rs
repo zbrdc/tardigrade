@@ -2096,6 +2096,42 @@ fn virtual_tied_deadlines_across_schedules_fire_in_registration_order() {
 }
 
 #[test]
+fn real_mode_never_fires_a_timer_before_its_delay() {
+    // Chained timers compound any per-timer earliness: 100 hops of 5 ms
+    // must span at least 500 ms of measured time (performance.now is
+    // the same monotonic clock the deadlines round up from). Deadadlines
+    // used to floor the elapsed time, letting each hop start early by
+    // its fractional millisecond.
+    let r = run_js(
+        "vclock-no-early",
+        "const t0 = performance.now(); let n = 0;\n         const hop = () => {\n           if (++n === 100) { console.log(Math.round(performance.now() - t0)); return; }\n           setTimeout(hop, 5);\n         };\n         setTimeout(hop, 5);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let ms: u64 = r.stdout.trim().parse().unwrap();
+    assert!(ms >= 500, "timers fired early: 100 x 5 ms spanned only {} ms", ms);
+    assert!(ms < 5000, "timers fired far too late: {} ms", ms);
+}
+
+#[test]
+fn virtual_time_date_clamps_at_the_es_maximum() {
+    // With the largest accepted epoch, advancing the timeline must keep
+    // Date.now() inside the ECMAScript time range (it used to report the
+    // saturated u64 as 18446744073709552000), while performance.now -
+    // the plain timeline - keeps counting.
+    let max = "8640000000000000";
+    let r = run_js_with(
+        &["--clock=virtual", &format!("--epoch={}", max), "--timeout=5000"],
+        "vclock-date-clamp",
+        "console.log(Date.now(), new Date().getTime());\n         setTimeout(() => console.log(Date.now(), performance.now(), new Date().getTime()), 1000);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "8640000000000000 8640000000000000\n8640000000000000 1000 8640000000000000\n"
+    );
+}
+
+#[test]
 fn virtual_time_flags_are_validated() {
     let path = script("vclock-flags", "");
     let entry = path.to_str().unwrap();
@@ -2103,6 +2139,15 @@ fn virtual_time_flags_are_validated() {
     assert_eq!(v8vm(&["--clock=virtual", "--epoch=abc", entry], b"").code, 2);
     assert_eq!(v8vm(&["--epoch=5", entry], b"").code, 2);
     assert_eq!(v8vm(&["--clock=virtual", "--epoch=0", entry], b"").code, 0);
+    // One above the ECMAScript maximum time value.
+    assert_eq!(
+        v8vm(&["--clock=virtual", "--epoch=8640000000000001", entry], b"").code,
+        2
+    );
+    assert_eq!(
+        v8vm(&["--clock=virtual", "--epoch=8640000000000000", entry], b"").code,
+        0
+    );
 }
 
 #[test]

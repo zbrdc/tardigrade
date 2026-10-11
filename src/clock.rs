@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::guest_cb;
 use crate::world::world_mut;
+use crate::Clock;
 
 /// A run's time source.
 pub(crate) enum RunClock {
@@ -34,6 +35,26 @@ impl RunClock {
         }
     }
 
+    /// A deadline `delay_ms` into the future on the run's timeline. Real
+    /// time rounds the elapsed time up first: now_ms floors, and a
+    /// deadline built on a floored now could let a timer fire a fraction
+    /// of a millisecond before its full delay has passed. Virtual time is
+    /// exact already, so it just adds.
+    pub(crate) fn deadline_after(&self, delay_ms: u64) -> u64 {
+        match self {
+            RunClock::Real(origin) => {
+                // Nanosecond ceil: even a sub-microsecond fractional part
+                // must push the deadline to the next whole millisecond.
+                // Nanosecond ceil: even a sub-microsecond fractional part
+                // must push the deadline to the next whole millisecond.
+                let nanos = origin.elapsed().as_nanos();
+                u64::try_from(nanos.div_ceil(1_000_000) + u128::from(delay_ms))
+                    .unwrap_or(u64::MAX)
+            }
+            RunClock::Virtual { now_ms, .. } => now_ms.saturating_add(delay_ms),
+        }
+    }
+
     /// performance.now(): elapsed ms since the run started. Virtual runs
     /// report the timeline, so it starts at exactly 0 and moves only with
     /// the virtual clock.
@@ -44,12 +65,16 @@ impl RunClock {
         }
     }
 
-    /// Date.now(): the virtual timeline shifted by the epoch. Real runs
-    /// never read this (they keep V8's own Date); the 0 guards the
-    /// pairing instead of panicking inside a V8 callback.
+    /// Date.now(): the virtual timeline shifted by the epoch, clamped at
+    /// the ECMAScript maximum time value so a saturated timeline cannot
+    /// hand the guest a number outside the Date range. Real runs never
+    /// read this (they keep V8's own Date); the 0 guards the pairing
+    /// instead of panicking inside a V8 callback.
     pub(crate) fn date_ms(&self) -> u64 {
         match self {
-            RunClock::Virtual { epoch_ms, now_ms } => epoch_ms.saturating_add(*now_ms),
+            RunClock::Virtual { epoch_ms, now_ms } => epoch_ms
+                .saturating_add(*now_ms)
+                .min(Clock::MAX_EPOCH_MS),
             RunClock::Real(_) => 0,
         }
     }
@@ -105,8 +130,38 @@ mod tests {
             now_ms: 0,
         };
         c.advance_to(10);
-        assert_eq!(c.date_ms(), u64::MAX, "no overflow past the epoch");
+        assert_eq!(
+            c.date_ms(),
+            Clock::MAX_EPOCH_MS,
+            "past the ECMAScript maximum the Date timeline clamps"
+        );
         assert_eq!(c.now_ms(), 10, "the timeline itself keeps counting");
+    }
+
+    #[test]
+    fn real_deadlines_round_the_elapsed_time_up() {
+        // A deadline must never be in the past of the exact elapsed time:
+        // scheduling at elapsed 0.9 ms for +1 must not be due at 1 ms
+        // (0.1 ms early). The fractional part here is whatever the
+        // scheduler left, and the assertion must hold for all of them.
+        let origin = std::time::Instant::now();
+        let exact_now = origin.elapsed();
+        let deadline = RunClock::Real(origin).deadline_after(5);
+        let as_duration = std::time::Duration::from_millis(deadline);
+        assert!(
+            as_duration >= exact_now + std::time::Duration::from_millis(5),
+            "deadline {:?} covers exact elapsed {:?} + 5 ms",
+            as_duration,
+            exact_now
+        );
+    }
+
+    #[test]
+    fn virtual_deadlines_are_the_timeline_plus_the_delay() {
+        let mut c = RunClock::Virtual { epoch_ms: 0, now_ms: 40 };
+        assert_eq!(c.deadline_after(60), 100);
+        c.advance_to(100);
+        assert_eq!(c.deadline_after(0), 100, "zero delay keeps the clock");
     }
 
     #[test]
