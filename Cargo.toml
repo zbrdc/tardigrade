@@ -1,6 +1,9 @@
 [package]
 name = "tardigrade"
 version = "0.1.0"
+description = "Run small JavaScript programs entirely in RAM on the V8 engine, with a RAM filesystem, timers, a heap cap and a wall-clock timeout"
+license = "Apache-2.0"
+repository = "https://github.com/zbrdc/tardigrade"
 edition = "2021"
 autobins = true
 autoexamples = false
