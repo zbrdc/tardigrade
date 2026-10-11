@@ -19,8 +19,11 @@
 set -euo pipefail
 OUT=${OUT:?set OUT to the tardigrade binary}
 # BASH_SOURCE, not $0: the cli tests source this file to drive build_app,
-# and then $0 is the shell, not this script.
-DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# and then $0 is the shell, not this script. The directory is derived with
+# builtins only, so an emptied PATH (the smoke tests use one) still works.
+DIR=${BASH_SOURCE[0]%/*}
+[ "$DIR" = "${BASH_SOURCE[0]}" ] && DIR=.
+DIR=$(cd "$DIR" && pwd)
 WS=${WS:-$(dirname "$OUT")/agent-ts-ws.json}
 
 # bun is looked up in $BUN, then PATH, then its default install location;

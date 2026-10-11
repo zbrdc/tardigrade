@@ -13,7 +13,10 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 # The same command variables and the same pin (examples/ts-pin.sh) as the
 # loop itself, so an override here and there is one setting (each command
 # may be several words).
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ts-pin.sh"
+DIR=${BASH_SOURCE[0]%/*}
+[ "$DIR" = "${BASH_SOURCE[0]}" ] && DIR=.
+DIR=$(cd "$DIR" && pwd)
+source "$DIR/ts-pin.sh"
 TSC_RS=${TARDIGRADE_TSC_RS:-npx -y $TSC_RS_PKG}
 TSC=${TARDIGRADE_TSC:-tsc}
 

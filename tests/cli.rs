@@ -2755,7 +2755,6 @@ fn make_executable(path: &std::path::Path) {
 /// init (and pid 0's own group) out of range by construction.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
-    use std::io::Read;
     use std::os::unix::process::CommandExt;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2766,8 +2765,8 @@ fn output_within(mut cmd: Command, secs: u64) -> std::process::Output {
     assert!(pgid > 1, "refusing to signal pgid {pgid}");
     // The pipes are drained on their own threads; the Child itself stays
     // here so only this thread ever reaps it.
-    let mut out_pipe = child.stdout.take().expect("stdout pipe");
-    let mut err_pipe = child.stderr.take().expect("stderr pipe");
+    let out_pipe = child.stdout.take().expect("stdout pipe");
+    let err_pipe = child.stderr.take().expect("stderr pipe");
     // Readers deliver through channels, so waiting on them is bounded: a
     // descendant that left the group can hold the pipes open past the
     // leader's exit forever, and an unbounded join would hang the test.
@@ -2826,10 +2825,7 @@ fn recv_by(
     let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
         return Vec::new();
     };
-    match rx.recv_timeout(wait) {
-        Ok(buf) => buf,
-        Err(_) => Vec::new(),
-    }
+    rx.recv_timeout(wait).unwrap_or_default()
 }
 
 /// The full loop against the real tools: the seeded type errors end their
