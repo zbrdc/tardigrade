@@ -38,6 +38,7 @@ and is not set by this repo.
 ## Use
 
     v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]
+    v8vm --sandbox-check
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
@@ -47,6 +48,8 @@ and is not set by this repo.
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
 - "--sandbox" OS self-containment for hostile code (Linux only), see below
+- "--sandbox-check" (only as the sole argument) exit 0 if --sandbox can work
+  here, 2 if not; after the entry it is an ordinary guest argument
 - uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
 
 ## Library API
@@ -73,6 +76,12 @@ dump file. `preload_data` seeds the filesystem by itself (it needs no
 `preload` path) and takes precedence over reading `preload`. Embedders that
 build a `Config` with a struct literal must set the field, or use
 `..Default::default()`.
+
+The restrictions apply to the whole embedding process, not only to v8vm's
+threads. The filters cover every thread (apply refuses unless the caller is
+the only one) and every thread started later inherits them, so all code of
+the embedder after `apply` runs under the same denials, including the rule
+that syscall numbers 452 and above fail with ENOSYS. Nothing can lift them.
 
 ## Event loop
 

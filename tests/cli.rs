@@ -334,8 +334,6 @@ fn serve_answers_a_final_command_without_a_trailing_newline_and_exits() {
 
 const SANDBOX_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A dump the sandbox cannot anchor is refused while it prepares, before any
-/// kernel layer is installed, so these hold on every kernel.
 /// The flag scripts gate their skips on: exit 0 with a word when sandboxing
 /// is possible and 2 with the reason otherwise. The kernel is queried
 /// independently of the library under test, so a lying answer fails.
@@ -351,6 +349,35 @@ fn sandbox_check_matches_the_kernel() {
     assert!(r.stderr.contains("--sandbox is not available"), "stderr: {}", r.stderr);
 }
 
+/// The probe flag only means something as the sole argument. Anywhere before
+/// the entry it is a usage error, so a typo cannot turn a run into a check.
+#[test]
+fn sandbox_check_before_the_entry_or_with_other_flags_is_a_usage_error() {
+    let path = script("sb-check-misplaced", "console.log('ran');");
+    let entry = path.to_str().unwrap();
+    for args in [vec!["--sandbox-check", "--bogus"], vec!["--sandbox-check", entry], vec!["--", "--sandbox-check"]] {
+        let r = v8vm(&args, b"");
+        assert_eq!(r.code, 2, "{:?} stderr: {}", args, r.stderr);
+        assert_eq!(r.stdout, "", "{:?}: no probe answer and no guest run", args);
+        assert!(r.stderr.contains("--sandbox-check must be the only argument"), "stderr: {}", r.stderr);
+    }
+}
+
+/// After the entry (with or without `--`) it is an ordinary guest argument:
+/// the script runs and sees it in vm.args.
+#[test]
+fn sandbox_check_after_the_entry_is_a_guest_argument() {
+    let path = script("sb-check-arg", "console.log(JSON.stringify(vm.args));");
+    let entry = path.to_str().unwrap();
+    for args in [vec![entry, "--sandbox-check"], vec![entry, "--", "--sandbox-check"]] {
+        let r = v8vm(&args, b"");
+        assert_eq!(r.code, 0, "{:?} stderr: {}", args, r.stderr);
+        assert_eq!(r.stdout, "[\"--sandbox-check\"]\n", "{:?}", args);
+    }
+}
+
+/// A dump the sandbox cannot anchor is refused while it prepares, before any
+/// kernel layer is installed, so these hold on every kernel.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod sandbox_prepare {
     use super::*;

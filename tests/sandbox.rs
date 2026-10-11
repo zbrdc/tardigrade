@@ -650,10 +650,25 @@ mod run {
         ]
     }
 
+    /// Probes for the newest syscalls below the floor: they must reach the
+    /// kernel (and fail on their invalid arguments) instead of being turned
+    /// into ENOSYS, which pins the lower edge of the range rule.
+    fn below_floor_probes() -> Vec<Probe> {
+        vec![
+            // cachestat(fd, range, cstat, flags): fd -1 is EBADF.
+            probe("cachestat", sys(NR_CACHESTAT, [-1, 0, 0, 0, 0])),
+            // futex_waitv(waiters, nr_futexes, flags, timeout, clockid): zero
+            // futexes is EINVAL.
+            probe("futex-waitv", sys(NR_FUTEX_WAITV, [0, 0, 0, 0, 0])),
+        ]
+    }
+
     /// Syscall numbers libc 0.2.190 does not define (post-6.12 additions;
-    /// asm/unistd_64.h on this host): fchmodat2 452, setxattrat 463,
+    /// asm/unistd_64.h on this host): futex_waitv 449, cachestat 451, fchmodat2 452, setxattrat 463,
     /// getxattrat 464, listxattrat 465, removexattrat 466, file_getattr 468,
     /// file_setattr 469.
+    const NR_FUTEX_WAITV: libc::c_long = 449;
+    const NR_CACHESTAT: libc::c_long = 451;
     const NR_FCHMODAT2: libc::c_long = 452;
     const NR_SETXATTRAT: libc::c_long = 463;
     const NR_GETXATTRAT: libc::c_long = 464;
@@ -664,6 +679,7 @@ mod run {
 
     fn fs_probes(dump: &Path, escape_dir: &Path) -> Vec<Probe> {
         let mut probes = new_syscall_probes(dump);
+        probes.extend(below_floor_probes());
         probes.extend(vec![
             probe("read-etc-passwd", io(std::fs::File::open("/etc/passwd").map(|_| ()))),
             probe("read-urandom", io(std::fs::File::open("/dev/urandom").map(|_| ()))),
@@ -1174,6 +1190,9 @@ mod run {
         "file-setattr",
     ];
 
+    /// Probes just below the floor of the range rule.
+    const BELOW_FLOOR: [&str; 2] = ["cachestat", "futex-waitv"];
+
     /// Every probe that fails with EPERM once the seccomp layer is in.
     fn seccomp_denied() -> Vec<String> {
         let mut names: Vec<String> = SECCOMP_ONLY.iter().chain(SCOPED_PARENT).map(|n| n.to_string()).collect();
@@ -1212,6 +1231,24 @@ mod run {
         all.extend(expect(["clone3"].into_iter().chain(NEW_SYSCALLS), &errno_str(libc::ENOSYS)));
         all.extend(expect(always_ok(), "ok"));
         all
+    }
+
+    /// The below-floor calls must fail on their own invalid arguments, with
+    /// any errno but ENOSYS (which is what the range rule would return if its
+    /// floor sat too low). The kernel supports them: this runs only where
+    /// Landlock ABI 6 (Linux 6.12) does.
+    fn check_below_floor(lines: &[String], prefix: &str) {
+        let enosys = errno_str(libc::ENOSYS);
+        for name in BELOW_FLOOR {
+            let outcome = result(lines, &format!("{}{}", prefix, name));
+            assert!(
+                outcome.starts_with("errno=") && outcome != enosys,
+                "{}{} must reach the kernel and fail on its arguments, got {}",
+                prefix,
+                name,
+                outcome
+            );
+        }
     }
 
     fn check(lines: &[String], prefix: &str, expected: &Expected) {
@@ -1317,6 +1354,26 @@ mod run {
         }
     }
 
+    /// Describes how the test table and the library's deny list differ: the
+    /// entries only the list has (named by the table when it knows them, else
+    /// by number), the ones only the table has, or a pure reordering.
+    fn table_drift(table: &[(libc::c_long, &str)], list: &[libc::c_long]) -> String {
+        let name = |nr: libc::c_long| {
+            table.iter().find(|(n, _)| *n == nr).map_or_else(|| nr.to_string(), |(_, name)| name.to_string())
+        };
+        let only_in_list: Vec<String> =
+            list.iter().filter(|nr| !table.iter().any(|(n, _)| n == *nr)).map(|nr| name(*nr)).collect();
+        let only_in_table: Vec<String> =
+            table.iter().filter(|(nr, _)| !list.contains(nr)).map(|(nr, _)| name(*nr)).collect();
+        if only_in_list.is_empty() && only_in_table.is_empty() {
+            return "the test table and the deny list hold the same syscalls in a different order".to_string();
+        }
+        format!(
+            "the test table and the deny list disagree: in the list but not the table: {:?}; in the table but not the list: {:?}",
+            only_in_list, only_in_table
+        )
+    }
+
     /// The whole deny list, one syscall at a time, against a filter whose
     /// denials return an errno nothing else produces: every entry must
     /// report exactly that errno, and the table in this file must match the
@@ -1324,11 +1381,8 @@ mod run {
     fn denied_enumeration() {
         let expected_nrs = denied_syscalls();
         let table = denied_table();
-        assert_eq!(
-            table.iter().map(|(nr, _)| *nr).collect::<Vec<_>>(),
-            expected_nrs,
-            "the test table and the deny list disagree"
-        );
+        let table_nrs: Vec<libc::c_long> = table.iter().map(|(nr, _)| *nr).collect();
+        assert!(table_nrs == expected_nrs, "{}", table_drift(&table, &expected_nrs));
         let lines = run_probe("deny-enum", &[]);
         assert_eq!(result(&lines, "deny-enum"), "ok", "apply must succeed");
         let want = format!("errno={}", PROBE_DENY_ERRNO);
@@ -1511,6 +1565,7 @@ mod run {
         let lines = layer_mode("probe", "deny");
         assert_eq!(result(&lines, "threads"), "1", "apply starts from one thread");
         check(&lines, "", &full_expectations());
+        check_below_floor(&lines, "");
     }
 
     fn full_sandbox_dump_only() {
@@ -1526,6 +1581,7 @@ mod run {
     fn threads_inherit() {
         let lines = layer_mode("probe", "thr");
         check(&lines, "thr-", &full_expectations());
+        check_below_floor(&lines, "thr-");
     }
 
     /// seccomp alone, so every denial here is provably from a seccomp rule

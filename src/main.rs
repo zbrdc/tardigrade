@@ -43,6 +43,13 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.serve = true;
         } else if a == "--sandbox" {
             c.sandbox = true;
+        } else if a == "--sandbox-check" {
+            // main() handles the sole-argument form before parse(). Before
+            // the entry this is a misplaced probe flag; after it, a guest arg.
+            if c.entry.is_empty() {
+                return Err("--sandbox-check must be the only argument".into());
+            }
+            c.args.push(a.clone());
         } else if a.starts_with('-') && a != "-" {
             return Err(format!("unknown flag {}", a));
         } else if c.entry.is_empty() {
@@ -53,7 +60,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve {
         return Err(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]"
+            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
                 .to_string(),
         );
     }
@@ -65,7 +72,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.iter().any(|a| a == "--sandbox-check") {
+    if argv == ["--sandbox-check"] {
         // A gate scripts and CI can call without running a guest: exit 0 when
         // the platform and kernel can sandbox, 2 with the reason otherwise.
         if v8vm::sandbox::supported() {

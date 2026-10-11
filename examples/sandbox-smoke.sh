@@ -8,7 +8,15 @@ set -u
 OUT=${OUT:?set OUT to the v8vm binary}
 DIR=$(cd "$(dirname "$0")" && pwd)
 
-if ! "$OUT" --sandbox-check >/dev/null 2>&1; then
+# --sandbox-check exits 0 (can sandbox) or 2 (cannot). Any other status is a
+# broken binary or a crash, which must not pass as a skip.
+"$OUT" --sandbox-check >/dev/null 2>&1
+check=$?
+if [ "$check" -ne 0 ]; then
+  if [ "$check" -ne 2 ]; then
+    echo "sandbox smoke: --sandbox-check exited $check, expected 0 or 2" >&2
+    exit 1
+  fi
   if [ "${V8VM_REQUIRE_SANDBOX:-}" = 1 ]; then
     echo "sandbox smoke: V8VM_REQUIRE_SANDBOX=1 but this host cannot sandbox" >&2
     exit 1
