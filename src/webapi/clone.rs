@@ -2,18 +2,29 @@
 //! clone semantics are the engine's: Map, Set, Date, RegExp, typed
 //! arrays and their windows, ArrayBuffers, cycles, and shared references
 //! inside one clone. Functions, symbols, WebAssembly modules and (here)
-//! SharedArrayBuffers are refused through the serializer delegate with
-//! an Error named DataCloneError. There is no transfer list: transfers
-//! would detach buffers across the clone, and there is no shared-id
-//! registry to carry a SAB within the run.
+//! SharedArrayBuffers are refused with an Error named DataCloneError.
+//! There is no transfer list: transfers would detach buffers across the
+//! clone, and there is no shared-id registry to carry a SAB within the
+//! run.
+
+use std::cell::Cell;
+use std::rc::Rc;
 
 use crate::guest_cb;
 use crate::webapi::{throw_named, throw_named_error, throw_type, v8_str};
 
+/// Set by the serializer delegate when it declines a SharedArrayBuffer:
+/// the only refusal whose error V8 raises directly (unnamed) instead of
+/// through the delegate, and therefore the only one the callback has to
+/// name itself. Guest exceptions from getters keep their identity.
+type SabRefused = Rc<Cell<bool>>;
+
 /// Serializer delegate: V8 refuses functions, symbols, shared buffers
 /// and other non-cloneable values by asking the delegate to raise the
 /// error.
-struct CloneSerializer;
+struct CloneSerializer {
+    sab_refused: SabRefused,
+}
 
 impl v8::ValueSerializerImpl for CloneSerializer {
     fn throw_data_clone_error<'s>(
@@ -22,7 +33,7 @@ impl v8::ValueSerializerImpl for CloneSerializer {
         message: v8::Local<'s, v8::String>,
     ) {
         let exc = v8::Exception::error(scope, message);
-        crate::webapi::throw_named_error(scope, exc, "DataCloneError");
+        throw_named_error(scope, exc, "DataCloneError");
     }
 
     fn get_shared_array_buffer_id(
@@ -31,8 +42,10 @@ impl v8::ValueSerializerImpl for CloneSerializer {
         _shared_array_buffer: v8::Local<'_, v8::SharedArrayBuffer>,
     ) -> Option<u32> {
         // Without a shared-id registry a SAB cannot be cloned within the
-        // run. Declining lets V8 raise its own "could not be cloned"
-        // message; the callback below gives it the DataCloneError name.
+        // run. Declining makes V8 raise its own "#<SharedArrayBuffer>
+        // could not be cloned." error; the flag tells the callback that
+        // this - and only this - refusal still needs the name.
+        self.sab_refused.set(true);
         None
     }
 
@@ -66,8 +79,9 @@ enum TransferWant {
 
 /// Reads options.transfer under a TryCatch: a throwing getter must
 /// propagate (rethrown before the TryCatch can swallow it), anything
-/// but an array is a TypeError (a sequence is required), and a non-empty
-/// array is refused by the caller.
+/// but an array is a TypeError (a sequence is required; iterables such
+/// as Sets are not accepted), and a non-empty array is refused by the
+/// caller.
 fn transfer_want(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> TransferWant {
     if opts.is_null_or_undefined() {
         return TransferWant::None;
@@ -95,87 +109,125 @@ fn transfer_want(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> Tr
     }
 }
 
-guest_cb!(structured_clone, |args, rv, scope| {
-    if args.length() == 0 {
-        return throw_type(
-            scope,
-            "The \"The value argument must be specified\" argument must be specified",
-        );
-    }
-    match transfer_want(scope, &args.get(1)) {
+/// Validates the options argument; false means the right error was
+/// thrown (or a getter's exception is pending) and the call is over.
+fn options_ok(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> bool {
+    match transfer_want(scope, opts) {
+        TransferWant::None => true,
         TransferWant::Refuse => {
-            return throw_named(scope, "DataCloneError", "transfer is not supported");
+            throw_named(scope, "DataCloneError", "transfer is not supported");
+            false
         }
-        TransferWant::Threw => return,
+        TransferWant::Threw => false,
         TransferWant::BadOptions => {
-            return throw_type(scope, "The provided value is not of type 'object'");
+            throw_type(scope, "The provided value is not of type 'object'");
+            false
         }
         TransferWant::BadTransfer => {
-            return throw_type(scope, "The provided value is not of type 'sequence'");
+            throw_type(
+                scope,
+                "Failed to execute 'structuredClone': transfer in Options can not be converted to sequence.",
+            );
+            false
         }
-        TransferWant::None => {}
+    }
+}
+
+guest_cb!(structured_clone, |args, rv, scope| {
+    if args.length() == 0 {
+        return throw_type(scope, "structuredClone requires a value argument");
+    }
+    if !options_ok(scope, &args.get(1)) {
+        return;
     }
     let value = args.get(0);
     let context = scope.get_current_context();
-    let ser = v8::ValueSerializer::new(scope, Box::new(CloneSerializer));
+    let sab_refused: SabRefused = Rc::new(Cell::new(false));
+    let ser = v8::ValueSerializer::new(
+        scope,
+        Box::new(CloneSerializer {
+            sab_refused: sab_refused.clone(),
+        }),
+    );
     let mut tc = v8::TryCatch::new(scope);
     // The wire-format header must precede the value (the v8 crate tests
     // pair write_header with read_header).
     use v8::ValueSerializerHelper as _;
     ser.write_header();
     if ser.write_value(context, value) != Some(true) {
-        // A TryCatch that drops a caught exception swallows it, so the
-        // failure is always rethrown. The delegate already named its own
-        // refusals (functions, symbols, wasm); V8's directly-raised
-        // shared-buffer error still needs the name. Guest exceptions from
-        // getters propagate untouched, like the platform.
-        if !tc.has_caught() {
-            let m = v8_str(&mut tc, "value could not be cloned");
-            let exc = v8::Exception::error(&mut tc, m);
-            throw_named_error(&mut tc, exc, "DataCloneError");
-        } else if is_unnamed_clone_error(&mut tc) {
-            if let Some(exc) = tc.exception() {
-                throw_named_error(&mut tc, exc, "DataCloneError");
-            }
-        }
-        tc.rethrow();
-        return;
+        return clone_write_failure(&mut tc, &sab_refused);
     }
     let data = ser.release();
     let de = v8::ValueDeserializer::new(&mut tc, Box::new(CloneDeserializer), &data);
     // The header (wire-format version) precedes any value; read it first.
     use v8::ValueDeserializerHelper as _;
     if de.read_header(context) != Some(true) {
-        rethrow_or_throw(
+        return rethrow_or_throw(
             &mut tc,
             "structuredClone: could not decode the serialized value",
         );
-        return;
     }
     match de.read_value(context) {
-        Some(v) => rv.set(v),
+        Some(v) => {
+            if buffer_mismatch(&mut tc, value, v) {
+                return throw_named(
+                    &mut tc,
+                    "DataCloneError",
+                    "value could not be cloned: buffer allocation failed",
+                );
+            }
+            rv.set(v)
+        }
         None => rethrow_or_throw(&mut tc, "structuredClone: could not deserialize the value"),
     }
 });
 
-/// True when the pending exception is one of V8's own "<value> could be
-/// cloned." errors - the ones raised directly (not through the delegate)
-/// for shared buffers, which are the only ones still missing the
-/// DataCloneError name. Reading "message" off a real error never runs
-/// guest code; a crafted getter that throws while answering reads as
-/// "not ours" and keeps its own exception.
-fn is_unnamed_clone_error(tc: &mut v8::TryCatch<v8::HandleScope>) -> bool {
-    let Some(exc) = tc.exception() else {
-        return false;
+/// True when a buffer-shaped value came back a different size than its
+/// source. V8's serializer can fail its own wire allocation silently
+/// under memory pressure and hand back a truncated buffer; a clone like
+/// that must surface as an error, never as wrong data.
+fn buffer_mismatch(
+    scope: &mut v8::HandleScope,
+    orig: v8::Local<v8::Value>,
+    cloned: v8::Local<v8::Value>,
+) -> bool {
+    let size = |v: v8::Local<v8::Value>| -> Option<usize> {
+        if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(v) {
+            return Some(buffer.byte_length());
+        }
+        v8::Local::<v8::ArrayBufferView>::try_from(v)
+            .ok()
+            .map(|view| view.byte_length())
     };
-    let Ok(obj) = v8::Local::<v8::Object>::try_from(exc) else {
-        return false;
+    match (size(orig), size(cloned)) {
+        (Some(a), Some(b)) => {
+            let _ = scope;
+            a != b
+        }
+        _ => false,
+    }
+}
+
+/// Handles a failed write: guest exceptions (a getter that threw while
+/// the serializer walked it) rethrow untouched, V8's directly-raised
+/// shared-buffer refusal gets the DataCloneError name it is missing, and
+/// a failure with no exception at all gets a named one. In every case
+/// the exception is rethrown - a TryCatch that drops a caught exception
+/// swallows it.
+fn clone_write_failure(tc: &mut v8::TryCatch<v8::HandleScope>, sab_refused: &Cell<bool>) {
+    let exc = match (tc.exception(), sab_refused.get()) {
+        (Some(exc), true) => exc,
+        (Some(_), false) => {
+            tc.rethrow();
+            return;
+        }
+        (None, _) => {
+            let m = v8_str(tc, "value could not be cloned");
+            v8::Exception::error(tc, m)
+        }
     };
-    let key = v8_str(tc, "message");
-    let Some(msg) = obj.get(tc, key.into()) else {
-        return false;
-    };
-    crate::diag::to_rust_string(tc, &msg).contains("could not be cloned")
+    throw_named_error(tc, exc, "DataCloneError");
+    tc.rethrow();
 }
 
 /// A caught exception (for example from a throwing getter the

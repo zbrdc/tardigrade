@@ -26,37 +26,9 @@ fn script(name: &str, source: &str) -> PathBuf {
 /// Spawns v8vm and kills it (failing the test) if it outlives LIMIT, so a
 /// hang regression can never stick the suite.
 fn v8vm(args: &[&str], stdin: &[u8]) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn v8vm");
-    let mut pipe = child.stdin.take().unwrap();
-    let input = stdin.to_vec();
-    let feeder = std::thread::spawn(move || {
-        let _ = pipe.write_all(&input);
-    });
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll v8vm") {
-            break status;
-        }
-        if start.elapsed() > LIMIT {
-            child.kill().expect("kill hung v8vm");
-            child.wait().expect("reap v8vm");
-            panic!("v8vm still running after {:?}", LIMIT);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    feeder.join().unwrap();
-    let out = child.wait_with_output().expect("collect v8vm output");
-    Run {
-        code: status.code().expect("exit code, not a signal"),
-        stdout: String::from_utf8(out.stdout).unwrap(),
-        stderr: String::from_utf8(out.stderr).unwrap(),
-    }
+    let mut argv = vec![env!("CARGO_BIN_EXE_v8vm")];
+    argv.extend(args.iter().copied());
+    spawn(&argv, stdin)
 }
 
 fn run_js(name: &str, source: &str) -> Run {
@@ -392,32 +364,49 @@ fn seed_zero_is_a_seed_and_bad_seeds_are_usage_errors() {
     assert!(bad.stderr.contains("bad --seed"), "stderr: {}", bad.stderr);
 }
 
-/// Spawns v8vm under an address-space cap (prlimit execs timeout, which
-/// execs v8vm; both inherit the cap), still bounded by the same 60 s
-/// kill as every other spawn.
+/// Spawns v8vm with RLIMIT_AS set to `as_bytes` bytes in a pre_exec hook
+/// (the repo's file-size-cap pattern): no external prlimit/timeout on
+/// PATH, and the same 60 s kill bound as every other spawn applies to
+/// the child itself.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn v8vm_capped(as_bytes: u64, args: &[&str], stdin: &[u8]) -> Run {
-    let mut capped = vec![
-        "prlimit".to_string(),
-        format!("--as={}", as_bytes),
-        "--".to_string(),
-        "timeout".to_string(),
-        "60".to_string(),
-        env!("CARGO_BIN_EXE_v8vm").to_string(),
-    ];
-    capped.extend(args.iter().map(|s| s.to_string()));
-    let refs: Vec<&str> = capped.iter().map(|s| s.as_str()).collect();
-    spawn(&refs, stdin)
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_v8vm"));
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure only makes async-signal-safe libc calls.
+    unsafe {
+        cmd.pre_exec(move || {
+            let cap = libc::rlimit {
+                rlim_cur: as_bytes,
+                rlim_max: as_bytes,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &cap) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn capped v8vm");
+    finish(child, stdin)
 }
 
 /// The spawn/wait/kill core of `v8vm`, for any command line.
 fn spawn(argv: &[&str], stdin: &[u8]) -> Run {
-    let mut child = Command::new(argv[0])
+    let child = Command::new(argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn test command");
+    finish(child, stdin)
+}
+
+/// Feeds stdin, waits with the shared 60 s kill bound, collects output.
+fn finish(mut child: std::process::Child, stdin: &[u8]) -> Run {
     let mut pipe = child.stdin.take().unwrap();
     let input = stdin.to_vec();
     let feeder = std::thread::spawn(move || {
@@ -446,7 +435,7 @@ fn spawn(argv: &[&str], stdin: &[u8]) -> Run {
     }
 }
 
-// ---- review round 1 ----
+// ---- decoder stream state, validation, and memory behavior ----
 
 #[test]
 fn text_decoder_resets_bom_and_carry_after_a_flushing_decode() {
@@ -525,7 +514,7 @@ fn atob_btoa_and_structured_clone_require_an_argument() {
         try { btoa(); } catch (err) { console.log(err.constructor.name, err.message); }
         try { structuredClone(); } catch (err) { console.log(err.constructor.name, err.message); }
         "#,
-        "TypeError The \"input\" argument must be specified\nTypeError The \"input\" argument must be specified\nTypeError The \"The value argument must be specified\" argument must be specified\n",
+        "TypeError The \"input\" argument must be specified\nTypeError The \"input\" argument must be specified\nTypeError structuredClone requires a value argument\n",
     );
 }
 
@@ -550,6 +539,9 @@ fn structured_clone_validates_options_and_rejects_shared_buffers() {
     );
 }
 
+/// Memory-heavy (a 300 MB guest): run with `make test-heavy`.
+#[ignore]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn decode_of_a_huge_buffer_under_memory_pressure_throws_instead_of_aborting() {
     // 300 MB of ASCII under a 1.4 GB address-space cap: the input buffer
@@ -570,6 +562,9 @@ fn decode_of_a_huge_buffer_under_memory_pressure_throws_instead_of_aborting() {
     );
 }
 
+/// Memory-heavy (a 420 MB string): run with `make test-heavy`.
+#[ignore]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn btoa_past_the_string_limit_throws_range_error() {
     // 420 MB of "a" encodes to 560 MB of base64, past V8's ~536 M-char
@@ -600,5 +595,227 @@ fn performance_now_starts_near_zero_each_run() {
         console.log(c >= a, b > 0);
         "#,
         "true undefined\ntrue true\n",
+    );
+}
+
+// ---- piece boundaries, option getters, and global hygiene ----
+
+#[test]
+fn decode_crosses_the_piece_boundary_with_multibyte_and_boms() {
+    // 128 KiB of ASCII with a multibyte sequence set at every offset
+    // around the 64 KiB piece seam, plus BOMs placed at and across it;
+    // streamed and unstreamed results must equal the built-from-parts
+    // string, which is what the platform decodes these bytes to.
+    ok(
+        "td-piece-boundary",
+        r#"
+        const N = 131072;
+        const seqs = {
+          "\u{1f600}": [0xF0,0x9F,0x98,0x80],
+          "\u{20ac}": [0xE2,0x82,0xAC],
+          "\u{fffd}": [0xF0,0x9F,0x98],        // cut by the next 0x41
+          "\u{fffd}\u{fffd}": [0xE1,0x80,0xC0],
+          "\u{feff}": [0xEF,0xBB,0xBF],        // mid-stream BOM survives
+        };
+        const check = (bytes, expected, note) => {
+          const d = new TextDecoder();
+          if (d.decode(bytes) !== expected) { console.log("FAIL", note); vm.exit(1); }
+          const s = new TextDecoder();
+          const mid = 65536;
+          const streamed = s.decode(bytes.subarray(0, mid), {stream: true})
+                         + s.decode(bytes.subarray(mid), {stream: true})
+                         + s.decode();
+          if (streamed !== expected) { console.log("FAIL stream", note); vm.exit(1); }
+        };
+        for (const [form, seq] of Object.entries(seqs)) {
+          for (const off of [65533, 65534, 65535, 65536, 65537]) {
+            const v = new Uint8Array(N).fill(0x41);
+            v.set(seq, off);
+            const expected = "A".repeat(off) + form + "A".repeat(N - off - seq.length);
+            check(v, expected, form + "@" + off);
+          }
+        }
+        // A leading BOM split by the seam is still stripped.
+        const b = new Uint8Array(N).fill(0x41);
+        b.set([0xEF, 0xBB, 0xBF], 0);
+        for (const mid of [1, 2]) {
+          const s2 = new TextDecoder();
+          const out = s2.decode(b.subarray(0, mid), {stream: true})
+                    + s2.decode(b.subarray(mid), {stream: true})
+                    + s2.decode();
+          if (out !== "A".repeat(N - 3)) { console.log("FAIL bom split", mid); vm.exit(1); }
+        }
+        console.log("bom split ok");
+        "#,
+        "bom split ok\n",
+    );
+}
+
+#[test]
+fn decode_input_shrunk_or_detached_by_an_options_getter_reads_the_new_shape() {
+    ok(
+        "td-opt-getter-mutation",
+        r#"
+        const d = new TextDecoder();
+        // Length-tracking view over a resizable buffer: the getter shrinks
+        // it, the decode sees four bytes (Node prints "AAAA").
+        const rab = new ArrayBuffer(16, { maxByteLength: 1 << 20 });
+        const u = new Uint8Array(rab); u.fill(65);
+        console.log(JSON.stringify(d.decode(u, { get stream() { rab.resize(4); return false; } })));
+        // A fixed view left out of bounds by a shrink reads as empty.
+        const rab2 = new ArrayBuffer(16, { maxByteLength: 64 });
+        const v = new Uint8Array(rab2, 2, 10); v.fill(66);
+        console.log(JSON.stringify(d.decode(v, { get stream() { rab2.resize(5); return false; } })));
+        // Detached mid-options: empty, and later decodes still work.
+        const ab = new ArrayBuffer(8); new Uint8Array(ab).fill(67);
+        console.log(JSON.stringify(d.decode(new Uint8Array(ab), { get stream() { ab.transfer(); return false; } })));
+        console.log(JSON.stringify(d.decode(ab)));
+        try { d.decode(new Uint8Array(ab)); } catch (err) { console.log("view:", err.constructor.name); }
+        // A raw SharedArrayBuffer is a BufferSource, like in browsers.
+        console.log(JSON.stringify(d.decode(new SharedArrayBuffer(2))));
+        // A bad input mid-stream throws before touching the state: the
+        // pending BOM still strips on the next call.
+        const e = new TextDecoder();
+        e.decode(new Uint8Array([0xEF]), { stream: true });
+        try { e.decode("text"); } catch (err) { console.log(err.constructor.name); }
+        console.log(JSON.stringify(e.decode(new Uint8Array([0xBB, 0xBF, 97]))));
+        // Options convert before the input type is checked: the stream
+        // getter runs and the input TypeError still wins.
+        const f = new TextDecoder();
+        const order = [];
+        try { f.decode({ get length() { order.push("len"); return 0; } },
+                       { get stream() { order.push("stream"); return false; } }); }
+        catch (err) { console.log(err.constructor.name, order.join(",")); }
+        "#,
+        "\"AAAA\"\n\"\"\n\"\"\n\"\"\nview: TypeError\n\"\\u0000\\u0000\"\nTypeError\n\"a\"\nTypeError stream\n",
+    );
+}
+
+#[test]
+fn decoder_options_labels_and_types_convert_like_webidl() {
+    ok(
+        "td-webidl-conversion",
+        r#"
+        // Function options are callable objects: valid dictionaries.
+        console.log(new TextDecoder("utf-8", function () {}).fatal,
+                    new TextDecoder().decode(new Uint8Array([97]), function () {}));
+        // A symbol label cannot convert to a string.
+        try { new TextDecoder(Symbol()); } catch (err) { console.log(err.constructor.name); }
+        // stream converts as a WebIDL boolean, not by identity.
+        const d = new TextDecoder();
+        console.log(JSON.stringify(d.decode(new Uint8Array([0xF0]), { stream: 1 })),
+                    JSON.stringify(d.decode()));
+        const e = new TextDecoder();
+        console.log(JSON.stringify(e.decode(new Uint8Array([0xF0]), { stream: {} })),
+                    JSON.stringify(e.decode()));
+        "#,
+        "false a\nTypeError\n\"\" \"\u{fffd}\"\n\"\" \"\u{fffd}\"\n",
+    );
+}
+
+#[test]
+fn a_getter_error_during_clone_keeps_its_identity() {
+    ok(
+        "sc-getter-error-identity",
+        r#"
+        const show = (tag, f) => { try { f(); console.log(tag, "no throw"); }
+                                  catch (e) { console.log(tag, e && e.name, e instanceof Error); } };
+        show("plain", () => structuredClone({ get a() { throw new Error("x could not be cloned"); } }));
+        show("custom", () => { const mine = new Error("boom"); mine.name = "Custom";
+                               try { structuredClone({ get a() { throw mine; } }); }
+                               catch (e) { console.log("inner", e.name, e === mine); } });
+        const frozen = Object.freeze(new Error("frozen could not be cloned"));
+        show("frozen", () => structuredClone({ get a() { throw frozen; } }));
+        console.log("kept", frozen.name, Object.keys(frozen).join(","));
+        // The SAB refusal itself is still named.
+        try { structuredClone(new SharedArrayBuffer(4)); } catch (e) { console.log("sab", e.name); }
+        "#,
+        "plain Error true\ninner Custom true\ncustom no throw\nfrozen Error true\nkept Error \nsab DataCloneError\n",
+    );
+}
+
+#[test]
+fn overridden_globals_do_not_reach_the_decoder_internals() {
+    ok(
+        "td-captured-intrinsics",
+        r#"
+        const Real = Uint8Array;
+        globalThis.Uint8Array = function () { throw new Error("hijacked"); };
+        const d = new TextDecoder();
+        const e = new TextEncoder();
+        globalThis.Uint8Array = Real;
+        console.log(JSON.stringify(d.decode(new Real([97]))), e.encode("h").length);
+        // A bad BufferSource still throws after the globals were swapped.
+        try { d.decode("text"); } catch (err) { console.log(err.constructor.name); }
+        "#,
+        "\"a\" 1\nTypeError\n",
+    );
+}
+
+#[test]
+fn encode_into_requires_a_string_source() {
+    ok(
+        "te-encode-into-src",
+        r#"
+        for (const bad of [12345, null, {}, [], new Number(5)]) {
+          try { new TextEncoder().encodeInto(bad, new Uint8Array(4)); console.log("no throw"); }
+          catch (err) { console.log(err.constructor.name); }
+        }
+        "#,
+        "TypeError\nTypeError\nTypeError\nTypeError\nTypeError\n",
+    );
+}
+
+/// Memory-heavy (a 300 MB string): run with `make test-heavy`.
+#[ignore]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn atob_under_memory_pressure_throws_instead_of_aborting() {
+    // 300 MB of valid base64 under a 2.2 GB cap with room for the V8
+    // heap: the streaming decoder walks the string's own units, so the
+    // only Rust allocation is the fallible output.
+    let path = script(
+        "atob-pressure",
+        r#"const s = "A".repeat(300 * 1048576);
+           try { console.log("atob", atob(s).length); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm_capped(
+        2_200_000_000,
+        &["--memory=1024", path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("atob") || r.stdout.starts_with("caught RangeError"),
+        "stdout: {}",
+        r.stdout
+    );
+}
+
+/// Memory-heavy (a 300 MB buffer): run with `make test-heavy`.
+#[ignore]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn cloning_a_buffer_beyond_memory_reports_data_clone_error() {
+    // V8's own wire allocation fails; it raises the clone error through
+    // the delegate, so the guest sees DataCloneError, not a truncation
+    // or an abort.
+    let path = script(
+        "clone-pressure",
+        r#"const a = new ArrayBuffer(300 * 1048576); new Uint8Array(a).fill(1);
+           try { const c = structuredClone(a); console.log("clone", c.byteLength); }
+           catch (e) { console.log("caught", e.name, e.message); }"#,
+    );
+    let r = v8vm_capped(
+        2_200_000_000,
+        &["--memory=1024", path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stdout.starts_with("caught DataCloneError"),
+        "stdout: {}",
+        r.stdout
     );
 }

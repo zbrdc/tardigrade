@@ -9,8 +9,9 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
 // TextEncoder / TextDecoder (UTF-8 only). All byte-level encoding lives in
 // the host callbacks installed by src/webapi; these classes exist only to
 // hold per-instance state (the streaming carry and the undecided BOM) in
-// #private fields. The helper functions are bound here and removed from the
-// global object.
+// #private fields. The intrinsics the classes use at call time are captured
+// here, so a guest replacing globals between calls cannot change what gets
+// allocated or how errors are built.
 {
   const __encode = globalThis.__encodeUtf8;
   const __encodeInto = globalThis.__encodeIntoUtf8;
@@ -19,30 +20,37 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
   delete globalThis.__encodeIntoUtf8;
   delete globalThis.__decodeUtf8;
 
-  class TextEncoder {
-    get encoding() { return "utf-8"; }
-    encode(s = "") {
-      if (!(this instanceof TextEncoder)) throw new TypeError("Illegal invocation");
-      return __encode(s);
-    }
-    encodeInto(source, destination) {
-      if (!(this instanceof TextEncoder)) throw new TypeError("Illegal invocation");
-      return __encodeInto(source, destination);
-    }
-  }
-  Object.defineProperty(TextEncoder.prototype, Symbol.toStringTag, { value: "TextEncoder" });
-
+  const U8 = Uint8Array;
+  const AB = ArrayBuffer;
+  const SAB = SharedArrayBuffer;
+  const isView = ArrayBuffer.isView;
+  const Str = String;
+  const TErr = TypeError;
+  const RErr = RangeError;
   const UTF8_LABELS = new Set([
     "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8",
     "utf-8", "utf8", "x-unicode20utf8",
   ]);
   // WebIDL-style option handling: null/undefined is the empty dictionary,
-  // anything non-object is a TypeError.
+  // functions are callable objects and count, anything else is a TypeError.
   const asOptions = (options) => {
     if (options == null) return {};
-    if (typeof options !== "object") throw new TypeError("The provided value is not of type 'object'");
+    const t = typeof options;
+    if (t !== "object" && t !== "function") throw new TErr("The provided value is not of type 'object'");
     return options;
   };
+
+  class TextEncoder {
+    get encoding() { return "utf-8"; }
+    encode(s = "") {
+      if (!(this instanceof TextEncoder)) throw new TErr("Illegal invocation");
+      return __encode(s);
+    }
+    encodeInto(source, destination) {
+      if (!(this instanceof TextEncoder)) throw new TErr("Illegal invocation");
+      return __encodeInto(source, destination);
+    }
+  }
 
   class TextDecoder {
     #fatal;
@@ -50,24 +58,29 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
     #carry;
     #bom;
     constructor(label = "utf-8", options = null) {
-      const text = String(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "").toLowerCase();
+      // label + "" converts like Str() and throws on a symbol, as the
+      // platform's string conversion does.
+      const text = (label + "").replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, "").toLowerCase();
       if (!UTF8_LABELS.has(text))
-        throw new RangeError(`The "${String(label)}" encoding is not supported`);
+        throw new RErr(`The "${Str(label)}" encoding is not supported`);
       const o = asOptions(options);
       this.#fatal = !!o.fatal;
       this.#ignoreBOM = !!o.ignoreBOM;
-      this.#carry = new Uint8Array(0);
+      this.#carry = new U8(0);
       // No leading code point has been seen yet, so a BOM may still come.
       this.#bom = true;
     }
-    get encoding() { return "utf-8"; }
-    get fatal() { return this.#fatal; }
-    get ignoreBOM() { return this.#ignoreBOM; }
-    #reset() { this.#carry = new Uint8Array(0); this.#bom = true; }
-    decode(input = new Uint8Array(0), options = null) {
-      if (!(this instanceof TextDecoder)) throw new TypeError("Illegal invocation");
+    decode(input = new U8(0), options = null) {
+      if (!(this instanceof TextDecoder)) throw new TErr("Illegal invocation");
+      // Options convert before the input's type is checked (Node runs a
+      // stream getter and still throws the input TypeError), and a bad
+      // BufferSource throws before any state change: the stream survives.
       const o = asOptions(options);
-      const stream = o.stream === true;
+      // The stream getter runs before the input's type is checked (Node
+      // behaves the same), and neither changes any state.
+      const stream = !!o.stream;
+      if (!(input instanceof AB || input instanceof SAB || isView(input)))
+        throw new TErr("decode input must be an ArrayBuffer or a typed array");
       // A non-stream decode ends the stream: the next call starts fresh
       // (new BOM decision, no carry), also after a throwing decode.
       let r;
@@ -87,8 +100,26 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
       if (!stream) this.#reset();
       return r.text;
     }
+    get encoding() { return "utf-8"; }
+    get fatal() { return this.#fatal; }
+    get ignoreBOM() { return this.#ignoreBOM; }
+    #reset() { this.#carry = new U8(0); this.#bom = true; }
   }
-  Object.defineProperty(TextDecoder.prototype, Symbol.toStringTag, { value: "TextDecoder" });
+
+  // WebIDL operations and attribute getters are enumerable on the
+  // prototype, and the brand tag is configurable, like the platform's.
+  const webidlStyle = (proto, tag) => {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (name !== "constructor") {
+        const d = Object.getOwnPropertyDescriptor(proto, name);
+        Object.defineProperty(proto, name, { ...d, enumerable: true });
+      }
+    }
+    Object.defineProperty(proto, Symbol.toStringTag, { value: tag, configurable: true });
+  };
+  webidlStyle(TextEncoder.prototype, "TextEncoder");
+  webidlStyle(TextDecoder.prototype, "TextDecoder");
+
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
 }

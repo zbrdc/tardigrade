@@ -180,18 +180,23 @@ Details and limits of the web APIs above:
   views, ArrayBuffers, cycles and shared references inside one clone.
   Functions, symbols, WebAssembly modules and SharedArrayBuffers throw
   an Error named DataCloneError; there is no transfer list ({transfer:
-  [...]} throws DataCloneError, a non-array transfer a TypeError), and
-  symbol-keyed properties are dropped, as the clone algorithm dictates.
+  [...]} throws DataCloneError, a non-array transfer - a Set is not
+  accepted either, only Arrays - a TypeError), and symbol-keyed
+  properties are dropped, as the clone algorithm dictates.
 - performance.now() reports milliseconds on the real clock (a monotonic
   Instant) with the start of the run as its zero point, so values begin
   near zero in every run and never go backwards within one.
 - All of these decode/encode paths bound their Rust-side allocations
-  (decode reads the input from its backing store in 64 KiB pieces, and
-  every output buffer grows through try_reserve): a memory-constrained
-  embedder sees a guest RangeError instead of a process abort. What
-  stays outside that rule is V8's own memory: cloning a buffer larger
-  than the process can hold still dies with V8's fatal out-of-memory
-  report, like the heap cap does.
+  (decode reads the input from its backing store in pieces sized to the
+  input, atob walks the string's own units and fails on the first
+  non-alphabet unit before allocating anything, and every output buffer
+  grows through try_reserve): a memory-constrained embedder sees a guest
+  RangeError instead of a process abort. What stays outside that rule
+  is V8's own memory: a decode whose result string cannot exist, a btoa
+  result that no longer fits the heap, or a clone whose wire buffer
+  cannot be allocated still ends with V8's own report - a RangeError
+  from V8 where it can build one, its fatal out-of-memory report where
+  it cannot, like the heap cap does.
 
 
 WebAssembly, Intl/ICU, and all of ES2023 are available.

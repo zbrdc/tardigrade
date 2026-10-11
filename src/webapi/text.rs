@@ -176,6 +176,12 @@ fn encode_into_cells(len: usize, unit: impl Fn(usize) -> u16, out: &[Cell<u8>]) 
     (read, written)
 }
 
+/// The typeof name of a value, for ERR_INVALID_ARG_TYPE-shaped messages.
+fn type_name(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> String {
+    let ty = v.type_of(scope);
+    ty.to_rust_string_lossy(scope)
+}
+
 fn read_written_obj<'s>(
     scope: &mut v8::HandleScope<'s>,
     read: usize,
@@ -226,6 +232,18 @@ fn encode_into<'s>(
 guest_cb!(encode_into_utf8, |args, rv, scope| {
     if !args.get(1).is_uint8_array() {
         return throw_type(scope, "encodeInto destination must be a Uint8Array");
+    }
+    // Node requires a string source here (no ToString coercion); the type
+    // name rides along in the message like its ERR_INVALID_ARG_TYPE.
+    if !args.get(0).is_string() {
+        let ty = type_name(scope, &args.get(0));
+        return throw_type(
+            scope,
+            &format!(
+                "The \"src\" argument must be of type string. Received type {}",
+                ty
+            ),
+        );
     }
     let Some(src) = args.get(0).to_string(scope) else {
         return;
@@ -466,7 +484,25 @@ impl ChunkSrc {
                 len,
             });
         }
+        // A raw SharedArrayBuffer is a BufferSource too, like in browsers.
+        if v.is_shared_array_buffer() {
+            let buffer = v8::Local::<v8::SharedArrayBuffer>::try_from(*v).ok()?;
+            let store = buffer.get_backing_store();
+            let len = store.byte_length();
+            return Some(ChunkSrc::Store {
+                cells: store,
+                start: 0,
+                len,
+            });
+        }
         None
+    }
+
+    fn total_len(&self) -> usize {
+        match self {
+            ChunkSrc::Empty => 0,
+            ChunkSrc::Store { cells, start, len } => (*len).min(cells.len().saturating_sub(*start)),
+        }
     }
 
     fn pieces(&self) -> impl Iterator<Item = &[Cell<u8>]> {
@@ -486,19 +522,21 @@ guest_cb!(decode_utf8, |args, rv, scope| {
     // The carry is this module's own Uint8Array (at most three bytes);
     // reading it through a bounded copy costs nothing.
     let carry = carry_bytes(&args.get(0));
+    // Options first: a getter may resize or detach the input buffer, and
+    // no guest-reachable call may run after the backing store is borrowed.
+    let opts = DecodeOpts::read(scope, &args.get(2));
     let Some(chunk) = ChunkSrc::from_arg(&args.get(1)) else {
         return throw_type(
             scope,
             "decode input must be an ArrayBuffer or a typed array",
         );
     };
-    let opts = DecodeOpts::read(scope, &args.get(2));
     let mut state = DecodeState {
         carry,
         bom_pending: opts.bom_pending && !opts.ignore_bom,
     };
     let mut out = Vec::new();
-    let mut piece = vec![0u8; DECODE_PIECE];
+    let mut piece = vec![0u8; DECODE_PIECE.min(chunk.total_len())];
     let mut step = DecodeOpts {
         flush: false,
         ..opts
@@ -525,16 +563,25 @@ guest_cb!(decode_utf8, |args, rv, scope| {
     }
 });
 
-/// Reads the JS-side carry (this module's own Uint8Array, at most a few
-/// bytes) or an empty one for anything else.
+/// Reads the JS-side carry (this module's own Uint8Array) or an empty
+/// one for anything else. A carry is only ever an incomplete trailing
+/// sequence or a possible BOM prefix, so anything longer than three
+/// bytes cannot be ours and reads as empty: a guest-sized value here
+/// must never reach a Rust allocation.
 fn carry_bytes(v: &v8::Local<v8::Value>) -> Vec<u8> {
     let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(*v) else {
         return Vec::new();
     };
+    if view.byte_length() > MAX_CARRY {
+        return Vec::new();
+    }
     let mut buf = vec![0u8; view.byte_length()];
     view.copy_contents(&mut buf);
     buf
 }
+
+/// The carry is at most three bytes of a cut-off UTF-8 sequence.
+const MAX_CARRY: usize = 3;
 
 #[cfg(test)]
 mod tests {
