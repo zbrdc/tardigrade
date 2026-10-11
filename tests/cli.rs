@@ -1901,19 +1901,72 @@ fn virtual_time_epoch_is_honored_by_every_date_read() {
 #[test]
 fn virtual_date_is_rebuilt_over_the_original() {
     // The override must not hand the guest the original constructor (the
-    // host clock) through any of the usual object-graph paths, and it
-    // must keep the Date surface (function form, subclassing, statics)
-    // shaped like the platform's.
+    // host clock) through any of the usual object-graph paths - the
+    // prototype chain of Date itself included - and it must keep the
+    // Date surface (function form, subclassing, statics, constructor
+    // shape) looking like the platform's.
     let r = run_js_with(
         &["--clock=virtual", "--epoch=77", "--timeout=5000"],
         "vclock-date-shape",
-        "const E = 77;\n         console.log(new Date().constructor === Date, Date.name, Date.length);\n         console.log(Object.getPrototypeOf(new Date()) === Date.prototype);\n         console.log(typeof globalThis.__virtualDateMs);\n         class D extends Date {}\n         console.log(new D(5).getTime() === 5, new D().getTime() === E, D.now() === E);\n         console.log(Date.UTC(1970, 0, 1) === 0, typeof Date.parse);\n         console.log(Date(999) === Date(), new Date().getUTCFullYear());",
+        "const E = 77;\n         console.log(new Date().constructor === Date, Date.name, Date.length);\n         console.log(Object.getPrototypeOf(new Date()) === Date.prototype);\n         console.log(typeof globalThis.__virtualDateMs);\n         class D extends Date {}\n         console.log(new D(5).getTime() === 5, new D().getTime() === E, D.now() === E);\n         console.log(Date.UTC(1970, 0, 1) === 0, typeof Date.parse);\n         console.log(Date(999) === Date(), new Date().getUTCFullYear());\n         // Date's own [[Prototype]] is Function.prototype in every\n         // spelling, so nothing through it constructs with the host clock.\n         console.log(Object.getPrototypeOf(Date) === Function.prototype,\n                     Date.__proto__ === Function.prototype,\n                     Reflect.getPrototypeOf(Date) === Function.prototype,\n                     Object.getPrototypeOf(D) === Date);\n         let protoCtor = 'constructed';\n         try { new (Object.getPrototypeOf(Date))(); } catch (e) { protoCtor = e.name; }\n         console.log(protoCtor, new (Date.bind())().getTime() === E);\n         console.log(Object.keys(Date).length === 0,\n                     Object.getOwnPropertyNames(Date).sort().join(','),\n                     Object.getOwnPropertyDescriptor(Date, 'prototype').writable,\n                     Date.now.name,\n                     (() => { try { new Date.now(); return 'constructed'; } catch (e) { return e.name; } })());",
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    // 1970-01-01T00:00:00.077Z under epoch 77 ms, in UTC terms.
     assert_eq!(
         r.stdout,
-        "true Date 7\ntrue\nundefined\ntrue true true\ntrue function\ntrue 1970\n"
+        "true Date 7\ntrue\nundefined\ntrue true true\ntrue function\ntrue 1970\n".to_string()
+            + "true true true true\nTypeError true\ntrue UTC,length,name,now,parse,prototype false now TypeError\n"
+    );
+}
+
+#[test]
+fn every_intrinsic_the_date_override_uses_survives_being_replaced() {
+    // The decoder probe shape, applied to Date: swap each intrinsic the
+    // prelude's override touches for a throwing boom, run the whole Date
+    // surface, restore, and require the same results - the override
+    // captured Reflect.construct/apply (and everything else it uses) at
+    // prelude time, so a guest cannot reroute or trap it, least of all to
+    // capture the host constructor.
+    let r = run_js_with(
+        &["--clock=virtual", "--epoch=77", "--timeout=5000"],
+        "vclock-date-intrinsics",
+        r#"
+        const DP = Object.defineProperty, GOPD = Object.getOwnPropertyDescriptor;
+        const boom = function () { throw new Error("HIJACKED"); };
+        const E = 77;
+        const run = () => {
+          const out = [];
+          const t = (n, f) => { try { out.push(n + "=" + String(f())); } catch (x) { out.push(n + "!" + (x && x.name)); } };
+          t("now", () => Date.now() === E);
+          t("new", () => new Date().getTime() === E);
+          t("arg", () => new Date(5).getTime() === 5);
+          t("call", () => Date() === Date());
+          t("subclass", () => new (class extends Date {})().getTime() === E);
+          t("utc", () => Date.UTC(1970, 0, 1) === 0);
+          t("parse", () => typeof Date.parse("2000-01-01T00:00:00Z"));
+          return out.join(" ");
+        };
+        const base = run();
+        if (base.includes("HIJACKED")) { console.log("baseline broken:", base); vm.exit(1); }
+        const targets = [
+          [globalThis, "Reflect"], [globalThis, "Array"],
+          [Reflect, "construct"], [Reflect, "apply"],
+          [Function.prototype, "call"], [Function.prototype, "apply"],
+          [Date.prototype, "toString"], [Date.prototype, Symbol.toPrimitive],
+        ];
+        for (const [o, k] of targets) {
+          const desc = GOPD(o, k);
+          DP(o, k, { value: boom, configurable: true, writable: true });
+          const now = run();
+          if (desc) DP(o, k, desc); else delete o[k];
+          if (now !== base) { console.log("DIFFERS under", String(k), ":", now, "|", base); vm.exit(1); }
+        }
+        console.log("stable", base);
+        "#,
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "stable now=true new=true arg=true call=true subclass=true utc=true parse=number\n"
     );
 }
 

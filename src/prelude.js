@@ -153,32 +153,63 @@ vm.run = (p) => (0, eval)(vm.fs.read(p));
 // --clock=virtual: Date must read the run's virtual clock, never the
 // host clock. The host installs __virtualDateMs only for virtual runs;
 // capture it like the encoder hooks above, delete it, and rebuild Date
-// over the original constructor, which stays reachable only from this
-// closure - no date object, prototype or subclass can hand the guest a
+// over the original constructor. The original stays reachable only from
+// this closure: the rebuilt Date's [[Prototype]] is Function.prototype
+// (chaining it to the original would hand the guest the host clock
+// through Object.getPrototypeOf), its statics are own copies, and every
+// intrinsic the override touches at call time is captured here too - so
+// no date object, prototype, subclass chain or replaced Reflect yields a
 // constructor bound to the host clock.
 if (typeof globalThis.__virtualDateMs === "function") {
   const __vnow = globalThis.__virtualDateMs;
   delete globalThis.__virtualDateMs;
   const HostDate = Date;
-  // A plain function, not a class, so Date() without new still returns
-  // the time string; Reflect.construct keeps new.target (subclasses,
-  // prototype changes) honest. An explicit argument is passed through
-  // untouched, so new Date(ms) (and every other form) stays exact.
-  const VDate = function Date(...args) {
+  const __construct = Reflect.construct;
+  const __apply = Reflect.apply;
+  const __Array = Array;
+  // Copies a strict arguments object without touching replaceable
+  // intrinsics (no spread, no Array.prototype.slice).
+  const __argsOf = (argsObj) => {
+    const list = __Array(argsObj.length);
+    for (let i = 0; i < argsObj.length; i++) list[i] = argsObj[i];
+    return list;
+  };
+  // Date() as a function ignores its arguments (ECMA-262 21.4.2.1) and
+  // builds its string without consulting the (replaceable)
+  // Date.prototype methods; the captured toString does the same.
+  const __dateString = HostDate.prototype.toString;
+  // A plain function, not a class, so Date() without new still works;
+  // strict with a simple parameter list, so it carries no own
+  // arguments/caller accessors the platform's constructor does not have.
+  // Reflect.construct keeps new.target (subclasses, prototype changes)
+  // honest, and an explicit argument is passed through untouched, so
+  // new Date(ms) (and every other form) stays exact.
+  const VDate = function Date() {
+    "use strict";
     if (new.target === undefined) {
-      // Date() as a function ignores its arguments (ECMA-262 21.4.2.1)
-      // and returns the current time as a string - here the virtual one.
-      return `${new HostDate(__vnow())}`;
+      return __apply(__dateString, new HostDate(__vnow()), []);
     }
-    return Reflect.construct(HostDate, args.length ? args : [__vnow()], new.target);
+    return __construct(HostDate, arguments.length ? __argsOf(arguments) : [__vnow()], new.target);
   };
   VDate.prototype = HostDate.prototype;
-  // The statics (UTC, parse) are inherited from the original; now is
-  // the virtual clock, and Date.prototype.constructor names the visible
-  // constructor instead of the captured original.
-  Object.setPrototypeOf(VDate, HostDate);
+  // now stays non-constructable like the platform's (an arrow), with
+  // the platform's name.
+  const nowFn = () => __vnow();
+  Object.defineProperty(nowFn, "name", { value: "now", configurable: true });
+  // Platform constructor shape: own length, name, prototype, now, parse
+  // and UTC, all non-enumerable (Object.keys(Date) is empty), with the
+  // prototype property non-writable like a class's.
+  Object.defineProperty(VDate, "prototype", { writable: false });
+  Object.defineProperty(VDate, "length", { value: 7, configurable: true });
+  Object.defineProperty(VDate, "now", {
+    value: nowFn,
+    writable: true, configurable: true,
+  });
+  for (const staticName of ["parse", "UTC"]) {
+    Object.defineProperty(
+      VDate, staticName, Object.getOwnPropertyDescriptor(HostDate, staticName)
+    );
+  }
   HostDate.prototype.constructor = VDate;
-  VDate.now = () => __vnow();
-  Object.defineProperty(VDate, "length", { value: 7 });
   globalThis.Date = VDate;
 }

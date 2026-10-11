@@ -69,6 +69,16 @@ and is not set by this repo.
   reachable only from that prelude closure), so no Date read - Date.now,
   the no-argument constructor, the function-call string form, or Date
   prototype methods on a no-argument date - can observe the host clock.
+  Nor can any object-graph path reach a host-clock-bound constructor:
+  the rebuilt Date's [[Prototype]] is Function.prototype (not the
+  original Date), its statics are own copies (parse, UTC - neither reads
+  a clock), and every intrinsic it uses at call time is captured with
+  it, so replaced globals (Reflect.construct, Function.prototype
+  methods, ...) neither change what runs nor trap the original
+  constructor. The rebuilt constructor is shaped like the platform's:
+  own length, name, prototype, now, parse, UTC - all non-enumerable -
+  with a non-writable prototype property and a non-constructable,
+  correctly named now.
   --seed plus --clock=virtual makes a guest that touches nothing real
   byte-for-byte reproducible across runs.
 - Wall-clock rules are unchanged under "--clock=virtual": --timeout
