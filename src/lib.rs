@@ -48,7 +48,7 @@ use watchdog::Watchdog;
 use world::{world_mut, World};
 
 /// The run's clock: real time, or the virtual clock of --clock=virtual
-/// (see the README's Use section for its exact semantics).
+/// (see docs/OPTIONS.md, --clock=virtual, for its exact semantics).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Clock {
     /// Real time: Date reads V8's own clock and performance.now() a

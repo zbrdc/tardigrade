@@ -12,10 +12,11 @@
 //! JavaScript resumes straight into the termination - growth otherwise
 //! dies inside V8's allocation retry, which never returns to JavaScript
 //! and ignores termination. Where a run is actually stopped therefore sits
-//! between the configured cap and the raised limit (README states this).
+//! between the configured cap and the raised limit (docs/KNOWN_RISKS.md
+//! states this).
 //!
 //! ArrayBuffer memory is capped separately by the counting allocator:
-//! this V8 build does not account sandboxed backing stores as external
+//! this V8 build does not account ArrayBuffer backing stores as external
 //! memory, so the allocator enforces its own budget (live backing-store
 //! bytes against the same --memory figure) by refusing allocations that
 //! would cross it; V8 reports the refusal to the guest as a catchable
@@ -23,7 +24,7 @@
 //! (TextEncoder.encode, vm.fs.readBytes) are charged to the same budget
 //! through [uint8_array_from], so they cannot be retained past it either.
 //! Resizable ArrayBuffers and growable SharedArrayBuffers bypass the
-//! allocator entirely (see README).
+//! allocator entirely (see docs/KNOWN_RISKS.md).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
