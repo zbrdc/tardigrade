@@ -336,6 +336,21 @@ const SANDBOX_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A dump the sandbox cannot anchor is refused while it prepares, before any
 /// kernel layer is installed, so these hold on every kernel.
+/// The flag scripts gate their skips on: exit 0 with a word when sandboxing
+/// is possible and 2 with the reason otherwise. The kernel is queried
+/// independently of the library under test, so a lying answer fails.
+#[test]
+fn sandbox_check_matches_the_kernel() {
+    let r = v8vm(&["--sandbox-check"], b"");
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if common::kernel_supports_sandbox() {
+        assert_eq!((r.code, r.stdout.trim()), (0, "supported"), "stderr: {}", r.stderr);
+        return;
+    }
+    assert_eq!(r.code, 2, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("--sandbox is not available"), "stderr: {}", r.stderr);
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod sandbox_prepare {
     use super::*;

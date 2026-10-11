@@ -38,9 +38,11 @@ jobs:
         #
         # --sandbox needs Landlock ABI 6 (Linux 6.12). Hosted runners may run
         # an older kernel, so the sandbox runtime tests and the make check
-        # sandbox line print "SKIPPED (kernel lacks Landlock ABI 6)" and pass
-        # there. V8VM_REQUIRE_SANDBOX=1 would make a missing kernel feature
-        # fail instead; set it in this step's env only on a runner known to
-        # have the support, so a silent skip cannot hide a regression. It is
+        # sandbox line report a skip and pass there, gated on the kernel's
+        # actual Landlock ABI (v8vm --sandbox-check), never on a refusal
+        # message: a kernel that can sandbox but refuses fails the gate.
+        # V8VM_REQUIRE_SANDBOX=1 would make a missing kernel feature fail
+        # instead; set it in this step's env only on a runner known to have
+        # the support, so a silent skip cannot hide a regression. It is
         # deliberately unset here.
         run: make ci CARGOFLAGS=--locked

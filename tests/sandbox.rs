@@ -48,7 +48,7 @@ mod run {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::time::{Duration, Instant};
-    use v8vm::sandbox::{apply_layer, Layer};
+    use v8vm::sandbox::{apply_layer, apply_probe, denied_syscalls, Layer, PROBE_DENY_ERRNO};
 
     const PROBE_PREFIX: &str = "--probe-mode=";
     /// Set on the children the harness case spawns, so they do not run the
@@ -120,6 +120,7 @@ mod run {
             "late-v8" => mode_late_v8(),
             "no-landlock" => mode_missing("no-landlock", libc::SYS_landlock_create_ruleset),
             "no-seccomp" => mode_missing("no-seccomp", libc::SYS_seccomp),
+            "deny-enum" => mode_deny_enum(),
             "x32" => mode_x32(),
             "int80" => mode_int80(),
             "int80-bare" => mode_int80_bare(),
@@ -147,6 +148,331 @@ mod run {
         let in_thread =
             std::thread::spawn(move || probe_all(&owned.0, &owned.1)).join().expect("probe thread");
         report("thr-", &in_thread);
+    }
+
+    /// The whole deny list through a filter whose denials return
+    /// PROBE_DENY_ERRNO, an errno no kernel call produces here: every entry
+    /// must report exactly that, so a missing or inert rule is named. The
+    /// argument-rule shapes (namespace clones, TIOCLINUX) go through the
+    /// same filter.
+    fn mode_deny_enum() {
+        if let Err(e) = apply_probe() {
+            println!("PROBE|deny-enum|refused:{}", e);
+            return;
+        }
+        println!("PROBE|deny-enum|ok");
+        let want = format!("errno={}", PROBE_DENY_ERRNO);
+        let mut count = 0;
+        for (nr, name) in denied_table() {
+            // fork and vfork would create a child if the rule were missing;
+            // the raw path exits any child in asm before it can run.
+            let outcome = match name {
+                "fork" | "vfork" => probe_raw_process(nr),
+                _ => sys(nr, [-1, -1, 0, 0, 0]),
+            };
+            count += usize::from(outcome == want);
+            println!("PROBE|deny|{}|{}", name, outcome);
+        }
+        // Argument rules carry the same errno in this filter.
+        let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as libc::c_ulong;
+        for (name, flags) in NAMESPACE_PROBE_FLAGS {
+            println!("PROBE|deny|clone-thread+{}|{}", name, probe_clone(thread | flags));
+        }
+        println!("PROBE|deny|clone-vm-nothread|{}", probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong));
+        println!("PROBE|deny|ioctl-tioclinux|{}", on_pipe(|fd| raw(unsafe {
+            libc::ioctl(fd, libc::TIOCLINUX as libc::c_ulong, b'x' as *const u8)
+        })));
+        println!("PROBE|deny|checked|{}", count);
+    }
+
+    /// (number, name) for every syscall denied outright, in the order the
+    /// deny list holds them; the enumeration test also checks this against
+    /// the list the library exports, so the two cannot drift apart.
+    fn denied_table() -> Vec<(libc::c_long, &'static str)> {
+        const NAMES: &[&str] = &[
+        "socket",
+        "socketpair",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "sendmmsg",
+        "recvmmsg",
+        "shutdown",
+        "getsockname",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        "execve",
+        "execveat",
+        "fork",
+        "vfork",
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "kcmp",
+        "pidfd_open",
+        "pidfd_getfd",
+        "pidfd_send_signal",
+        "setuid",
+        "setgid",
+        "setreuid",
+        "setregid",
+        "setresuid",
+        "setresgid",
+        "setfsuid",
+        "setfsgid",
+        "setgroups",
+        "capset",
+        "unshare",
+        "setns",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "move_mount",
+        "open_tree",
+        "mount_setattr",
+        "fspick",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "kexec_file_load",
+        "reboot",
+        "swapon",
+        "swapoff",
+        "acct",
+        "sethostname",
+        "setdomainname",
+        "syslog",
+        "bpf",
+        "perf_event_open",
+        "userfaultfd",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        "seccomp",
+        "memfd_create",
+        "memfd_secret",
+        "personality",
+        "modify_ldt",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "open_by_handle_at",
+        "name_to_handle_at",
+        "clock_settime",
+        "clock_adjtime",
+        "adjtimex",
+        "settimeofday",
+        "shmget",
+        "shmat",
+        "shmctl",
+        "msgget",
+        "msgsnd",
+        "msgrcv",
+        "msgctl",
+        "semget",
+        "semop",
+        "semtimedop",
+        "semctl",
+        "mq_open",
+        "mq_unlink",
+        "mq_timedsend",
+        "mq_timedreceive",
+        "mq_notify",
+        "mq_getsetattr",
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "chown",
+        "fchown",
+        "lchown",
+        "fchownat",
+        "setxattr",
+        "lsetxattr",
+        "fsetxattr",
+        "getxattr",
+        "lgetxattr",
+        "fgetxattr",
+        "listxattr",
+        "llistxattr",
+        "flistxattr",
+        "removexattr",
+        "lremovexattr",
+        "fremovexattr",
+        "utime",
+        "utimes",
+        "futimesat",
+        "utimensat",
+        "inotify_init",
+        "inotify_init1",
+        "inotify_add_watch",
+        "fanotify_init",
+        "fanotify_mark",
+        "sendfile",
+        "splice",
+        "vmsplice",
+        "tee",
+        "copy_file_range",
+        "ioperm",
+        "iopl",
+        "uselib",
+        ];
+        // libc has no name-to-number lookup; the constants are matched by
+        // the same tokens the deny list uses.
+        fn nr_of(name: &str) -> libc::c_long {
+            match name {
+                "socket" => libc::SYS_socket,
+                "socketpair" => libc::SYS_socketpair,
+                "connect" => libc::SYS_connect,
+                "bind" => libc::SYS_bind,
+                "listen" => libc::SYS_listen,
+                "accept" => libc::SYS_accept,
+                "accept4" => libc::SYS_accept4,
+                "sendto" => libc::SYS_sendto,
+                "recvfrom" => libc::SYS_recvfrom,
+                "sendmsg" => libc::SYS_sendmsg,
+                "recvmsg" => libc::SYS_recvmsg,
+                "sendmmsg" => libc::SYS_sendmmsg,
+                "recvmmsg" => libc::SYS_recvmmsg,
+                "shutdown" => libc::SYS_shutdown,
+                "getsockname" => libc::SYS_getsockname,
+                "getpeername" => libc::SYS_getpeername,
+                "setsockopt" => libc::SYS_setsockopt,
+                "getsockopt" => libc::SYS_getsockopt,
+                "execve" => libc::SYS_execve,
+                "execveat" => libc::SYS_execveat,
+                "fork" => libc::SYS_fork,
+                "vfork" => libc::SYS_vfork,
+                "ptrace" => libc::SYS_ptrace,
+                "process_vm_readv" => libc::SYS_process_vm_readv,
+                "process_vm_writev" => libc::SYS_process_vm_writev,
+                "kcmp" => libc::SYS_kcmp,
+                "pidfd_open" => libc::SYS_pidfd_open,
+                "pidfd_getfd" => libc::SYS_pidfd_getfd,
+                "pidfd_send_signal" => libc::SYS_pidfd_send_signal,
+                "setuid" => libc::SYS_setuid,
+                "setgid" => libc::SYS_setgid,
+                "setreuid" => libc::SYS_setreuid,
+                "setregid" => libc::SYS_setregid,
+                "setresuid" => libc::SYS_setresuid,
+                "setresgid" => libc::SYS_setresgid,
+                "setfsuid" => libc::SYS_setfsuid,
+                "setfsgid" => libc::SYS_setfsgid,
+                "setgroups" => libc::SYS_setgroups,
+                "capset" => libc::SYS_capset,
+                "unshare" => libc::SYS_unshare,
+                "setns" => libc::SYS_setns,
+                "mount" => libc::SYS_mount,
+                "umount2" => libc::SYS_umount2,
+                "pivot_root" => libc::SYS_pivot_root,
+                "chroot" => libc::SYS_chroot,
+                "fsopen" => libc::SYS_fsopen,
+                "fsconfig" => libc::SYS_fsconfig,
+                "fsmount" => libc::SYS_fsmount,
+                "move_mount" => libc::SYS_move_mount,
+                "open_tree" => libc::SYS_open_tree,
+                "mount_setattr" => libc::SYS_mount_setattr,
+                "fspick" => libc::SYS_fspick,
+                "init_module" => libc::SYS_init_module,
+                "finit_module" => libc::SYS_finit_module,
+                "delete_module" => libc::SYS_delete_module,
+                "kexec_load" => libc::SYS_kexec_load,
+                "kexec_file_load" => libc::SYS_kexec_file_load,
+                "reboot" => libc::SYS_reboot,
+                "swapon" => libc::SYS_swapon,
+                "swapoff" => libc::SYS_swapoff,
+                "acct" => libc::SYS_acct,
+                "sethostname" => libc::SYS_sethostname,
+                "setdomainname" => libc::SYS_setdomainname,
+                "syslog" => libc::SYS_syslog,
+                "bpf" => libc::SYS_bpf,
+                "perf_event_open" => libc::SYS_perf_event_open,
+                "userfaultfd" => libc::SYS_userfaultfd,
+                "io_uring_setup" => libc::SYS_io_uring_setup,
+                "io_uring_enter" => libc::SYS_io_uring_enter,
+                "io_uring_register" => libc::SYS_io_uring_register,
+                "seccomp" => libc::SYS_seccomp,
+                "memfd_create" => libc::SYS_memfd_create,
+                "memfd_secret" => libc::SYS_memfd_secret,
+                "personality" => libc::SYS_personality,
+                "modify_ldt" => libc::SYS_modify_ldt,
+                "keyctl" => libc::SYS_keyctl,
+                "add_key" => libc::SYS_add_key,
+                "request_key" => libc::SYS_request_key,
+                "open_by_handle_at" => libc::SYS_open_by_handle_at,
+                "name_to_handle_at" => libc::SYS_name_to_handle_at,
+                "clock_settime" => libc::SYS_clock_settime,
+                "clock_adjtime" => libc::SYS_clock_adjtime,
+                "adjtimex" => libc::SYS_adjtimex,
+                "settimeofday" => libc::SYS_settimeofday,
+                "shmget" => libc::SYS_shmget,
+                "shmat" => libc::SYS_shmat,
+                "shmctl" => libc::SYS_shmctl,
+                "msgget" => libc::SYS_msgget,
+                "msgsnd" => libc::SYS_msgsnd,
+                "msgrcv" => libc::SYS_msgrcv,
+                "msgctl" => libc::SYS_msgctl,
+                "semget" => libc::SYS_semget,
+                "semop" => libc::SYS_semop,
+                "semtimedop" => libc::SYS_semtimedop,
+                "semctl" => libc::SYS_semctl,
+                "mq_open" => libc::SYS_mq_open,
+                "mq_unlink" => libc::SYS_mq_unlink,
+                "mq_timedsend" => libc::SYS_mq_timedsend,
+                "mq_timedreceive" => libc::SYS_mq_timedreceive,
+                "mq_notify" => libc::SYS_mq_notify,
+                "mq_getsetattr" => libc::SYS_mq_getsetattr,
+                "chmod" => libc::SYS_chmod,
+                "fchmod" => libc::SYS_fchmod,
+                "fchmodat" => libc::SYS_fchmodat,
+                "chown" => libc::SYS_chown,
+                "fchown" => libc::SYS_fchown,
+                "lchown" => libc::SYS_lchown,
+                "fchownat" => libc::SYS_fchownat,
+                "setxattr" => libc::SYS_setxattr,
+                "lsetxattr" => libc::SYS_lsetxattr,
+                "fsetxattr" => libc::SYS_fsetxattr,
+                "getxattr" => libc::SYS_getxattr,
+                "lgetxattr" => libc::SYS_lgetxattr,
+                "fgetxattr" => libc::SYS_fgetxattr,
+                "listxattr" => libc::SYS_listxattr,
+                "llistxattr" => libc::SYS_llistxattr,
+                "flistxattr" => libc::SYS_flistxattr,
+                "removexattr" => libc::SYS_removexattr,
+                "lremovexattr" => libc::SYS_lremovexattr,
+                "fremovexattr" => libc::SYS_fremovexattr,
+                "utime" => libc::SYS_utime,
+                "utimes" => libc::SYS_utimes,
+                "futimesat" => libc::SYS_futimesat,
+                "utimensat" => libc::SYS_utimensat,
+                "inotify_init" => libc::SYS_inotify_init,
+                "inotify_init1" => libc::SYS_inotify_init1,
+                "inotify_add_watch" => libc::SYS_inotify_add_watch,
+                "fanotify_init" => libc::SYS_fanotify_init,
+                "fanotify_mark" => libc::SYS_fanotify_mark,
+                "sendfile" => libc::SYS_sendfile,
+                "splice" => libc::SYS_splice,
+                "vmsplice" => libc::SYS_vmsplice,
+                "tee" => libc::SYS_tee,
+                "copy_file_range" => libc::SYS_copy_file_range,
+                "ioperm" => libc::SYS_ioperm,
+                "iopl" => libc::SYS_iopl,
+                "uselib" => libc::SYS_uselib,
+                _ => unreachable!("test table entry without a libc constant"),
+            }
+        }
+        NAMES.iter().map(|n| (nr_of(n), *n)).collect()
     }
 
     /// A syscall number in the x32 range (nr | 0x40000000) must be killed by
@@ -302,15 +628,51 @@ mod run {
         parent.map_or_else(|| "skipped".to_string(), aim)
     }
 
-    fn fs_probes(dump: &Path, escape_dir: &Path) -> Vec<Probe> {
+    /// Probes for the syscalls newer than the deny list: the range rule in
+    /// the stacked guard must refuse them with ENOSYS whatever their
+    /// arguments. They aim at the dump file, which the run owns, so an
+    /// unexpectedly successful call damages nothing that matters.
+    fn new_syscall_probes(dump: &Path) -> Vec<Probe> {
+        let path = CString::new(path_string(dump)).expect("dump path");
+        let name = addr(c"user.v8vm".as_ptr());
+        // struct xattr_args { u64 value; u32 size; u32 flags; }
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&1u64.to_ne_bytes());
+        let file_attr = [0u8; 32]; // struct file_attr, all zero
         vec![
+            probe("fchmodat2", sys(NR_FCHMODAT2, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0o600 as _, 0, 0])),
+            probe("setxattrat", sys(NR_SETXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, addr(args.as_ptr())])),
+            probe("getxattrat", sys(NR_GETXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, addr(args.as_ptr())])),
+            probe("listxattrat", sys(NR_LISTXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, addr(args.as_ptr()), 0])),
+            probe("removexattrat", sys(NR_REMOVEXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, 0])),
+            probe("file-getattr", sys(NR_FILE_GETATTR, [libc::AT_FDCWD as _, addr(path.as_ptr()), addr(file_attr.as_ptr()), file_attr.len() as _, 0])),
+            probe("file-setattr", sys(NR_FILE_SETATTR, [libc::AT_FDCWD as _, addr(path.as_ptr()), addr(file_attr.as_ptr()), file_attr.len() as _, 0])),
+        ]
+    }
+
+    /// Syscall numbers libc 0.2.190 does not define (post-6.12 additions;
+    /// asm/unistd_64.h on this host): fchmodat2 452, setxattrat 463,
+    /// getxattrat 464, listxattrat 465, removexattrat 466, file_getattr 468,
+    /// file_setattr 469.
+    const NR_FCHMODAT2: libc::c_long = 452;
+    const NR_SETXATTRAT: libc::c_long = 463;
+    const NR_GETXATTRAT: libc::c_long = 464;
+    const NR_LISTXATTRAT: libc::c_long = 465;
+    const NR_REMOVEXATTRAT: libc::c_long = 466;
+    const NR_FILE_GETATTR: libc::c_long = 468;
+    const NR_FILE_SETATTR: libc::c_long = 469;
+
+    fn fs_probes(dump: &Path, escape_dir: &Path) -> Vec<Probe> {
+        let mut probes = new_syscall_probes(dump);
+        probes.extend(vec![
             probe("read-etc-passwd", io(std::fs::File::open("/etc/passwd").map(|_| ()))),
             probe("read-urandom", io(std::fs::File::open("/dev/urandom").map(|_| ()))),
             probe("write-existing", io(std::fs::write(escape_dir.join("escape.txt"), "x"))),
             probe("write-new", io(std::fs::write(escape_dir.join("new.txt"), "x"))),
             probe("write-dump", io(std::fs::write(dump, "{\"probe\":1}"))),
             probe("read-dump", io(std::fs::File::open(dump).map(|_| ()))),
-        ]
+        ]);
+        probes
     }
 
     /// Probes that need no other process. Argument-less denials are exercised
@@ -800,6 +1162,18 @@ mod run {
         "ioprio-set-user",
     ];
 
+    /// Probes refused by the range rule in the stacked guard: newer-than-
+    /// list syscalls get ENOSYS, exactly like an unknown syscall.
+    const NEW_SYSCALLS: [&str; 7] = [
+        "fchmodat2",
+        "setxattrat",
+        "getxattrat",
+        "listxattrat",
+        "removexattrat",
+        "file-getattr",
+        "file-setattr",
+    ];
+
     /// Every probe that fails with EPERM once the seccomp layer is in.
     fn seccomp_denied() -> Vec<String> {
         let mut names: Vec<String> = SECCOMP_ONLY.iter().chain(SCOPED_PARENT).map(|n| n.to_string()).collect();
@@ -835,7 +1209,7 @@ mod run {
     fn full_expectations() -> Expected {
         let mut all = expect(FS_DENIED, &errno_str(libc::EACCES));
         all.extend(expect(seccomp_denied(), &errno_str(libc::EPERM)));
-        all.extend(expect(["clone3"], &errno_str(libc::ENOSYS)));
+        all.extend(expect(["clone3"].into_iter().chain(NEW_SYSCALLS), &errno_str(libc::ENOSYS)));
         all.extend(expect(always_ok(), "ok"));
         all
     }
@@ -871,6 +1245,7 @@ mod run {
         Case { name: "foreign_abi_int80_call_is_killed", run: int80_call_killed, needs_kernel: false },
         Case { name: "live_run_threads_all_restricted", run: live_threads_restricted, needs_kernel: true },
         Case { name: "dump_not_truncated_before_the_snapshot", run: dump_not_truncated_early, needs_kernel: true },
+        Case { name: "every_denied_syscall_is_denied", run: denied_enumeration, needs_kernel: false },
         Case { name: "harness_selection_flags_list_skip_and_exact", run: harness_selection, needs_kernel: false },
         Case { name: "harness_skips_cases_on_a_kernel_without_landlock", run: harness_old_kernel, needs_kernel: false },
     ];
@@ -940,6 +1315,37 @@ mod run {
         } else {
             Outcome::Failed
         }
+    }
+
+    /// The whole deny list, one syscall at a time, against a filter whose
+    /// denials return an errno nothing else produces: every entry must
+    /// report exactly that errno, and the table in this file must match the
+    /// list the library exports.
+    fn denied_enumeration() {
+        let expected_nrs = denied_syscalls();
+        let table = denied_table();
+        assert_eq!(
+            table.iter().map(|(nr, _)| *nr).collect::<Vec<_>>(),
+            expected_nrs,
+            "the test table and the deny list disagree"
+        );
+        let lines = run_probe("deny-enum", &[]);
+        assert_eq!(result(&lines, "deny-enum"), "ok", "apply must succeed");
+        let want = format!("errno={}", PROBE_DENY_ERRNO);
+        let mut keys: Vec<String> = table.iter().map(|(_, name)| format!("deny|{}", name)).collect();
+        keys.extend(NAMESPACE_PROBE_FLAGS.iter().map(|(name, _)| format!("deny|clone-thread+{}", name)));
+        keys.extend(["deny|clone-vm-nothread", "deny|ioctl-tioclinux"].map(String::from));
+        let wrong: Vec<String> = keys
+            .iter()
+            .filter_map(|key| match lines.iter().find_map(|l| l.strip_prefix(&format!("PROBE|{}|", key))) {
+                None => Some(format!("{}: no result", key)),
+                Some(o) if o != want => Some(format!("{}: {}", key, o)),
+                _ => None,
+            })
+            .collect();
+        assert!(wrong.is_empty(), "deny list mismatches: {:?}", wrong);
+        // every listed syscall was actually probed
+        assert_eq!(result(&lines, "deny|checked"), &table.len().to_string());
     }
 
     /// The harness's own argument handling, driven through cheap or listing
@@ -1127,7 +1533,7 @@ mod run {
     fn seccomp_alone() {
         let lines = layer_mode("seccomp-only", "seccomp");
         let mut expected = expect(seccomp_denied(), &errno_str(libc::EPERM));
-        expected.extend(expect(["clone3"], &errno_str(libc::ENOSYS)));
+        expected.extend(expect(["clone3"].into_iter().chain(NEW_SYSCALLS), &errno_str(libc::ENOSYS)));
         expected.extend(expect(always_ok(), "ok"));
         // Landlock is absent in this mode: these succeed, proving the layer
         // isolation works in the other direction too.
@@ -1144,7 +1550,7 @@ mod run {
         // otherwise be the only wall for.
         expected.extend(expect(SCOPED_PARENT, &errno_str(libc::EPERM)));
         // Everything else is seccomp's job: with it absent these succeed.
-        expected.extend(expect(["fcntl-setown-parent", "clone3"], "ok"));
+        expected.extend(expect(["fcntl-setown-parent", "clone3", "fchmodat2"], "ok"));
         expected.extend(expect(always_ok(), "ok"));
         check(&lines, "", &expected);
     }

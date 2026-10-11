@@ -16,7 +16,7 @@
 //!
 //! `PR_SET_NO_NEW_PRIVS` is set first and inherited descriptors >= 3 are
 //! closed. Every setup failure refuses to run (fail closed), including a
-//! Landlock ruleset that is not fully enforced (kernel below ABI 5).
+//! Landlock ruleset that is not fully enforced (kernel below ABI 6).
 
 use std::path::Path;
 
@@ -59,6 +59,13 @@ impl std::fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
+/// Whether [`apply`] can work here: x86_64 Linux with Landlock ABI 6
+/// (Linux 6.12). Purely informational — it installs nothing — so a caller
+/// can tell "this kernel cannot sandbox" from any other refusal.
+pub fn supported() -> bool {
+    imp::supported()
+}
+
 /// Restrict this process: Landlock (filesystem, signal and abstract-socket
 /// scopes) plus seccomp (syscalls).
 ///
@@ -99,6 +106,29 @@ pub fn apply_layer(layer: Layer, dump: Option<&Path>) -> Result<(), SandboxError
     imp::apply_layer(layer, dump)
 }
 
+/// Test-only (`test-layers`): the errno the enumeration's deny filter
+/// returns. EOWNERDEAD (130) is produced by no syscall in the deny list, so
+/// seeing it means the list matched.
+#[cfg(all(feature = "test-layers", target_os = "linux", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub const PROBE_DENY_ERRNO: libc::c_int = libc::EOWNERDEAD;
+
+/// Test-only (`test-layers`): the syscall numbers denied outright, so a
+/// probe can iterate the list instead of duplicating it.
+#[cfg(all(feature = "test-layers", target_os = "linux", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn denied_syscalls() -> Vec<libc::c_long> {
+    imp::denied_syscalls()
+}
+
+/// Test-only (`test-layers`): the seccomp layer alone with the deny list
+/// returning [`PROBE_DENY_ERRNO`], for that iteration.
+#[cfg(all(feature = "test-layers", target_os = "linux", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn apply_probe() -> Result<(), SandboxError> {
+    imp::apply_probe(PROBE_DENY_ERRNO)
+}
+
 /// Stand-in for every target the layers are not verified on: the same
 /// signatures as the real module, but nothing is ever restricted.
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -108,6 +138,10 @@ mod imp {
 
     pub fn apply(_dump: Option<&Path>) -> Result<(), SandboxError> {
         Err(SandboxError::Unsupported)
+    }
+
+    pub fn supported() -> bool {
+        false
     }
 
     #[cfg(feature = "test-layers")]
@@ -143,6 +177,26 @@ mod imp {
     /// here, the only arch this module builds for).
     type Rules = BTreeMap<libc::c_long, Vec<SeccompRule>>;
 
+    /// landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
+    /// returns the kernel's Landlock ABI, or -1 when Landlock is off.
+    fn landlock_abi() -> libc::c_long {
+        const VERSION: libc::c_ulong = 1;
+        unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0 as libc::size_t,
+                VERSION,
+            )
+        }
+    }
+
+    pub fn supported() -> bool {
+        // ABI 6 carries both the filesystem rights and the scopes the
+        // ruleset asks for; anything less is refused by enforce_status.
+        landlock_abi() >= 6
+    }
+
     /// Both layers, filesystem first and seccomp last: seccomp is the most
     /// irreversible, and its deny list refuses the seccomp syscall itself.
     pub fn apply(dump: Option<&Path>) -> Result<(), SandboxError> {
@@ -159,6 +213,21 @@ mod imp {
             super::Layer::Landlock => landlock_restrict(anchor.as_ref()),
             super::Layer::Seccomp => seccomp_restrict(),
         }
+    }
+
+    /// The deny list as numbers, for the test-only enumeration.
+    #[cfg(feature = "test-layers")]
+    pub fn denied_syscalls() -> Vec<libc::c_long> {
+        DENIED.to_vec()
+    }
+
+    /// The seccomp layer with a caller-chosen deny errno, for the same
+    /// enumeration: preconditions as [`apply`], no Landlock, so nothing else
+    /// can colour the result.
+    #[cfg(feature = "test-layers")]
+    pub fn apply_probe(deny_errno: libc::c_int) -> Result<(), SandboxError> {
+        prepare(None)?;
+        seccomp_restrict_with(deny_errno)
     }
 
     /// Everything that must hold before any restriction is installed:
@@ -313,8 +382,9 @@ mod imp {
     }
 
     /// Landlock must be fully enforced: a partially enforced ruleset means
-    /// the kernel dropped handled rights (Landlock ABI below 5), which is a
-    /// silent gap rather than a sandbox, so it is refused like a missing one.
+    /// the kernel dropped handled rights or scopes (Landlock ABI below 6),
+    /// which is a silent gap rather than a sandbox, so it is refused like a
+    /// missing one.
     fn enforce_status(status: landlock::RulesetStatus) -> Result<(), SandboxError> {
         match status {
             landlock::RulesetStatus::FullyEnforced => Ok(()),
@@ -325,6 +395,13 @@ mod imp {
     }
 
     fn seccomp_restrict() -> Result<(), SandboxError> {
+        seccomp_restrict_with(libc::EPERM)
+    }
+
+    /// The deny list's errno is a parameter so the test-only enumeration can
+    /// ask for one no kernel call produces here, making every denial
+    /// attributable to the list itself.
+    fn seccomp_restrict_with(deny_errno: libc::c_int) -> Result<(), SandboxError> {
         // Order matters: the deny list refuses SYS_seccomp, so it must be the
         // last filter installed. clone3 gets ENOSYS (not EPERM) because
         // glibc's pthread_create falls back to clone only on ENOSYS; the
@@ -332,7 +409,7 @@ mod imp {
         let nosys = compile(single(libc::SYS_clone3), libc::ENOSYS)?;
         apply_filter_all_threads(&nosys).map_err(comp)?;
         install_x32_guard()?;
-        let deny = compile(filter_rules(), libc::EPERM)?;
+        let deny = compile(filter_rules(), deny_errno)?;
         apply_filter_all_threads(&deny).map_err(comp)
     }
 
@@ -476,25 +553,37 @@ mod imp {
     const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
     /// Syscall numbers at or above this are the x32 ABI range on x86_64.
     const X32_BIT: u32 = 0x4000_0000;
+    /// fchmodat2, the first syscall newer than the deny list's newest entry:
+    /// everything from here on is refused with ENOSYS so that a future
+    /// kernel's new syscalls cannot bypass the documented denials (the
+    /// round-4 review set modes and xattrs through fchmodat2, setxattrat and
+    /// friends). Nothing in the run path calls anything this high (verified
+    /// with strace over the examples and the suite).
+    const NEW_SYSCALL_FLOOR: u32 = 452;
 
-    /// A stacked filter closing the x32 hole: seccompiler matches syscall
-    /// numbers exactly, so a call made through the x32 ABI (nr | X32_BIT)
-    /// would skip every deny rule, and an int 0x80 call would arrive with a
-    /// different arch. Both are kills: nothing in a v8vm run uses another
-    /// syscall ABI.
+    /// A stacked filter for what syscall-number matching cannot express:
+    /// seccompiler matches numbers exactly, so a call made through the x32
+    /// ABI (nr | X32_BIT) would skip every deny rule, an int 0x80 call would
+    /// arrive with a different arch, and a syscall newer than the deny list
+    /// would not be in it at all. Foreign ABIs are kills; new numbers get
+    /// ENOSYS, which is also what an unknown syscall returns.
     fn x32_guard() -> Vec<libc::sock_filter> {
         const LD_W: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
         const JEQ: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
         const JGE: u16 = (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16;
         const RET: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+        const NOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
         // seccomp_data: nr at offset 0, arch at offset 4. Jump offsets are
-        // relative to the following instruction; index 5 is the KILL return.
+        // relative to the following instruction; [6] returns ENOSYS and [7]
+        // is the KILL return.
         vec![
             libc::sock_filter { code: LD_W, jt: 0, jf: 0, k: 4 },
-            libc::sock_filter { code: JEQ, jt: 0, jf: 3, k: AUDIT_ARCH_X86_64 },
+            libc::sock_filter { code: JEQ, jt: 0, jf: 5, k: AUDIT_ARCH_X86_64 },
             libc::sock_filter { code: LD_W, jt: 0, jf: 0, k: 0 },
-            libc::sock_filter { code: JGE, jt: 1, jf: 0, k: X32_BIT },
+            libc::sock_filter { code: JGE, jt: 3, jf: 0, k: X32_BIT },
+            libc::sock_filter { code: JGE, jt: 1, jf: 0, k: NEW_SYSCALL_FLOOR },
             libc::sock_filter { code: RET, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
+            libc::sock_filter { code: RET, jt: 0, jf: 0, k: NOSYS },
             libc::sock_filter { code: RET, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS },
         ]
     }
@@ -692,20 +781,25 @@ mod imp {
         }
 
         #[test]
-        fn x32_guard_kills_foreign_arch_and_x32_numbers() {
+        fn x32_guard_kills_foreign_arch_x32_and_new_numbers() {
             let p = x32_guard();
             let kill = p.len() - 1;
-            assert_eq!(p.len(), 6);
+            let nosys = p.len() - 2;
+            assert_eq!(p.len(), 8);
             // loads arch (seccomp_data offset 4), kills when it differs
             assert_eq!((p[0].code, p[0].k), ((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4));
-            assert_eq!((p[1].jf, p[1].k), (3, AUDIT_ARCH_X86_64));
+            assert_eq!((p[1].jf, p[1].k), (5, AUDIT_ARCH_X86_64));
             assert_eq!(2 + p[1].jf as usize, kill);
-            // loads nr (offset 0), kills on the x32 range
+            // loads nr (offset 0): the x32 range kills, newer numbers ENOSYS
             assert_eq!((p[2].code, p[2].k), ((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0));
-            assert_eq!((p[3].jt, p[3].k), (1, X32_BIT));
+            assert_eq!((p[3].jt, p[3].k), (3, X32_BIT));
             assert_eq!(4 + p[3].jt as usize, kill);
-            assert_eq!(p[4].k, libc::SECCOMP_RET_ALLOW);
-            assert_eq!(p[5].k, libc::SECCOMP_RET_KILL_PROCESS);
+            assert_eq!((p[4].jt, p[4].k), (1, NEW_SYSCALL_FLOOR));
+            assert_eq!(5 + p[4].jt as usize, nosys);
+            // below the floor is allowed, then the two returns
+            assert_eq!(p[5].k, libc::SECCOMP_RET_ALLOW);
+            assert_eq!(p[6].k, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
+            assert_eq!(p[7].k, libc::SECCOMP_RET_KILL_PROCESS);
         }
     }
 }

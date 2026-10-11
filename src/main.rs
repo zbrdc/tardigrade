@@ -65,6 +65,17 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--sandbox-check") {
+        // A gate scripts and CI can call without running a guest: exit 0 when
+        // the platform and kernel can sandbox, 2 with the reason otherwise.
+        if v8vm::sandbox::supported() {
+            println!("supported");
+        } else {
+            eprintln!("v8vm: --sandbox is not available here (needs Linux x86_64 with Landlock ABI 6)");
+            std::process::exit(2);
+        }
+        return;
+    }
     let c = match parse(&argv) {
         Ok(c) => c,
         Err(msg) => {

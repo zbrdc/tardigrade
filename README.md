@@ -140,9 +140,11 @@ filters are installed with TSYNC.
   the snapshot leaves an existing file untouched, or an empty new file) and
   is the only write the run can perform: the end-of-run snapshot truncates
   and rewrites that one file, and even reading it back is denied. `--dump`
-  must name a regular file: a pipe or terminal (`--dump=/dev/stdout` with
-  stdout piped) is refused up front with "--dump must be a regular file",
-  because Landlock can only anchor its rule on a file or directory.
+  must name a regular file: one that cannot be opened for writing at all is
+  refused with "cannot prepare dump", and one that opens but is not a
+  regular file (a pipe, `--dump=/dev/stdout` with stdout piped) with
+  "--dump must be a regular file", because Landlock can only anchor its rule
+  on a file or directory inode.
   /dev/urandom is readable because V8 opens it while seeding RNGs. Note what
   Landlock does not mediate: file metadata, file existence, and symlink
   targets stay observable through stat/access/readlink/chdir/statfs (xattr
@@ -153,12 +155,15 @@ filters are installed with TSYNC.
   being signalled at all.
 - seccomp-BPF, a deny list where denied calls fail with EPERM: all socket
   calls, exec (execve, execveat, fork, vfork), ptrace and cross-process
-  memory access, privilege and identity changes, mount and namespace calls,
-  kernel modules, bpf, perf, io_uring, userfaultfd, keyctl, System V and
-  POSIX message queues (open, unlink, send, receive, notify, attributes),
-  personality, modify_ldt, xattr and other file
-  metadata changes, file-event notification (inotify, fanotify), and clock
-  setting.
+  memory access, process comparison and pidfds (kcmp, pidfd_open,
+  pidfd_getfd, pidfd_send_signal), privilege and identity changes, mount and
+  namespace calls, kernel modules, bpf, perf, io_uring, userfaultfd, keyctl,
+  every System V IPC family (shared memory, semaphores, message queues) and
+  every POSIX message-queue call (open, unlink, send, receive, notify,
+  attributes), memfd, personality, modify_ldt, xattr and other file
+  metadata changes, file-event notification (inotify, fanotify), fd-to-fd
+  plumbing (sendfile, splice, vmsplice, tee, copy_file_range), file handles
+  (name_to_handle_at, open_by_handle_at), and clock setting.
 - Cross-process interference is filtered by argument, on top of the scopes:
   kill, tgkill, rt_sigqueueinfo and rt_tgsigqueueinfo are denied unless the
   target is the run's own pid (tkill, which names no process, is denied
@@ -179,7 +184,11 @@ filters are installed with TSYNC.
   work; fork and user-namespace escapes do not.
 - A small hand-written stacked filter kills the process on any syscall made
   through a different ABI: a non-x86_64 arch value (int 0x80) or a syscall
-  number in the x32 range, which would otherwise bypass every deny rule.
+  number in the x32 range, which would otherwise bypass every deny rule. The
+  same filter refuses every syscall newer than the deny list's newest entry
+  (any number from fchmodat2, 452, upwards) with ENOSYS, so syscalls a
+  future kernel adds cannot bypass the documented denials the way fchmodat2
+  and the *xattrat family once did; they fail exactly like unknown numbers.
 
 Everything the runtime needs stays allowed: threads, mmap/mprotect for the
 JIT, futex, clocks, getrandom, and reads/writes on already-open descriptors.
@@ -216,6 +225,9 @@ cannot exercise the real layers, so they skip instead of failing:
 - `make check` skips its `--sandbox` line with a printed reason.
 - `V8VM_REQUIRE_SANDBOX=1` turns every one of those skips into a failure.
   Set it where the kernel is known to have support; CI leaves it unset.
+- `v8vm --sandbox-check` exits 0 when this platform and kernel can sandbox
+  (x86_64 Linux with Landlock ABI 6) and 2 with a message otherwise; scripts
+  gate their skips on it instead of guessing from a refusal message.
 
 The sandbox test binary takes libtest-style arguments: substring filters
 (`--exact` for whole names), `--skip <name>` and `--list`; other flags are
