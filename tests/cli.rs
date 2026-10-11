@@ -525,6 +525,107 @@ fn a_failed_dump_exits_74_when_the_guest_succeeded() {
     assert_eq!(r3.code, 0);
 }
 
+/// A fresh, empty directory under the scratch dir for one test's dump files.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fresh_dir(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create test dir");
+    dir
+}
+
+/// Names of the entries in `dir`, sorted.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("list dir")
+        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Runs v8vm with RLIMIT_FSIZE set to `limit` bytes, so any write that grows
+/// a file past it fails partway with EFBIG. SIGXFSZ is ignored (the default
+/// action kills the process); the setting survives the exec.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn v8vm_with_file_size_cap(args: &[&str], limit: u64) -> Run {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_v8vm"));
+    cmd.args(args).stdin(Stdio::null());
+    // SAFETY: the closure only makes async-signal-safe libc calls.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let cap = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &cap) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().expect("run v8vm");
+    Run {
+        code: out.status.code().expect("exit code, not a signal"),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+/// The agent loop reads and writes one file (--preload = --dump). A dump
+/// that fails partway must leave the previous one whole. RLIMIT_FSIZE makes
+/// the failure a real partial write (the first KiB lands, then EFBIG): an
+/// in-place std::fs::write has already truncated the old file by then, while
+/// the temp-file path loses only the temp file. Unlike a read-only
+/// directory, this also fails for root and is the mid-write case itself.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_failed_dump_write_leaves_the_old_dump_intact() {
+    let dir = fresh_dir("atomic-dump-fail");
+    let dump = dir.join("ws.json");
+    std::fs::write(&dump, "OLD-DUMP").expect("seed dump");
+    let guest = script("atomic-dump-fail", "vm.fs.write('/big', 'x'.repeat(65536));");
+    let dump_arg = format!("--dump={}", dump.display());
+    let r = v8vm_with_file_size_cap(&[&dump_arg, guest.to_str().unwrap()], 1024);
+    assert_eq!(r.code, 74, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("cannot write dump"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("File too large"), "OS error missing: {}", r.stderr);
+    assert_eq!(std::fs::read_to_string(&dump).unwrap(), "OLD-DUMP");
+    assert_eq!(entries(&dir), ["ws.json"], "temp file left behind");
+}
+
+/// The replacement keeps the old dump's mode and writes through a symlink
+/// to the file it names, as the in-place write always did.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_dump_replacement_keeps_the_mode_and_follows_symlinks() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = fresh_dir("atomic-dump-ok");
+    let real = dir.join("real.json");
+    let link = dir.join("link.json");
+    std::fs::write(&real, "OLD").expect("seed dump");
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+    symlink("real.json", &link).expect("symlink");
+    let guest = script("atomic-dump-ok", "vm.fs.write('/f', 'x');");
+    let r = v8vm(&[&format!("--dump={}", link.display()), guest.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink(), "link was replaced");
+    assert!(std::fs::read_to_string(&real).unwrap().contains("\"/f\""));
+    let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o640);
+    assert_eq!(entries(&dir), ["link.json", "real.json"], "temp file left behind");
+}
+
+/// A device is not replaceable by rename (and must not get a temp file in
+/// /dev): --dump=/dev/null keeps working as the in-place write did.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn a_dump_to_a_device_is_written_in_place() {
+    let guest = script("dump-devnull", "vm.fs.write('/f', 'x');");
+    let r = v8vm(&["--dump=/dev/null", guest.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+}
+
 #[test]
 fn full_quota_control_characters_survive_a_snapshot_round_trip() {
     // ctrl.js shape, scaled down: JSON escapes control characters to six
@@ -559,40 +660,85 @@ fn full_quota_control_characters_survive_a_snapshot_round_trip() {
     assert_eq!(lines.next().unwrap(), "restored true 3");
 }
 
+/// One way a run can end, for the every-ending dump test.
+struct Ending {
+    what: &'static str,
+    src: &'static str,
+    flags: &'static [&'static str],
+    stdin: &'static [u8],
+    want: i32,
+}
+
+const fn ending(what: &'static str, src: &'static str, want: i32) -> Ending {
+    Ending { what, src, flags: &[], stdin: b"", want }
+}
+
+/// True when `name` under the scratch dir exists and holds file "/f".
+fn dump_has_f(name: &str) -> bool {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    path.exists() && std::fs::read_to_string(&path).unwrap_or_default().contains("\"/f\"")
+}
+
 #[test]
 fn dump_is_written_for_every_ending() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let dump_has_f = |name: &str| {
-        let path = dir.join(name);
-        let json = std::fs::read_to_string(&path).unwrap_or_default();
-        path.exists() && json.contains("\"/f\"")
-    };
     let endings = [
-        ("vm.exit(0) at top level", "vm.fs.write('/f','x'); vm.exit(0);", 0),
-        ("vm.exit(0) in a timer", "vm.fs.write('/f','x'); setTimeout(() => vm.exit(0), 5);", 0),
-        ("vm.exit(0) in a microtask", "vm.fs.write('/f','x'); Promise.resolve().then(() => vm.exit(0));", 0),
-        ("vm.exit(3)", "vm.fs.write('/f','x'); vm.exit(3);", 3),
-        (
-            "timeout",
-            "vm.fs.write('/f','x'); for (;;) {}",
-            124,
-        ),
+        ending("vm.exit(0) at top level", "vm.fs.write('/f','x'); vm.exit(0);", 0),
+        ending("vm.exit(0) in a timer", "vm.fs.write('/f','x'); setTimeout(() => vm.exit(0), 5);", 0),
+        ending("vm.exit(0) in a microtask", "vm.fs.write('/f','x'); Promise.resolve().then(() => vm.exit(0));", 0),
+        ending("vm.exit(3)", "vm.fs.write('/f','x'); vm.exit(3);", 3),
+        ending("uncaught exception", "vm.fs.write('/f','x'); throw new Error('boom');", 1),
+        ending("unhandled rejection", "vm.fs.write('/f','x'); Promise.reject(new Error('no'));", 1),
+        Ending {
+            flags: &["--timeout=200"],
+            ..ending("timeout", "vm.fs.write('/f','x'); for (;;) {}", 124)
+        },
+        Ending {
+            stdin: b"go",
+            ..ending(
+                "vm.exit driven by stdin",
+                "vm.fs.write('/f','x'); vm.stdin.read().then((c) => vm.exit(c === 'go' ? 4 : 5));",
+                4,
+            )
+        },
+        Ending {
+            flags: &["--serve"],
+            stdin: b"1 + 1\n",
+            ..ending("--serve to stdin EOF", "vm.fs.write('/f','x');", 0)
+        },
     ];
-    for (i, (what, src, want)) in endings.iter().enumerate() {
-        let script_path = script(&format!("ending-{}", i), src);
-        let dump = dir.join(format!("ending-{}.json", i));
+    for (i, e) in endings.iter().enumerate() {
+        let script_path = script(&format!("ending-{}", i), e.src);
+        let name = format!("ending-{}.json", i);
+        let dump = dir.join(&name);
         let _ = std::fs::remove_file(&dump); // only this run's dump counts
-        let r = v8vm(
-            &[
-                "--timeout=200",
-                &format!("--dump={}", dump.display()),
-                script_path.to_str().unwrap(),
-            ],
-            b"",
-        );
-        assert_eq!(r.code, *want, "{}: exit code (stderr: {})", what, r.stderr);
-        assert!(dump_has_f(&format!("ending-{}.json", i)), "{}: dump missing /f", what);
+        let dump_arg = format!("--dump={}", dump.display());
+        let mut args = e.flags.to_vec();
+        args.push(&dump_arg);
+        args.push(script_path.to_str().unwrap());
+        let r = v8vm_bounded(&args, e.stdin, std::time::Duration::from_secs(60));
+        assert_eq!(r.code, e.want, "{}: exit code (stderr: {})", e.what, r.stderr);
+        assert!(dump_has_f(&name), "{}: dump missing /f", e.what);
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    sandboxed_ending_writes_its_dump();
+}
+
+/// --sandbox rewrites the dump in place (Landlock forbids a temp file), so
+/// a clean vm.exit(0) must still produce it. Runs only where the kernel can
+/// sandbox; elsewhere `sandboxed` checks the refusal and the case is skipped.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn sandboxed_ending_writes_its_dump() {
+    let script_path = script("ending-sandbox", "vm.fs.write('/f','x'); vm.exit(0);");
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ending-sandbox.json");
+    let _ = std::fs::remove_file(&dump);
+    let dump_arg = format!("--dump={}", dump.display());
+    let args = [dump_arg.as_str(), script_path.to_str().unwrap()];
+    let Some(r) = sandboxed("dump_is_written_for_every_ending", &args, b"") else {
+        return;
+    };
+    assert_eq!(r.code, 0, "sandboxed vm.exit(0) (stderr: {})", r.stderr);
+    assert!(dump_has_f("ending-sandbox.json"), "sandboxed vm.exit(0): dump missing /f");
 }
 
 #[test]

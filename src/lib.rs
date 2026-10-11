@@ -16,6 +16,7 @@
 mod api;
 mod console;
 mod diag;
+mod dump;
 mod event_loop;
 mod exit;
 mod fs;
@@ -53,7 +54,9 @@ pub struct Config {
     pub args: Vec<String>,
     /// Seed vm.fs from a snapshot() JSON file before the guest runs.
     pub preload: Option<std::path::PathBuf>,
-    /// Write snapshot() JSON to this file when the run ends.
+    /// Write snapshot() JSON to this file when the run ends. The file is
+    /// replaced atomically (temp file in the same directory, fsync, rename)
+    /// unless `sandboxed` is set.
     pub dump: Option<std::path::PathBuf>,
     /// True when the entry source was read from stdin, so guest stdin is
     /// already at EOF.
@@ -65,6 +68,10 @@ pub struct Config {
     /// RAM filesystem quota in bytes: per entry, content plus path bytes
     /// plus 64 of bookkeeping. 0 disables it. Default 64 MiB.
     pub fs_quota_bytes: u64,
+    /// True when the host applied [`sandbox::apply`]. Landlock then lets the
+    /// run write only the dump file itself, so the dump is rewritten in place
+    /// (a failure mid-write can truncate it) instead of through a temp file.
+    pub sandboxed: bool,
 }
 
 impl Default for Config {
@@ -78,6 +85,7 @@ impl Default for Config {
             stdin_consumed: false,
             preload_data: None,
             fs_quota_bytes: DEFAULT_FS_QUOTA_BYTES,
+            sandboxed: false,
         }
     }
 }
@@ -234,7 +242,7 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
 /// could depend on how the run ended (normal exit, vm.exit, uncaught
 /// exception, timeout). False means the dump could not be produced
 /// (serialize failure or the file could not be written).
-fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
+fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path, in_place: bool) -> bool {
     let fs = &world_mut(scope).fs;
     let json = match snapshot::encode(&fs.files, &fs.dirs) {
         Ok(json) => json,
@@ -243,10 +251,10 @@ fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
             return false;
         }
     };
-    match std::fs::write(dump, json) {
+    match dump::write(dump, &json, in_place) {
         Ok(()) => true,
-        Err(_) => {
-            eprintln!("v8vm: cannot write dump {:?}", dump);
+        Err(e) => {
+            eprintln!("v8vm: cannot write dump {}: {}", dump.display(), e);
             false
         }
     }
@@ -282,7 +290,7 @@ fn execute_inner(
     if let Some(dump) = &spec.cfg.dump {
         // EX_IOERR: the run was asked to produce a dump and could not.
         // A guest that already failed keeps its own exit code.
-        if !write_dump(scope, dump) && code == 0 {
+        if !write_dump(scope, dump, spec.cfg.sandboxed) && code == 0 {
             code = 74;
         }
     }

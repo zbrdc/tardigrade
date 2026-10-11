@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::fs::{normalize, FsResult, MAX_ENTRIES};
+use crate::fs::{normalize, shown, FsResult, MAX_ENTRIES};
 
 /// Parsed snapshot payload: explicit directories plus file contents.
 #[derive(Debug)]
@@ -74,7 +74,9 @@ pub(crate) fn parse(json: &str) -> FsResult<Snapshot> {
     let obj = v.as_object().ok_or("invalid snapshot: expected an object")?;
     match obj.get("version") {
         Some(v) if v.as_i64() == Some(2) => parse_v2(obj),
-        Some(v) => Err(format!("unsupported snapshot version {}", v)),
+        // The version is guest-controlled JSON of any size and type; cap it
+        // like every other echoed value.
+        Some(v) => Err(format!("unsupported snapshot version {}", shown(&v.to_string()))),
         None => parse_legacy(obj),
     }
 }
@@ -284,6 +286,18 @@ mod tests {
         let find = |p: &str| back.files.iter().find(|(k, _)| k == p).unwrap().1.clone();
         assert_eq!(find("/bin"), vec![0xff, 0x00, 0x81]);
         assert_eq!(find("/zeros"), vec![0u8; 300]);
+    }
+
+    #[test]
+    fn unsupported_version_error_truncates_a_huge_value() {
+        let huge = "x".repeat(100_000);
+        let err = parse(&format!(r#"{{"version":"{}"}}"#, huge)).unwrap_err();
+        assert!(err.starts_with("unsupported snapshot version \"xxx"), "{}", err);
+        assert!(err.ends_with("..."), "{}", err);
+        assert!(err.len() < 300, "message is {} bytes", err.len());
+        // An array value is echoed truncated too, not whole.
+        let arr = format!(r#"{{"version":[{}]}}"#, "1,".repeat(50_000) + "1");
+        assert!(parse(&arr).unwrap_err().len() < 300);
     }
 
     #[test]

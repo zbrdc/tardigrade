@@ -47,16 +47,32 @@ and is not set by this repo.
 - "--memory=<mb>" V8 heap cap in MB (default 256)
 - "--fs-quota=<mb>" RAM filesystem quota in MB (default 64, 0 disables)
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
-- "--dump=<file>" write the snapshot to a file after the run ends, whatever
-  the ending: normal exit, vm.exit, uncaught exception, or timeout
+- "--dump=<file>" write the snapshot to a file when the run ends: normal
+  exit, vm.exit (also from a timer, microtask or stdin read), uncaught
+  exception, unhandled rejection, timeout, or --serve reaching stdin EOF.
+  No dump is written after a V8 fatal out-of-memory abort (the process is
+  gone), after a prelude failure (exit 1) or a preload failure (exit 2), or
+  after a panic.
+  Without --sandbox the file is replaced atomically: the snapshot goes to a
+  hidden sibling temp file in the same directory, is fsynced, then renamed
+  over the target, which keeps its mode, and a symlink target is followed.
+  A failed write therefore leaves the previous dump intact, which matters
+  when --dump equals --preload (the agent loop). The directory must allow
+  creating a file. Under --sandbox Landlock allows writing only the dump
+  file itself, so no temp file can be made: the file is truncated and
+  rewritten in place, and a failure mid-write can leave it truncated. A
+  device such as /dev/null is always written in place
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
 - "--sandbox" OS self-containment for hostile code (Linux only), see below
 - "--sandbox-check" (only as the sole argument) exit 0 if --sandbox can work
   here, 2 if not; after the entry it is an ordinary guest argument
 - uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
-- "--dump" failure (snapshot too large, or the file cannot be written)
-  exits 74 when the guest itself exited 0; a failed guest keeps its own code
+- "--dump" failure (the file or its directory cannot be written; the message
+  names the path and the OS error) exits 74 when the guest itself exited 0; a
+  failed guest keeps its own code. A dump can exceed V8's string limit (a
+  multi-hundred-megabyte filesystem, possible with --fs-quota=0): it is
+  written, but --preload then refuses it with exit 2 ("too large to load")
 
 ## Library API
 
@@ -79,9 +95,14 @@ run()/serve() and before any thread exists; it refuses otherwise. Read a
 --preload file before applying and hand its contents to the library as
 `Config.preload_data`: after apply, the only file the run can write is the
 dump file. `preload_data` seeds the filesystem by itself (it needs no
-`preload` path) and takes precedence over reading `preload`. Embedders that
-build a `Config` with a struct literal must set the field, or use
-`..Default::default()`.
+`preload` path) and takes precedence over reading `preload`. It goes through
+the same size check and `vm.restore` as a file, so legacy and version 2
+snapshots behave identically. Also set `Config.sandboxed`: a dump is
+normally replaced atomically through a temp file, which Landlock forbids, so
+a sandboxed host must have it rewritten in place or `dump` fails with
+"Permission denied" (exit 74). Embedders that build a `Config` with a struct
+literal must set the newer fields (`preload_data`, `fs_quota_bytes`,
+`sandboxed`), or use `..Default::default()`.
 
 The restrictions apply to the whole embedding process, not only to v8vm's
 threads. The filters cover every thread (apply refuses unless the caller is
@@ -164,8 +185,8 @@ entry and never replaces an existing file with a directory or vice
 versa, and two spellings of one path in a single snapshot ("/a" and
 "//a", or a legacy "b" and "/b") fail with "duplicate path in snapshot".
 A snapshot naming any other `version` fails with "unsupported snapshot
-version <v>". When a quota is set, restore refuses a payload larger than
-six quotas plus 1 MiB before parsing it (JSON escapes control characters
+version <v>" (the value is echoed capped at 256 bytes). When a quota is
+set, restore refuses a payload larger than six quotas plus 1 MiB before parsing it (JSON escapes control characters
 to six bytes each, so a full-quota filesystem of them still restores
 from its own snapshot). Version 2 dumps are not loadable by older v8vm
 versions, which would see files named "version", "files" and "dirs" -
@@ -211,7 +232,9 @@ filters are installed with TSYNC.
   created without truncation when the sandbox starts (a run that ends before
   the snapshot leaves an existing file untouched, or an empty new file) and
   is the only write the run can perform: the end-of-run snapshot truncates
-  and rewrites that one file, and even reading it back is denied. `--dump`
+  and rewrites that one file in place (the atomic temp-file replace of the
+  unsandboxed dump cannot create a file here), and even reading it back is
+  denied. `--dump`
   must name a regular file: one that cannot be opened for writing at all is
   refused with "cannot prepare dump", and one that opens but is not a
   regular file (a pipe, `--dump=/dev/stdout` with stdout piped) with

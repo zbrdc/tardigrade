@@ -47,8 +47,6 @@ pub(crate) fn usage(files: &BTreeMap<String, Vec<u8>>, dirs: &BTreeSet<String>) 
             .sum::<u64>()
 }
 
-/// Collapses `.`/`..`/duplicate slashes and rejects anything that is not an
-/// absolute path inside the sandbox root.
 /// Paths echoed in guest-facing errors are capped so a huge argument
 /// cannot balloon the message past V8's string limit.
 pub(crate) fn shown(path: &str) -> String {
@@ -63,6 +61,8 @@ pub(crate) fn shown(path: &str) -> String {
     format!("{}...", &path[..cut])
 }
 
+/// Collapses `.`/`..`/duplicate slashes and rejects anything that is not an
+/// absolute path inside the sandbox root.
 pub(crate) fn normalize(path: &str) -> FsResult<String> {
     if path.contains('\0') {
         return Err(format!("path contains NUL: {}", shown(path)));
