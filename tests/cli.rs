@@ -2536,19 +2536,25 @@ fn sandbox_flag_is_refused_on_unsupported_platforms() {
 // --- TypeScript agent loop (examples/agent-loop-ts.sh) ---
 
 /// V8VM_REQUIRE_TS=1 turns a missing TypeScript toolchain from a skip into
-/// a failure, mirroring V8VM_REQUIRE_SANDBOX for the kernel checks.
+/// a failure, mirroring V8VM_REQUIRE_SANDBOX for the kernel checks. The
+/// tests that use these helpers run only on Linux x86_64 (where the
+/// bounded runner is), so they are gated the same way and stay dead-code
+/// clean on other targets.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn ts_required() -> bool {
     std::env::var("V8VM_REQUIRE_TS").is_ok_and(|v| v == "1")
 }
 
 /// A skip notice written straight to stderr, so it survives libtest's
 /// capture and a skipped test is never mistaken for a pass.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn ts_skipped(reason: &str, test: &str) {
     let _ = writeln!(std::io::stderr(), "SKIPPED ({}): {}", reason, test);
 }
 
 /// True when `tool --version` runs successfully: an executable the loop
 /// can use, not just a name on PATH.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn runs_on_host(tool: &str) -> bool {
     Command::new(tool)
         .arg("--version")
@@ -2559,8 +2565,28 @@ fn runs_on_host(tool: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// A type checker is usable when a bounded probe really runs it - the
+/// same probe as examples/ts-smoke.sh: npx that cannot fetch tsc-rs
+/// (offline, no cache) with no tsc is a skip, not a confusing failure.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn checker_runnable(primary: &str, fallback: &str) -> bool {
+    let probe = |cmd: &str| {
+        Command::new("timeout")
+            .arg("60")
+            .args(cmd.split_whitespace())
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    probe(primary) || probe(fallback)
+}
+
 /// bun for the loop: $BUN, then PATH, then the default install location -
 /// the same order examples/ts-smoke.sh probes.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn find_bun() -> Option<String> {
     if let Ok(bun) = std::env::var("BUN") {
         if runs_on_host(&bun) {
@@ -2576,8 +2602,10 @@ fn find_bun() -> Option<String> {
 }
 
 /// The smoke check must skip loudly when the toolchain is missing, never
-/// pass silently. An emptied PATH and HOME make the probes fail even on a
-/// host that has the tools, so the skip path itself is what is tested.
+/// pass silently: exit 77 (the automake skip code the Makefile recipe
+/// turns into TS-SKIPPED), the reason on stderr, and no TS-OK anywhere.
+/// An emptied PATH and HOME make the probes fail even on a host that has
+/// the tools, so the skip path itself is what is tested.
 #[test]
 fn ts_smoke_skips_loudly_without_a_toolchain() {
     let home = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-smoke-empty-home");
@@ -2593,10 +2621,12 @@ fn ts_smoke_skips_loudly_without_a_toolchain() {
         .output()
         .expect("run ts-smoke");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(77), "stderr: {stderr}");
+    assert!(!stdout.contains("TS-OK"), "a skip must never print TS-OK");
     assert!(
-        stdout.starts_with("SKIPPED (") && stdout.contains("TypeScript agent-loop smoke check"),
-        "the skip must be loud, stdout: {stdout}"
+        stderr.contains("SKIPPED (") && stderr.contains("TypeScript agent-loop smoke check"),
+        "the skip must be loud, stderr: {stderr}"
     );
 }
 
@@ -2615,12 +2645,67 @@ fn ts_smoke_require_flag_fails_when_the_toolchain_is_missing() {
         .env("V8VM_REQUIRE_TS", "1")
         .output()
         .expect("run ts-smoke");
+    let stdout = String::from_utf8(out.stdout).unwrap();
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stdout.contains("TS-OK"), "a failed skip must never print TS-OK");
     assert!(
         stderr.contains("V8VM_REQUIRE_TS=1 but"),
         "the failure must name the flag, stderr: {stderr}"
     );
+}
+
+/// bun present but no usable checker is still the loud missing-toolchain
+/// skip, not a broken run: PATH holds a stub bun that answers --version
+/// and a stub npx that is present but fails (offline, nothing cached),
+/// and tsc is unreachable.
+#[test]
+fn ts_smoke_skips_when_bun_cannot_be_paired_with_a_checker() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-stub-bun");
+    let _ = std::fs::remove_dir_all(&root);
+    let bin = root.join("bin");
+    let home = root.join("home");
+    std::fs::create_dir_all(&bin).expect("mkdir stub bin");
+    std::fs::create_dir_all(&home).expect("mkdir stub home");
+    let stub = bin.join("bun");
+    std::fs::write(&stub, "#!/bin/sh\necho 1.3.5\n").expect("write stub bun");
+    make_executable(&stub);
+    let dead_npx = bin.join("npx");
+    std::fs::write(&dead_npx, "#!/bin/sh\nexit 1\n").expect("write dead stub npx");
+    make_executable(&dead_npx);
+
+    let run = |require: bool| {
+        Command::new("/bin/bash")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-smoke.sh"))
+            .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
+            .env("BUN", &stub)
+            .env("HOME", &home)
+            .env("PATH", &bin)
+            .env("V8VM_REQUIRE_TS", if require { "1" } else { "" })
+            .output()
+            .expect("run ts-smoke")
+    };
+    let out = run(false);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(77), "stderr: {stderr}");
+    assert!(!stdout.contains("TS-OK"));
+    assert!(
+        stderr.contains("SKIPPED (") && stderr.contains("no usable type checker"),
+        "the skip must name the unusable checker, stderr: {stderr}"
+    );
+    let out = run(true);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("V8VM_REQUIRE_TS=1 but"), "stderr: {stderr}");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(path).expect("stat stub").permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(path, perm).expect("chmod stub");
 }
 
 /// Runs a command to completion under a hard wall-clock bound; 180 s
@@ -2697,9 +2782,9 @@ fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
         ts_skipped("bun is not installed", test);
         return;
     };
-    if !runs_on_host("npx") && !runs_on_host("tsc") {
-        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but no type checker");
-        ts_skipped("no type checker: npx and tsc are both missing", test);
+    if !checker_runnable("npx -y tsc-rs@0.3.0", "tsc") {
+        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but no usable type checker");
+        ts_skipped("no usable type checker (npx cannot fetch tsc-rs, and tsc is absent)", test);
         return;
     }
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts");
@@ -3123,9 +3208,12 @@ fn agent_loop_ts_with_the_tsc_fallback_passes() {
         ts_skipped("bun is not installed", test);
         return;
     };
-    if !runs_on_host("npx") {
-        assert!(!ts_required(), "V8VM_REQUIRE_TS=1 but npx is missing");
-        ts_skipped("npx is missing (the fallback fetches typescript)", test);
+    if !checker_runnable("/bin/false", "npx -y -p typescript@5.9.3 tsc") {
+        assert!(
+            !ts_required(),
+            "V8VM_REQUIRE_TS=1 but the fallback tsc cannot be fetched"
+        );
+        ts_skipped("the pinned typescript tsc cannot be fetched", test);
         return;
     }
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("agent-loop-ts-fallback");
