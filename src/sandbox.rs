@@ -53,7 +53,8 @@ impl std::fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-/// Restrict this process: Landlock (filesystem) plus seccomp (syscalls).
+/// Restrict this process: Landlock (filesystem, signal and abstract-socket
+/// scopes) plus seccomp (syscalls).
 ///
 /// `dump`, if set, is the only filesystem write the run may perform later:
 /// the file is created now without truncation and the end-of-run snapshot
@@ -61,16 +62,23 @@ impl std::error::Error for SandboxError {}
 /// Must be called before the first [`crate::run`]/[`crate::serve`] and
 /// before any thread exists; both are checked and refuse instead of
 /// restricting only one thread.
+///
+/// This also closes every file descriptor >= 3 in the whole process
+/// (`close_range`): descriptors inherited from the caller's environment
+/// (a socket, a log file) would be a channel out of the sandbox.
 pub fn apply(dump: Option<&Path>) -> Result<(), SandboxError> {
     imp::apply(dump, None)
 }
 
 /// Which kernel layer [`apply_layer`] installs.
 ///
-/// Hidden because the product always applies both layers: the tests need
-/// each layer alone to attribute a denial to the right one (execve, for
-/// example, is denied by seccomp with EPERM but also by Landlock's Execute
-/// right with EACCES, so only a seccomp-only run proves the seccomp rule).
+/// Only built with the `test-layers` feature (a non-default feature enabled
+/// for this crate's own tests through a self dev-dependency): the product
+/// always applies both layers, but the tests need each layer alone to
+/// attribute a denial to the right one (execve, for example, is denied by
+/// seccomp with EPERM but also by Landlock's Execute right with EACCES, so
+/// only a seccomp-only run proves the seccomp rule).
+#[cfg(feature = "test-layers")]
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
@@ -79,24 +87,29 @@ pub enum Layer {
 }
 
 /// Apply a single sandbox layer. Test-only; see [`Layer`].
+#[cfg(feature = "test-layers")]
 #[doc(hidden)]
 pub fn apply_layer(layer: Layer, dump: Option<&Path>) -> Result<(), SandboxError> {
-    imp::apply(dump, Some(layer))
+    let selector = match layer {
+        Layer::Landlock => imp::Selector::Landlock,
+        Layer::Seccomp => imp::Selector::Seccomp,
+    };
+    imp::apply(dump, Some(selector))
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod imp {
-    use super::{Layer, SandboxError};
+    use super::SandboxError;
     use std::path::Path;
 
-    pub fn apply(_dump: Option<&Path>, _layer: Option<Layer>) -> Result<(), SandboxError> {
+    pub fn apply(_dump: Option<&Path>) -> Result<(), SandboxError> {
         Err(SandboxError::Unsupported)
     }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod imp {
-    use super::{Layer, SandboxError};
+    use super::SandboxError;
     use seccompiler::{
         apply_filter_all_threads, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
         SeccompCondition, SeccompFilter, SeccompRule,
@@ -109,7 +122,15 @@ mod imp {
     /// here, the only arch this module builds for).
     type Rules = BTreeMap<libc::c_long, Vec<SeccompRule>>;
 
-    pub fn apply(dump: Option<&Path>, layer: Option<Layer>) -> Result<(), SandboxError> {
+    /// Internal single-layer selector; the public test-only one maps onto it
+    /// so this signature does not depend on the `test-layers` feature.
+    #[derive(Clone, Copy, PartialEq)]
+    pub(super) enum Selector {
+        Landlock,
+        Seccomp,
+    }
+
+    pub fn apply(dump: Option<&Path>, layer: Option<Selector>) -> Result<(), SandboxError> {
         // Refuse late application before doing any work, then restrict from
         // the broadest layer (filesystem) to the most irreversible (seccomp).
         if crate::engine_started() {
@@ -124,10 +145,10 @@ mod imp {
         close_inherited_fds()?;
         let dump_file = prepare_dump(dump)?;
         set_no_new_privs()?;
-        if layer != Some(Layer::Seccomp) {
+        if layer != Some(Selector::Seccomp) {
             landlock_restrict(dump_file.as_ref())?;
         }
-        if layer != Some(Layer::Landlock) {
+        if layer != Some(Selector::Landlock) {
             seccomp_restrict()?;
         }
         Ok(())
@@ -199,31 +220,59 @@ mod imp {
         SandboxError::Kernel(msg.to_string())
     }
 
+    /// Scopes requested from the kernel: no signals to processes outside the
+    /// sandbox and no connecting to abstract unix sockets outside it. Both
+    /// arrive with Landlock ABI 6, so requesting them also raises the minimum
+    /// kernel this sandbox accepts.
+    fn scopes() -> landlock::BitFlags<landlock::Scope> {
+        use landlock::Access;
+        landlock::Scope::from_all(landlock::ABI::V6)
+    }
+
+    /// fcntl requests libc does not define on x86_64 (fcntl(2) values):
+    /// F_SETSIG chooses the signal delivered for async fd events, and
+    /// F_SETOWN_EX aims them at a thread or process.
+    const F_SETSIG: libc::c_int = 10;
+    const F_SETOWN_EX: libc::c_int = 15;
+
     fn landlock_restrict(dump: Option<&landlock::PathFd>) -> Result<(), SandboxError> {
         use landlock::{
             make_bitflags, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr,
             RulesetCreatedAttr, ABI,
         };
-        // ABI::V5 covers every filesystem right through IoctlDev. Anything
-        // less must refuse instead of silently dropping rights.
+        // ABI::V5 covers every filesystem right through IoctlDev, and the
+        // scopes above need ABI::V6. Anything less must refuse instead of
+        // silently dropping rights.
         let mut ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(ABI::V5))
-            .map_err(kernel)?
+            .map_err(land)?
+            .scope(scopes())
+            .map_err(land)?
             .create()
-            .map_err(kernel)?;
+            .map_err(land)?;
         // V8 opens /dev/urandom while seeding RNGs (Math.random and hashing);
         // without this rule that open fails and the seed falls back to
         // weaker sources. Read-only, and this one file only.
-        let urandom = PathFd::new("/dev/urandom").map_err(kernel)?;
+        let urandom = PathFd::new("/dev/urandom").map_err(land)?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(urandom, AccessFs::ReadFile))
-            .map_err(kernel)?;
+            .map_err(land)?;
         if let Some(anchor) = dump {
             let access = make_bitflags!(AccessFs::{WriteFile | Truncate});
-            ruleset = ruleset.add_rule(PathBeneath::new(anchor, access)).map_err(kernel)?;
+            ruleset = ruleset.add_rule(PathBeneath::new(anchor, access)).map_err(land)?;
         }
-        let status = ruleset.restrict_self().map_err(kernel)?;
+        let status = ruleset.restrict_self().map_err(land)?;
         enforce_status(status.ruleset)
+    }
+
+    /// Tags a Landlock-layer failure so refusals name the refusing layer.
+    fn land(msg: impl std::fmt::Display) -> SandboxError {
+        SandboxError::Kernel(format!("Landlock: {}", msg))
+    }
+
+    /// Tags a seccomp-layer failure so refusals name the refusing layer.
+    fn comp(msg: impl std::fmt::Display) -> SandboxError {
+        SandboxError::Kernel(format!("seccomp: {}", msg))
     }
 
     /// Landlock must be fully enforced: a partially enforced ruleset means
@@ -233,7 +282,7 @@ mod imp {
         match status {
             landlock::RulesetStatus::FullyEnforced => Ok(()),
             landlock::RulesetStatus::PartiallyEnforced | landlock::RulesetStatus::NotEnforced => {
-                Err(kernel("Landlock is not fully enforced (needs ABI 5, Linux 6.10)"))
+                Err(land("not fully enforced (needs ABI 6, Linux 6.12)"))
             }
         }
     }
@@ -244,10 +293,10 @@ mod imp {
         // glibc's pthread_create falls back to clone only on ENOSYS; the
         // fallback is then argument-checked by the deny list.
         let nosys = compile(single(libc::SYS_clone3), libc::ENOSYS)?;
-        apply_filter_all_threads(&nosys).map_err(kernel)?;
+        apply_filter_all_threads(&nosys).map_err(comp)?;
         install_x32_guard()?;
         let deny = compile(filter_rules(), libc::EPERM)?;
-        apply_filter_all_threads(&deny).map_err(kernel)
+        apply_filter_all_threads(&deny).map_err(comp)
     }
 
     /// Compile a default-allow filter whose matched syscalls return `errno`.
@@ -258,11 +307,11 @@ mod imp {
             SeccompAction::Errno(errno as u32),
             // The module is x86_64-only; the arch token type is not exported
             // from the crate root, so it is inferred here.
-            std::env::consts::ARCH.try_into().map_err(|_| kernel("unsupported architecture"))?,
+            std::env::consts::ARCH.try_into().map_err(|_| comp("unsupported architecture"))?,
         )
-        .map_err(kernel)?
+        .map_err(comp)?
         .try_into()
-        .map_err(kernel)
+        .map_err(comp)
     }
 
     fn single(nr: libc::c_long) -> Rules {
@@ -274,16 +323,68 @@ mod imp {
     /// rules instead and are added on top.
     fn filter_rules() -> Rules {
         let mut rules: Rules = DENIED.iter().map(|nr| (*nr, Vec::new())).collect();
+        let pid = unsafe { libc::getpid() } as u64;
         rules.insert(libc::SYS_clone, clone_rules());
         rules.insert(libc::SYS_ioctl, ioctl_rules());
-        let pid = unsafe { libc::getpid() } as u64;
+        rules.insert(libc::SYS_fcntl, fcntl_rules());
         // Signals may only target this process (raise/abort paths); another
-        // process or a whole group (pid 0 or -pgid) is denied.
-        rules.insert(libc::SYS_kill, vec![condition(0, SeccompCmpOp::Ne, pid)]);
-        rules.insert(libc::SYS_tgkill, vec![condition(0, SeccompCmpOp::Ne, pid)]);
+        // process, a whole group (pid 0 or -pgid), or a queued siginfo to
+        // anyone else is denied. Landlock's Signal scope is the second wall.
+        for nr in [
+            libc::SYS_kill,
+            libc::SYS_tgkill,
+            libc::SYS_rt_sigqueueinfo,
+            libc::SYS_rt_tgsigqueueinfo,
+        ] {
+            rules.insert(nr, vec![condition(0, SeccompCmpOp::Ne, pid)]);
+        }
         // tkill carries no thread-group id to check: deny outright.
         rules.insert(libc::SYS_tkill, Vec::new());
+        // Resource limits, scheduling and priority may only touch this
+        // process: 0 (the caller) or its own pid, as glibc uses them.
+        for nr in [
+            libc::SYS_prlimit64,
+            libc::SYS_sched_setaffinity,
+            libc::SYS_sched_setscheduler,
+            libc::SYS_sched_setattr,
+        ] {
+            rules.insert(nr, vec![foreign(0, pid)]);
+        }
+        rules.insert(libc::SYS_setpriority, setpriority_rules(pid));
         rules
+    }
+
+    /// Denies an argument that is neither 0 (calling process) nor this
+    /// process: both `Ne` conditions must hold, so self-targeted calls pass.
+    fn foreign(arg: usize, pid: u64) -> SeccompRule {
+        rule2(
+            arg,
+            SeccompCmpOp::Ne,
+            0,
+            arg,
+            SeccompCmpOp::Ne,
+            pid,
+        )
+    }
+
+    /// setpriority(which, who, prio): only PRIO_PROCESS with the caller (0)
+    /// or this process; a user- or group-wide target is denied.
+    fn setpriority_rules(pid: u64) -> Vec<SeccompRule> {
+        vec![
+            condition(0, SeccompCmpOp::Ne, libc::PRIO_PROCESS as u64),
+            foreign(1, pid),
+        ]
+    }
+
+    /// fcntl: aiming async-signal delivery at another process (F_SETOWN,
+    /// F_SETOWN_EX) or choosing the signal (F_SETSIG) is denied; every other
+    /// request (FD_CLOEXEC, locks, O_NONBLOCK) is untouched.
+    fn fcntl_rules() -> Vec<SeccompRule> {
+        vec![
+            condition(1, SeccompCmpOp::Eq, libc::F_SETOWN as u64),
+            condition(1, SeccompCmpOp::Eq, F_SETSIG as u64),
+            condition(1, SeccompCmpOp::Eq, F_SETOWN_EX as u64),
+        ]
     }
 
     /// clone is allowed only for real threads of this process: CLONE_THREAD
@@ -319,6 +420,15 @@ mod imp {
         // Constructors only reject an argument index above 5.
         SeccompRule::new(vec![SeccompCondition::new(arg, len, op, value).expect("valid condition")])
             .expect("valid rule")
+    }
+
+    /// Two and-bound dword conditions; `foreign` needs a pair on one argument.
+    fn rule2(arg_a: usize, op_a: SeccompCmpOp, value_a: u64, arg_b: usize, op_b: SeccompCmpOp, value_b: u64) -> SeccompRule {
+        let a = SeccompCondition::new(arg_a as u8, SeccompCmpArgLen::Dword, op_a, value_a)
+            .expect("valid condition");
+        let b = SeccompCondition::new(arg_b as u8, SeccompCmpArgLen::Dword, op_b, value_b)
+            .expect("valid condition");
+        SeccompRule::new(vec![a, b]).expect("valid rule")
     }
 
     /// Namespace-creating clone flags (see clone(2)); each gets its own rule.
@@ -376,10 +486,7 @@ mod imp {
             )
         };
         if rc != 0 {
-            return Err(kernel(format!(
-                "seccomp(x32 guard): {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(comp(format!("x32 guard: {}", std::io::Error::last_os_error())));
         }
         Ok(())
     }
@@ -519,6 +626,12 @@ mod imp {
         libc::SYS_utimes,
         libc::SYS_futimesat,
         libc::SYS_utimensat,
+        // file-event observation (live names leak through these)
+        libc::SYS_inotify_init,
+        libc::SYS_inotify_init1,
+        libc::SYS_inotify_add_watch,
+        libc::SYS_fanotify_init,
+        libc::SYS_fanotify_mark,
         // fd-to-fd plumbing
         libc::SYS_sendfile,
         libc::SYS_splice,
@@ -550,6 +663,57 @@ mod imp {
                 .collect();
             assert_eq!(clone_rules(), expected);
             assert_eq!(clone_rules().len(), 1 + NAMESPACE_FLAGS.len());
+        }
+
+        #[test]
+        fn fcntl_rules_deny_only_async_signal_ownership() {
+            let expected = vec![
+                condition(1, SeccompCmpOp::Eq, libc::F_SETOWN as u64),
+                condition(1, SeccompCmpOp::Eq, F_SETSIG as u64),
+                condition(1, SeccompCmpOp::Eq, F_SETOWN_EX as u64),
+            ];
+            assert_eq!(fcntl_rules(), expected);
+        }
+
+        #[test]
+        fn process_rules_allow_only_this_process() {
+            let pid = unsafe { libc::getpid() } as u64;
+            let rules = filter_rules();
+            // signals (kill family) deny everything but this pid
+            for nr in [
+                libc::SYS_kill,
+                libc::SYS_tgkill,
+                libc::SYS_rt_sigqueueinfo,
+                libc::SYS_rt_tgsigqueueinfo,
+            ] {
+                assert_eq!(rules.get(&nr), Some(&vec![condition(0, SeccompCmpOp::Ne, pid)]));
+            }
+            // resources and scheduling allow 0 (caller) or this pid
+            let foreign = vec![rule2(0, SeccompCmpOp::Ne, 0, 0, SeccompCmpOp::Ne, pid)];
+            for nr in [
+                libc::SYS_prlimit64,
+                libc::SYS_sched_setaffinity,
+                libc::SYS_sched_setscheduler,
+                libc::SYS_sched_setattr,
+            ] {
+                assert_eq!(rules.get(&nr), Some(&foreign), "self-only {}", nr);
+            }
+            // setpriority: only PRIO_PROCESS, and only for self
+            assert_eq!(
+                rules.get(&libc::SYS_setpriority),
+                Some(&vec![
+                    condition(0, SeccompCmpOp::Ne, libc::PRIO_PROCESS as u64),
+                    rule2(1, SeccompCmpOp::Ne, 0, 1, SeccompCmpOp::Ne, pid),
+                ])
+            );
+        }
+
+        #[test]
+        fn scopes_cover_signals_and_abstract_sockets() {
+            use landlock::Access;
+            assert_eq!(scopes(), landlock::Scope::from_all(landlock::ABI::V6));
+            assert!(scopes().contains(landlock::Scope::Signal));
+            assert!(scopes().contains(landlock::Scope::AbstractUnixSocket));
         }
 
         #[test]

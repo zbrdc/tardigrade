@@ -467,6 +467,7 @@ dependencies = [
  "seccompiler",
  "serde_json",
  "v8",
+ "v8vm",
 ]
 
 [[package]]

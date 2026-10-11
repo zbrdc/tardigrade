@@ -120,14 +120,26 @@ TSYNC.
   not mediate: file metadata, file existence, and symlink targets stay
   observable through stat/access/readlink/chdir/statfs (xattr calls are
   denied instead).
+- Landlock also scopes the process itself (ABI 6): signals may not be sent
+  to processes outside the sandbox, and abstract unix sockets outside it may
+  not be connected. This is the layer that stops a same-uid neighbour from
+  being signalled at all.
 - seccomp-BPF, a deny list where denied calls fail with EPERM: all socket
   calls, exec (execve, execveat, fork, vfork), ptrace and cross-process
   memory access, privilege and identity changes, mount and namespace calls,
   kernel modules, bpf, perf, io_uring, userfaultfd, keyctl, System V and
   POSIX message queues, personality, modify_ldt, xattr and other file
-  metadata changes, and clock setting. Signals may only be sent to the run's
-  own process (kill/tgkill with any other target, and tkill, are denied).
-  ioctl is denied for the terminal input injection requests TIOCSTI and
+  metadata changes, file-event notification (inotify, fanotify), and clock
+  setting.
+- Cross-process interference is filtered by argument, on top of the scopes:
+  kill, tgkill, rt_sigqueueinfo and rt_tgsigqueueinfo are denied unless the
+  target is the run's own pid (tkill, which names no process, is denied
+  outright); fcntl is denied for F_SETOWN, F_SETOWN_EX and F_SETSIG, which is
+  how an async fd would aim SIGIO at another process; prlimit64,
+  sched_setaffinity, sched_setscheduler and sched_setattr are denied unless
+  the target is 0 (the caller) or the run's own pid; setpriority is denied
+  unless it is PRIO_PROCESS for 0 or the run's own pid.
+- ioctl is denied for the terminal input injection requests TIOCSTI and
   TIOCLINUX; other ioctl requests remain allowed on already-open descriptors,
   which is a residual surface.
 - Process creation is filtered, not just denied: clone succeeds only with
@@ -147,13 +159,18 @@ from sched_getaffinity) — /dev/urandom is allowed as above.
 What this does not do: it is not a VM. The guest runs as your user inside
 your process; kernel bugs, hardware side channels, the stdio descriptors,
 and the `--dump` file itself are out of scope. A compromised guest can still
-burn CPU until --timeout and read the metadata of the filesystem around it.
+burn CPU until --timeout and read the filesystem's shape around it: stat,
+access, readlink, chdir and statfs are not mediated by Landlock, and
+getpriority and sched_getaffinity on other processes remain readable. The
+process's own pid is a valid signal target by design (raise and abort need
+it).
 
-Kernel requirements: Landlock ABI 5 (Linux 6.10) and seccomp with TSYNC. A
-ruleset that is not fully enforced is refused rather than degraded. Verified
-on Linux 6.17 reporting Landlock ABI 7; older kernels are untested. If
-Landlock or seccomp is missing the run refuses to start — it never falls
-back to unsandboxed execution.
+Kernel requirements: Landlock ABI 6 (Linux 6.12, for the filesystem rights
+and the signal/abstract-socket scopes) and seccomp with TSYNC. A ruleset
+that is not fully enforced is refused rather than degraded. Verified on
+Linux 6.17 reporting Landlock ABI 7; older kernels are untested. If Landlock
+or seccomp is missing the run refuses to start — it never falls back to
+unsandboxed execution.
 
 ## Guarantees and limits
 

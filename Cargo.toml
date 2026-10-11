@@ -18,6 +18,14 @@ landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 libc = "=0.2.190"
 
+# Test-only: exposes per-layer sandbox application so the tests can attribute
+# a denial to a single layer. Never enabled for production builds.
+[features]
+test-layers = []
+
+[dev-dependencies]
+v8vm = { path = ".", features = ["test-layers"] }
+
 [profile.release]
 opt-level = 2
 debug = false
