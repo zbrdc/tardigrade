@@ -416,6 +416,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tardigrade"
+version = "0.1.0"
+dependencies = [
+ "landlock",
+ "libc",
+ "seccompiler",
+ "serde_json",
+ "tardigrade",
+ "v8",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -456,18 +468,6 @@ dependencies = [
  "once_cell",
  "paste",
  "which 6.0.3",
-]
-
-[[package]]
-name = "tardigrade"
-version = "0.1.0"
-dependencies = [
- "landlock",
- "libc",
- "seccompiler",
- "serde_json",
- "v8",
- "tardigrade",
 ]
 
 [[package]]

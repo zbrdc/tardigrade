@@ -2677,56 +2677,66 @@ fn real_mode_timers_are_exact_neither_early_nor_padded() {
     // every hop pay up to one extra millisecond (300 chained setTimeout(0)
     // measured 617 ms where main and Node take ~316; 100 x 5 ms measured
     // 601 against 502). Real deadlines are exact nanoseconds from the
-    // run's clock now, so the two pinned properties are: never early
-    // (the 100 x 5 ms chain spans at least 500 ms) and no padding (the
-    // 300 x 0 ms chain - each hop clamped to 1 ms - finishes well under
-    // the 450 ms CI bound; ~320 ms measured), with interval drift close
-    // to the asked period.
+    // run's clock now, so the two pinned properties are: never early (each
+    // chain's total is at least its hops times its delay) and no padding.
+    // Padding is judged by the upper median gap between hops, not by the
+    // total: a loaded host delays some hops by milliseconds, which moves a
+    // total past any tight bound but leaves the median where the delay put
+    // it, while the old +1 ms padding shifted every gap.
     let r = run_js(
         "vclock-exact",
         r#"
         const done = [];
-        const t0 = performance.now(); let n = 0;
-        (function step() {
-          if (++n < 300) setTimeout(step, 0);
-          else done.push("chain0", Math.round(performance.now() - t0));
-        })();
-        const t5 = performance.now(); let m = 0;
-        (function hop() {
-          if (++m < 100) setTimeout(hop, 5);
-          else done.push("chain5", Math.round(performance.now() - t5));
-        })();
-        const ti = performance.now(); let k = 0;
+        const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+        function report(label, t0, gaps) {
+          done.push(label, (performance.now() - t0).toFixed(3), median(gaps).toFixed(3));
+        }
+        function chain(label, delay, hops) {
+          const t0 = performance.now(), gaps = [];
+          let last = t0;
+          const step = () => {
+            const now = performance.now();
+            gaps.push(now - last); last = now;
+            if (gaps.length < hops) setTimeout(step, delay);
+            else report(label, t0, gaps);
+          };
+          setTimeout(step, delay);
+        }
+        chain("chain0", 0, 300);
+        chain("chain5", 5, 100);
+        const ti = performance.now(), ticks = [];
+        let lastTick = ti;
         const iv = setInterval(() => {
-          if (++k === 30) { clearInterval(iv); done.push("iv30", Math.round(performance.now() - ti)); }
+          const now = performance.now();
+          ticks.push(now - lastTick); lastTick = now;
+          if (ticks.length === 30) { clearInterval(iv); report("iv30", ti, ticks); }
         }, 10);
         setTimeout(() => console.log(done.join(" ")), 4000);
         "#,
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     // Completion order varies with the three chains' lengths; find each
-    // measurement by its label.
+    // measurement by its label: the total span, then the median gap.
     let toks: Vec<&str> = r.stdout.split_whitespace().collect();
-    let labeled = |want: &str| -> u64 {
+    let labeled = |want: &str| -> (f64, f64) {
         let i = toks.iter().position(|t| *t == want).unwrap_or_else(|| {
             panic!("label {} missing from {:?}", want, toks)
         });
-        toks[i + 1].parse().unwrap()
+        (toks[i + 1].parse().unwrap(), toks[i + 2].parse().unwrap())
     };
-    let chain0_ms = labeled("chain0");
-    let chain5_ms = labeled("chain5");
-    let iv30_ms = labeled("iv30");
-    // Each 0-delay hop waits its clamped 1 ms: at least 300 ms, and the
-    // padding bound would catch the old +1 ms per hop (~617 ms).
-    assert!((300..450).contains(&chain0_ms), "chain0 {} ms", chain0_ms);
-    // Never early: 100 hops of a full 5 ms each.
-    assert!(chain5_ms >= 500, "chain5 {} ms", chain5_ms);
-    assert!(chain5_ms < 650, "chain5 {} ms", chain5_ms);
-    // 30 interval ticks at 10 ms: no early fire, and drift close to the
-    // asked period (the old ms-rounded timeline measured ~11.07 ms per
-    // tick, i.e. ~332 ms here).
-    assert!(iv30_ms >= 299, "iv30 {} ms", iv30_ms);
-    assert!(iv30_ms < 325, "iv30 {} ms (mean tick {} ms)", iv30_ms, iv30_ms / 30);
+    // Each 0-delay hop waits its clamped 1 ms; the padded timeline paid
+    // about 2.06 ms per hop.
+    let (chain0_ms, chain0_gap) = labeled("chain0");
+    assert!(chain0_ms >= 300.0, "chain0 {} ms", chain0_ms);
+    assert!(chain0_gap < 1.5, "chain0 median gap {} ms", chain0_gap);
+    // 100 hops of a full 5 ms each; the padded timeline paid ~6.01 ms.
+    let (chain5_ms, chain5_gap) = labeled("chain5");
+    assert!(chain5_ms >= 500.0, "chain5 {} ms", chain5_ms);
+    assert!(chain5_gap < 5.5, "chain5 median gap {} ms", chain5_gap);
+    // 30 interval ticks at 10 ms; the padded timeline paid ~11.07 ms.
+    let (iv30_ms, iv30_gap) = labeled("iv30");
+    assert!(iv30_ms >= 300.0, "iv30 {} ms", iv30_ms);
+    assert!(iv30_gap < 10.5, "iv30 median tick {} ms", iv30_gap);
 }
 
 #[test]
