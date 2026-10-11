@@ -93,13 +93,16 @@ WebAssembly, Intl/ICU, and all of ES2023 are available.
 A RAM-only tree of directories and byte-valued files. Paths are
 normalized (`.`, `..`, duplicate and trailing slashes collapse) and must
 be absolute; a path that would climb out of the root throws, and
-`exists` just returns false for it. Writing a file creates its missing
-parent directories.
+`exists` just returns false for it. Paths containing U+FFFD are rejected
+(lone UTF-16 surrogates convert to U+FFFD, so allowing the character
+would let two distinct guest strings name one file). If a path argument's
+`toString` throws, that exception propagates. Writing a file creates its
+missing parent directories.
 
 | API | Description |
 |---|---|
-| vm.fs.write(path, data) | write a file; data is a string, an ArrayBuffer, or a typed array / DataView (a view stores only the bytes it can see); an existing file is replaced wholesale |
-| vm.fs.read(path) | read as a string; bytes that are not valid UTF-8 come back as U+FFFD |
+| vm.fs.write(path, data) | write a file; data is a string, an ArrayBuffer (shared buffers included), or a typed array / DataView (a view stores only the bytes it can see; detached buffers and views left out of bounds by a resize throw); an existing file is replaced wholesale; the length of buffer data is checked against the quota before anything is copied |
+| vm.fs.read(path) | read as a string; bytes that are not valid UTF-8 come back as U+FFFD; files larger than V8's string limit throw |
 | vm.fs.readBytes(path) | read as a Uint8Array |
 | vm.fs.list(dir) | recursive listing of file paths under dir, full paths, sorted; directories are not listed |
 | vm.fs.readdir(path) | immediate child names (files and directories), sorted |
@@ -112,19 +115,30 @@ parent directories.
 
 A failed mutating call leaves the filesystem unchanged.
 
-The tree is quota-capped: usage is content bytes plus a flat 64 bytes
-per file or directory entry (the root is free). Default 64 MiB;
-`--fs-quota=<mb>` overrides it and 0 disables it. A write that would
-cross the quota throws Error('fs quota exceeded'). Normalized paths are
-capped at 4096 bytes and the tree at 100000 entries.
+The tree is quota-capped: usage is content bytes plus path bytes plus a
+flat 64 bytes of bookkeeping per file or directory entry (the root is
+free). Default 64 MiB; `--fs-quota=<mb>` overrides it and 0 disables it.
+A write that would cross the quota throws Error('fs quota exceeded') and
+changes nothing. Normalized paths are capped at 4096 bytes (renames check
+re-keyed descendants too) and the tree at 100000 entries.
 
-Snapshots are JSON. The current format is
-`{"version":2,"files":{"/a.txt":{"text":"..."},"/b.bin":{"b64":"..."}},"dirs":["/","/d"]}`:
-valid-UTF-8 files are stored as text, anything else as base64, and
-keys are sorted so dumps are deterministic. vm.restore also accepts
-the old format, a flat `{"/path": "text"}` map, so --preload files
-written by earlier versions keep working; restore materializes parent
-directories of every restored entry.
+Snapshots are JSON, written with sorted keys so dumps are deterministic.
+The current format is
+`{"dirs":["/","/d"],"files":{"/a.txt":{"text":"..."},"/b.bin":{"b64":"..."}},"version":2}`:
+each file becomes `{"text":...}` when its bytes are valid UTF-8 whose
+JSON-escaped form is not larger than the base64 form, `{"b64":...}`
+otherwise, and base64 is decoded strictly (padding only in the final
+chunk, canonical trailing bits). vm.restore also accepts the legacy
+format, a flat `{"/path": "text"}` map — relative keys are read as
+root-relative, and keys that then escape the root or break the path cap
+fail naming the key — so --preload files written by earlier versions
+keep working; restore materializes parent directories of every restored
+entry and never replaces an existing file with a directory or vice
+versa. A snapshot naming any other `version` fails with "unsupported
+snapshot version <v>". When a quota is set, restore refuses a payload
+larger than four quotas plus 1 MiB before parsing it. Version 2 dumps
+are not loadable by older v8vm versions, which would see files named
+"version", "files" and "dirs".
 
 ## HTTP bridge
 

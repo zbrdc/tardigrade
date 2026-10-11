@@ -2,7 +2,7 @@
 
 use crate::console::{console_err, console_log};
 use crate::exit::vm_exit;
-use crate::fs::{
+use crate::fs_api::{
     fs_exists, fs_list, fs_mkdir, fs_read, fs_read_bytes, fs_readdir, fs_remove, fs_rename,
     fs_restore, fs_snapshot, fs_stat, fs_write,
 };

@@ -1,21 +1,16 @@
-//! vm.fs: the RAM filesystem. Directories are explicit entries; writing a
-//! file creates its missing parent directories. Guest paths are normalized
-//! (`.`, `..`, duplicate and trailing slashes collapse) and always absolute;
-//! paths that would escape the root are rejected. Contents are bytes:
-//! `read` returns them as a lossy UTF-8 string, `readBytes` as a Uint8Array,
-//! and `write` accepts a string, ArrayBuffer, or typed array. Throwing
-//! read/remove, as documented.
+//! The RAM filesystem core: path normalization and the [`RamFs`] tree.
+//! Guest-facing callbacks live in [crate::fs_api]; the snapshot codec in
+//! [crate::snapshot]. Paths are normalized (`.`, `..`, duplicate and
+//! trailing slashes collapse) and always absolute; paths that would escape
+//! the root, or that contain U+FFFD (which is what lone UTF-16 surrogates
+//! become when converted, so allowing it would let two distinct guest
+//! strings name one file), are rejected.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::diag::{throw, to_rust_string};
-use crate::guest_cb;
-use crate::world::world_mut;
-
 pub(crate) type FsResult<T> = Result<T, String>;
 
-/// Every file and directory costs this many quota bytes on top of its
-/// content, covering its key and its map entry.
+/// Flat bookkeeping cost per entry on top of its key and content bytes.
 pub(crate) const ENTRY_OVERHEAD: u64 = 64;
 /// Normalized paths at or under this UTF-8 length are accepted.
 pub(crate) const MAX_PATH_BYTES: usize = 4096;
@@ -24,82 +19,41 @@ pub(crate) const MAX_ENTRIES: usize = 100_000;
 /// The Config.fs_quota_bytes default: 64 MiB.
 pub const DEFAULT_FS_QUOTA_BYTES: u64 = 64 << 20;
 
-fn file_cost(len: usize) -> u64 {
-    ENTRY_OVERHEAD + len as u64
+/// A file entry costs its content plus its key plus flat bookkeeping.
+fn file_cost(path: &str, len: usize) -> u64 {
+    ENTRY_OVERHEAD + path.len() as u64 + len as u64
 }
 
-/// Full recount: content bytes plus overhead per entry, root excluded.
-fn usage(files: &BTreeMap<String, Vec<u8>>, dirs: &BTreeSet<String>) -> u64 {
-    files.values().map(|d| file_cost(d.len())).sum::<u64>()
-        + ENTRY_OVERHEAD * (dirs.len() as u64 - 1)
+/// A directory entry costs its key plus flat bookkeeping.
+fn dir_cost(path: &str) -> u64 {
+    ENTRY_OVERHEAD + path.len() as u64
 }
 
-/// Parsed snapshot payload: explicit directories plus file contents.
-type Snapshot = (BTreeSet<String>, Vec<(String, Vec<u8>)>);
-
-fn parse_snapshot(json: &str) -> FsResult<Snapshot> {
-    let v: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid snapshot: {}", e))?;
-    let obj = v.as_object().ok_or("invalid snapshot: expected an object")?;
-    // A legacy map's keys are absolute paths, so a bare "version" key can
-    // only belong to the versioned format.
-    if obj.get("version").and_then(serde_json::Value::as_i64) == Some(2) {
-        return parse_v2(obj);
-    }
-    parse_legacy(obj)
-}
-
-fn parse_v2(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapshot> {
-    let files = obj
-        .get("files")
-        .and_then(|v| v.as_object())
-        .ok_or("invalid snapshot: files must be an object")?;
-    let mut out = Vec::with_capacity(files.len());
-    for (p, entry) in files {
-        out.push((normalize(p)?, entry_bytes(entry)?));
-    }
-    let mut dirs = BTreeSet::new();
-    if let Some(v) = obj.get("dirs") {
-        let arr = v.as_array().ok_or("invalid snapshot: dirs must be an array")?;
-        for d in arr {
-            let s = d.as_str().ok_or("invalid snapshot: dirs entries must be strings")?;
-            dirs.insert(normalize(s)?);
-        }
-    }
-    Ok((dirs, out))
-}
-
-fn entry_bytes(entry: &serde_json::Value) -> FsResult<Vec<u8>> {
-    let obj = entry
-        .as_object()
-        .ok_or("invalid snapshot: file entry must be {text} or {b64}")?;
-    if let Some(t) = obj.get("text") {
-        return t
-            .as_str()
-            .map(|s| s.as_bytes().to_vec())
-            .ok_or("invalid snapshot: text must be a string".to_string());
-    }
-    if let Some(b) = obj.get("b64") {
-        let s = b.as_str().ok_or("invalid snapshot: b64 must be a string")?;
-        return b64::decode(s).ok_or("invalid snapshot: bad base64".to_string());
-    }
-    Err("invalid snapshot: file entry must be {text} or {b64}".to_string())
-}
-
-fn parse_legacy(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Snapshot> {
-    let mut files = Vec::with_capacity(obj.len());
-    for (p, v) in obj {
-        let s = v.as_str().ok_or("invalid snapshot: old-format values must be strings")?;
-        files.push((normalize(p)?, s.as_bytes().to_vec()));
-    }
-    Ok((BTreeSet::new(), files))
+/// Full recount of the quota usage of a whole tree (root excluded).
+#[cfg(test)]
+pub(crate) fn usage(files: &BTreeMap<String, Vec<u8>>, dirs: &BTreeSet<String>) -> u64 {
+    files
+        .iter()
+        .map(|(p, d)| file_cost(p, d.len()))
+        .sum::<u64>()
+        + dirs
+            .iter()
+            .filter(|d| d.as_str() != "/")
+            .map(|d| dir_cost(d))
+            .sum::<u64>()
 }
 
 /// Collapses `.`/`..`/duplicate slashes and rejects anything that is not an
 /// absolute path inside the sandbox root.
-fn normalize(path: &str) -> FsResult<String> {
+pub(crate) fn normalize(path: &str) -> FsResult<String> {
     if path.contains('\0') {
         return Err(format!("path contains NUL: {}", path));
+    }
+    if path.contains('\u{fffd}') {
+        return Err(format!(
+            "path contains U+FFFD (lone surrogates are rejected): {}",
+            path
+        ));
     }
     if !path.starts_with('/') {
         return Err(format!("path must be absolute: {}", path));
@@ -123,7 +77,11 @@ fn normalize(path: &str) -> FsResult<String> {
         format!("/{}", parts.join("/"))
     };
     if norm.len() > MAX_PATH_BYTES {
-        return Err(format!("path too long: {} bytes (max {})", norm.len(), MAX_PATH_BYTES));
+        return Err(format!(
+            "path too long: {} bytes (max {})",
+            norm.len(),
+            MAX_PATH_BYTES
+        ));
     }
     Ok(norm)
 }
@@ -164,14 +122,49 @@ fn child_name<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
         .filter(|name| !name.is_empty())
 }
 
+/// The `stat()` result: kind plus a size that means content bytes for files
+/// and immediate child count for directories.
+#[derive(Debug)]
+pub(crate) struct Stat {
+    pub(crate) is_dir: bool,
+    pub(crate) size: u64,
+}
+
+/// A write that has passed every check, ready to be applied.
+struct WritePlan {
+    path: String,
+    add: u64,
+    old: u64,
+    missing: Vec<String>,
+    new_file: usize,
+}
+
+/// What a rename will do once committed.
+struct RenamePlan {
+    from: String,
+    to: String,
+    from_is_dir: bool,
+    dest_is_file: bool,
+    dest_is_dir: bool,
+    /// Net usage change: destination removals plus key-length growth of
+    /// every re-keyed descendant (negative when bytes are freed).
+    used_delta: i64,
+}
+
+/// What a restore will add once it has passed every check.
+struct RestorePlan {
+    new_dirs: Vec<String>,
+    used_delta: i64,
+}
+
 /// The filesystem state: byte-valued files plus the set of directories
 /// that exist in their own right (root included). Every file's ancestors
 /// are directories; `write` and `restore` maintain that invariant. `used`
-/// tracks content bytes plus ENTRY_OVERHEAD per entry so growth can be
-/// checked before anything mutates.
+/// tracks key + content + bookkeeping bytes so growth is checked before
+/// anything mutates.
 pub(crate) struct RamFs {
-    files: BTreeMap<String, Vec<u8>>,
-    dirs: BTreeSet<String>,
+    pub(crate) files: BTreeMap<String, Vec<u8>>,
+    pub(crate) dirs: BTreeSet<String>,
     /// 0 disables the limit.
     quota: u64,
     used: u64,
@@ -273,20 +266,54 @@ impl RamFs {
         }
     }
 
-    /// Writing creates missing parent directories (documented guest rule)
-    /// and replaces an existing file at `path` wholesale.
-    pub(crate) fn write(&mut self, path: &str, data: Vec<u8>) -> FsResult<()> {
+    /// Everything `write` needs to decide, derived once so the caller can
+    /// run the same check before copying any data in.
+    fn plan_write(&self, path: &str, len: usize) -> FsResult<WritePlan> {
         let p = normalize(path)?;
         if self.is_dir(&p) {
             return Err(format!("is a directory: {}", p));
         }
         let missing = self.missing_dirs(&p)?;
-        let old = self.files.get(&p).map_or(0, |d| file_cost(d.len()));
-        let add = file_cost(data.len()) + ENTRY_OVERHEAD * missing.len() as u64;
+        let old = self.files.get(&p).map_or(0, |d| file_cost(&p, d.len()));
+        let add = file_cost(&p, len) + missing.iter().map(|d| dir_cost(d)).sum::<u64>();
         let new_file = usize::from(!self.files.contains_key(&p));
-        self.reserve(self.used + add - old, self.entries() + missing.len() + new_file)?;
+        Ok(WritePlan {
+            path: p,
+            add,
+            old,
+            missing,
+            new_file,
+        })
+    }
+
+    /// Quota, caps, and shape check for a would-be write of `len` bytes,
+    /// without any data. Lets the callback reject a giant buffer before
+    /// copying it into Rust memory.
+    pub(crate) fn probe_write(&self, path: &str, len: usize) -> FsResult<()> {
+        let plan = self.plan_write(path, len)?;
+        self.reserve(
+            self.used + plan.add - plan.old,
+            self.entries() + plan.missing.len() + plan.new_file,
+        )
+    }
+
+    /// Writing creates missing parent directories (documented guest rule)
+    /// and replaces an existing file at `path` wholesale.
+    pub(crate) fn write(&mut self, path: &str, data: Vec<u8>) -> FsResult<()> {
+        let plan = self.plan_write(path, data.len())?;
+        self.reserve(
+            self.used + plan.add - plan.old,
+            self.entries() + plan.missing.len() + plan.new_file,
+        )?;
+        let WritePlan {
+            path,
+            add,
+            old,
+            missing,
+            ..
+        } = plan;
         self.insert_dirs(missing);
-        self.files.insert(p, data);
+        self.files.insert(path, data);
         self.used += add - old;
         Ok(())
     }
@@ -296,7 +323,11 @@ impl RamFs {
     pub(crate) fn mkdir(&mut self, path: &str, recursive: bool) -> FsResult<()> {
         let p = normalize(path)?;
         if self.is_dir(&p) {
-            return if recursive { Ok(()) } else { Err(format!("already exists: {}", p)) };
+            return if recursive {
+                Ok(())
+            } else {
+                Err(format!("already exists: {}", p))
+            };
         }
         if self.files.contains_key(&p) {
             return Err(format!("already exists: {}", p));
@@ -310,14 +341,12 @@ impl RamFs {
             }
         }
         let missing = self.missing_dirs(&p)?;
-        let add = missing.len() as u64 + 1;
-        self.reserve(
-            self.used + ENTRY_OVERHEAD * add,
-            self.entries() + add as usize,
-        )?;
+        let add: u64 = missing.iter().map(|d| dir_cost(d)).sum::<u64>() + dir_cost(&p);
+        let count = missing.len() + 1;
+        self.reserve(self.used + add, self.entries() + count)?;
         self.insert_dirs(missing);
         self.dirs.insert(p);
-        self.used += ENTRY_OVERHEAD * add;
+        self.used += add;
         Ok(())
     }
 
@@ -332,16 +361,22 @@ impl RamFs {
     pub(crate) fn stat(&self, path: &str) -> FsResult<Stat> {
         let p = normalize(path)?;
         if let Some(data) = self.files.get(&p) {
-            return Ok(Stat { is_dir: false, size: data.len() as u64 });
+            return Ok(Stat {
+                is_dir: false,
+                size: data.len() as u64,
+            });
         }
         if self.is_dir(&p) {
-            return Ok(Stat { is_dir: true, size: self.child_names(&p).len() as u64 });
+            return Ok(Stat {
+                is_dir: true,
+                size: self.child_names(&p).len() as u64,
+            });
         }
         Err(format!("no such file: {}", p))
     }
 
-    /// Recursive full-path listing of the files under `dir` (directories are
-    /// not listed); the pre-snapshot() and vm.fs.list() compatibility shape.
+    /// Recursive full-path listing of the files under `dir` (directories
+    /// are not listed); the vm.fs.list() compatibility shape.
     pub(crate) fn list(&self, dir: &str) -> FsResult<Vec<String>> {
         let p = normalize(dir)?;
         if self.files.contains_key(&p) {
@@ -370,7 +405,7 @@ impl RamFs {
             return Err("cannot remove root".to_string());
         }
         if let Some(data) = self.files.remove(&p) {
-            self.used -= file_cost(data.len());
+            self.used -= file_cost(&p, data.len());
             return Ok(());
         }
         if !self.is_dir(&p) {
@@ -380,12 +415,15 @@ impl RamFs {
         if !recursive && !(files.is_empty() && dirs.is_empty()) {
             return Err(format!("directory not empty: {}", p));
         }
+        let freed = files
+            .iter()
+            .map(|f| self.files.get(f).map_or(0, |d| file_cost(f, d.len())))
+            .sum::<u64>()
+            + dirs.iter().map(|d| dir_cost(d)).sum::<u64>()
+            + dir_cost(&p);
         for f in files {
-            if let Some(data) = self.files.remove(&f) {
-                self.used -= file_cost(data.len());
-            }
+            self.files.remove(&f);
         }
-        let freed = ENTRY_OVERHEAD * (dirs.len() as u64 + 1);
         for d in dirs {
             self.dirs.remove(&d);
         }
@@ -396,144 +434,126 @@ impl RamFs {
 
     /// POSIX-shaped rename: a file replaces a file, a directory moves onto
     /// an empty directory, and mismatched kinds or a move into the source's
-    /// own subtree are errors. The destination's parent must exist.
+    /// own subtree are errors. The destination's parent must exist, and
+    /// renaming a path onto itself is the POSIX no-op success.
     pub(crate) fn rename(&mut self, from: &str, to: &str) -> FsResult<()> {
         let (f, t) = (normalize(from)?, normalize(to)?);
         if f == t {
             return Ok(());
         }
+        let plan = self.validate_rename(&f, &t)?;
+        self.commit_rename(plan)
+    }
+
+    /// Checks everything a rename needs and computes its key-growth delta
+    /// without touching the tree. `f` and `t` arrive normalized, distinct.
+    fn validate_rename(&self, f: &str, t: &str) -> FsResult<RenamePlan> {
         if f == "/" {
             return Err("cannot rename root".to_string());
         }
-        let tparent = parent(&t);
+        let tparent = parent(t);
         if !self.is_dir(&tparent) {
             return Err(format!("no such file: {}", tparent));
         }
-        let from_is_dir = self.is_dir(&f);
-        if !from_is_dir && !self.files.contains_key(&f) {
+        let from_is_dir = self.is_dir(f);
+        if !from_is_dir && !self.files.contains_key(f) {
             return Err(format!("no such file: {}", f));
         }
-        if from_is_dir && t.starts_with(&child_prefix(&f)) {
+        if from_is_dir && t.starts_with(&child_prefix(f)) {
             return Err(format!("cannot rename a directory into itself: {}", t));
         }
-        if from_is_dir {
-            self.check_move_fits(&f, &t)?;
-        }
-        let to_is_dir = self.is_dir(&t);
-        let to_is_file = self.files.contains_key(&t);
-        if to_is_file && from_is_dir {
+        let dest_is_file = self.files.contains_key(t);
+        let dest_is_dir = self.is_dir(t);
+        if dest_is_file && from_is_dir {
             return Err(format!("not a directory: {}", t));
         }
-        if to_is_dir && !from_is_dir {
+        if dest_is_dir && !from_is_dir {
             return Err(format!("is a directory: {}", t));
         }
-        if to_is_dir && !self.child_names(&t).is_empty() {
+        if dest_is_dir && !self.child_names(t).is_empty() {
             return Err(format!("directory not empty: {}", t));
         }
-        if to_is_file {
-            if let Some(data) = self.files.remove(&t) {
-                self.used -= file_cost(data.len());
+        let key_growth = if from_is_dir {
+            self.subtree_key_growth(f, t)?
+        } else {
+            t.len() as i64 - f.len() as i64
+        };
+        let removals = self.dest_removals(t, dest_is_file, dest_is_dir);
+        self.reserve_rename(key_growth, removals, dest_is_file)?;
+        Ok(RenamePlan {
+            from: f.to_string(),
+            to: t.to_string(),
+            from_is_dir,
+            dest_is_file,
+            dest_is_dir,
+            used_delta: key_growth,
+        })
+    }
+
+    /// Bytes freed by dropping the destination (a replaced file or the
+    /// empty directory a moved dir replaces).
+    fn dest_removals(&self, t: &str, dest_is_file: bool, dest_is_dir: bool) -> u64 {
+        let file = if dest_is_file {
+            self.files.get(t).map_or(0, |d| file_cost(t, d.len()))
+        } else {
+            0
+        };
+        file + u64::from(dest_is_dir) * dir_cost(t)
+    }
+
+    /// A rename can only grow the usage (longer keys), never the entry
+    /// count, so only net growth needs the quota gate.
+    fn reserve_rename(&self, key_growth: i64, removals: u64, dest_is_file: bool) -> FsResult<()> {
+        let net = key_growth - removals as i64;
+        if net <= 0 {
+            return Ok(());
+        }
+        let entries_after = self.entries() - usize::from(dest_is_file);
+        self.reserve((self.used as i64 + net) as u64, entries_after)
+    }
+
+    fn commit_rename(&mut self, plan: RenamePlan) -> FsResult<()> {
+        if plan.dest_is_file {
+            if let Some(data) = self.files.remove(&plan.to) {
+                self.used -= file_cost(&plan.to, data.len());
             }
         }
-        if to_is_dir {
-            self.dirs.remove(&t);
-            self.used -= ENTRY_OVERHEAD;
+        if plan.dest_is_dir {
+            self.dirs.remove(&plan.to);
+            self.used -= dir_cost(&plan.to);
         }
-        if from_is_dir {
-            self.move_subtree(&f, &t);
-        } else if let Some(data) = self.files.remove(&f) {
-            self.files.insert(t, data);
+        if plan.from_is_dir {
+            self.move_subtree(&plan.from, &plan.to);
+        } else if let Some(data) = self.files.remove(&plan.from) {
+            self.files.insert(plan.to, data);
         }
+        self.used = (self.used as i64 + plan.used_delta) as u64;
         Ok(())
     }
 
-    /// Renaming onto a longer path grows every re-keyed descendant; none
-    /// of them may cross the path cap. Checked before any mutation.
-    fn check_move_fits(&self, from: &str, to: &str) -> FsResult<()> {
-        let growth = to.len() as isize - from.len() as isize;
+    /// Sum of (new key length - old key length) over every entry a
+    /// directory rename re-keys, the directory itself included. Refuses
+    /// re-keyed paths past the length cap before any mutation.
+    fn subtree_key_growth(&self, from: &str, to: &str) -> FsResult<i64> {
+        let growth = to.len() as i64 - from.len() as i64;
         if growth <= 0 {
-            return Ok(());
+            return Ok(0);
         }
         let prefix = child_prefix(from);
-        let too_long =
-            |k: &str| k.len() as isize + growth > MAX_PATH_BYTES as isize;
+        let mut count = 1; // `from` itself is re-keyed to `to`
         let keys = self
             .files
             .keys()
             .map(String::as_str)
-            .chain(self.dirs.iter().map(String::as_str));
-        if keys.filter(|k| k.starts_with(&prefix)).any(too_long) {
-            return Err(format!("path too long after rename (max {})", MAX_PATH_BYTES));
-        }
-        Ok(())
-    }
-
-    /// Snapshot format version 2:
-    /// {"version":2,"files":{path:{"text":s}|{"b64":s}},"dirs":[...]}.
-    /// Valid UTF-8 content is stored as text, anything else as base64;
-    /// B-tree key order makes dumps deterministic. Old readers that only
-    /// understand the legacy flat map can still read text-only snapshots'
-    /// files through vm.fs.list/read, and this reader accepts both.
-    pub(crate) fn snapshot_json(&self) -> String {
-        let mut files = serde_json::Map::new();
-        for (p, bytes) in &self.files {
-            let entry = match std::str::from_utf8(bytes) {
-                Ok(text) => serde_json::json!({ "text": text }),
-                Err(_) => serde_json::json!({ "b64": b64::encode(bytes) }),
-            };
-            files.insert(p.clone(), entry);
-        }
-        let dirs: Vec<&str> = self.dirs.iter().map(String::as_str).collect();
-        let v = serde_json::json!({ "version": 2, "files": files, "dirs": dirs });
-        serde_json::to_string(&v).expect("a snapshot is always serializable")
-    }
-
-    /// Restores a version-2 snapshot or the legacy flat {path: text} map,
-    /// merging into the current state. All-or-nothing: a snapshot that
-    /// would break the caps or the quota changes nothing.
-    pub(crate) fn restore(&mut self, json: &str) -> FsResult<()> {
-        let (dirs, files) = parse_snapshot(json)?;
-        self.apply_snapshot(dirs, files)
-    }
-
-    /// Plans the merge on copies and commits only a state that fits. Every
-    /// ancestor of a restored entry becomes a directory, so stat, exists
-    /// and readdir see one uniform tree even for legacy snapshots.
-    fn apply_snapshot(
-        &mut self,
-        dirs: BTreeSet<String>,
-        files: Vec<(String, Vec<u8>)>,
-    ) -> FsResult<()> {
-        let mut want = dirs.clone();
-        for d in &dirs {
-            want.extend(ancestors(d));
-        }
-        for (p, _) in &files {
-            want.extend(ancestors(p));
-        }
-        let mut next_dirs = self.dirs.clone();
-        let mut next_files = self.files.clone();
-        for d in want {
-            next_files.remove(&d);
-            next_dirs.insert(d);
-        }
-        for (p, bytes) in files {
-            if next_dirs.contains(&p) {
-                return Err(format!("is a directory: {}", p));
+            .chain(self.dirs.iter().map(String::as_str))
+            .filter(|k| k.starts_with(&prefix));
+        for k in keys {
+            if k.len() as i64 + growth > MAX_PATH_BYTES as i64 {
+                return Err(format!("path too long after rename (max {})", MAX_PATH_BYTES));
             }
-            next_files.insert(p, bytes);
+            count += 1;
         }
-        let used = usage(&next_files, &next_dirs);
-        if next_files.len() + next_dirs.len() - 1 > MAX_ENTRIES {
-            return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
-        }
-        if self.quota != 0 && used > self.quota {
-            return Err("fs quota exceeded".to_string());
-        }
-        self.files = next_files;
-        self.dirs = next_dirs;
-        self.used = used;
-        Ok(())
+        Ok(growth * count)
     }
 
     /// Re-keys a directory subtree under a new path.
@@ -551,243 +571,91 @@ impl RamFs {
         self.dirs.remove(from);
         self.dirs.insert(to.to_string());
     }
+
+    /// Restores a snapshot, merging into the current state. All-or-nothing:
+    /// a snapshot that would break the caps or the quota, or that clashes
+    /// with existing entries, changes nothing. With a quota set, a payload
+    /// larger than four quotas plus 1 MiB is rejected before parsing, so a
+    /// hostile snapshot cannot make the host allocate unboundedly.
+    pub(crate) fn restore(&mut self, json: &str) -> FsResult<()> {
+        if self.quota != 0 && json.len() as u64 > self.quota.saturating_mul(4).saturating_add(1 << 20)
+        {
+            return Err(format!(
+                "snapshot too large for the quota ({} bytes)",
+                json.len()
+            ));
+        }
+        let snap = crate::snapshot::parse(json)?;
+        self.apply_snapshot(snap)
+    }
+
+    /// Validates the merge as a delta against the current state, then
+    /// commits. Every ancestor of a restored entry becomes a directory, so
+    /// stat, exists and readdir see one uniform tree even for legacy
+    /// snapshots.
+    fn apply_snapshot(&mut self, snap: crate::snapshot::Snapshot) -> FsResult<()> {
+        let plan = self.plan_restore(&snap)?;
+        for d in plan.new_dirs {
+            self.dirs.insert(d);
+        }
+        for (p, bytes) in snap.files {
+            self.files.insert(p, bytes);
+        }
+        self.used = (self.used as i64 + plan.used_delta) as u64;
+        Ok(())
+    }
+
+    /// The delta a restore would apply: new directories, replaced and
+    /// added files, and the resulting usage and entry counts. A path that
+    /// is currently a file cannot become a directory (consistent with
+    /// write/mkdir), and a snapshot file cannot land on any directory.
+    fn plan_restore(&self, snap: &crate::snapshot::Snapshot) -> FsResult<RestorePlan> {
+        let mut want = snap.dirs.clone();
+        for d in &snap.dirs {
+            want.extend(ancestors(d));
+        }
+        for (p, _) in &snap.files {
+            want.extend(ancestors(p));
+        }
+        let mut new_dirs = Vec::new();
+        for d in &want {
+            if self.files.contains_key(d) {
+                return Err(format!("not a directory: {}", d));
+            }
+            if !self.dirs.contains(d) {
+                new_dirs.push(d.clone());
+            }
+        }
+        let mut delta = 0i64;
+        let mut added = new_dirs.len();
+        for d in &new_dirs {
+            delta += dir_cost(d) as i64;
+        }
+        for (p, bytes) in &snap.files {
+            if want.contains(p) || self.dirs.contains(p) {
+                return Err(format!("is a directory: {}", p));
+            }
+            let old = self.files.get(p).map_or(0, |d| file_cost(p, d.len()));
+            delta += file_cost(p, bytes.len()) as i64 - old as i64;
+            added += usize::from(old == 0);
+        }
+        let entries_after = self.entries() + added;
+        if entries_after > MAX_ENTRIES {
+            return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
+        }
+        if self.quota != 0 && (self.used as i64 + delta) > self.quota as i64 {
+            return Err("fs quota exceeded".to_string());
+        }
+        Ok(RestorePlan {
+            new_dirs,
+            used_delta: delta,
+        })
+    }
 }
 
 fn rekey(path: &str, from: &str, to: &str) -> String {
     format!("{}{}", to, &path[from.len()..])
 }
-
-/// Standard base64 with padding, in ~30 lines so the snapshot format needs
-/// no extra crate.
-mod b64 {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    pub(super) fn encode(data: &[u8]) -> String {
-        let digit = |v: u32| ALPHABET[(v & 63) as usize] as char;
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for chunk in data.chunks(3) {
-            let mut b = [0u8; 3];
-            b[..chunk.len()].copy_from_slice(chunk);
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            out.push(digit(n >> 18));
-            out.push(digit(n >> 12));
-            out.push(if chunk.len() > 1 { digit(n >> 6) } else { '=' });
-            out.push(if chunk.len() > 2 { digit(n) } else { '=' });
-        }
-        out
-    }
-
-    pub(super) fn decode(s: &str) -> Option<Vec<u8>> {
-        let b = s.as_bytes();
-        if !b.len().is_multiple_of(4) {
-            return None;
-        }
-        let mut out = Vec::with_capacity(b.len() / 4 * 3);
-        for chunk in b.chunks(4) {
-            let pad = chunk.iter().filter(|&&c| c == b'=').count();
-            // Padding is only ever trailing, and at most two characters.
-            if pad > 2 || chunk[..4 - pad].contains(&b'=') {
-                return None;
-            }
-            let mut n = 0u32;
-            for (i, &c) in chunk.iter().enumerate() {
-                let v = if c == b'=' {
-                    0
-                } else {
-                    ALPHABET.iter().position(|&a| a == c)? as u32
-                };
-                n |= v << (18 - 6 * i);
-            }
-            out.push((n >> 16) as u8);
-            if pad < 2 {
-                out.push((n >> 8) as u8);
-            }
-            if pad < 1 {
-                out.push(n as u8);
-            }
-        }
-        Some(out)
-    }
-}
-
-/// The `stat()` result: kind plus a size that means content bytes for files
-/// and immediate child count for directories.
-#[derive(Debug)]
-pub(crate) struct Stat {
-    pub(crate) is_dir: bool,
-    pub(crate) size: u64,
-}
-
-fn str_local<'s>(scope: &mut v8::HandleScope<'s>, s: &str) -> v8::Local<'s, v8::String> {
-    v8::String::new_from_utf8(scope, s.as_bytes(), v8::NewStringType::Normal).unwrap()
-}
-
-fn str_array<'s>(scope: &mut v8::HandleScope<'s>, names: Vec<String>) -> v8::Local<'s, v8::Array> {
-    let array = v8::Array::new(scope, names.len() as i32);
-    for (i, name) in names.iter().enumerate() {
-        let s = str_local(scope, name);
-        array.set_index(scope, i as u32, s.into());
-    }
-    array
-}
-
-/// Reads a boolean option (`{recursive: true}` style) off an argument.
-fn opt_flag(
-    scope: &mut v8::HandleScope,
-    args: &v8::FunctionCallbackArguments,
-    idx: i32,
-    name: &str,
-) -> bool {
-    let v = args.get(idx);
-    if !v.is_object() {
-        return false;
-    }
-    match v8::Local::<v8::Object>::try_from(v) {
-        Ok(obj) => {
-            let key = str_local(scope, name);
-            obj.get(scope, key.into()).is_some_and(|flag| flag.boolean_value(scope))
-        }
-        Err(_) => false,
-    }
-}
-
-/// Extracts write() data: a string's UTF-8 bytes, a typed array's or
-/// DataView's contents, or a whole ArrayBuffer's backing store. Views are
-/// copied with their byte_offset/length honored, so a small view over a
-/// large buffer writes only what it can see.
-fn arg_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Option<Vec<u8>> {
-    if v.is_string() {
-        return Some(to_rust_string(scope, &v).into_bytes());
-    }
-    if v.is_array_buffer_view() {
-        let view = v8::Local::<v8::ArrayBufferView>::try_from(v).ok()?;
-        let mut buf = vec![0u8; view.byte_length()];
-        view.copy_contents(&mut buf);
-        return Some(buf);
-    }
-    if v.is_array_buffer() {
-        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(v).ok()?;
-        let view = v8::Uint8Array::new(scope, buffer, 0, buffer.byte_length())?;
-        let mut buf = vec![0u8; view.byte_length()];
-        view.copy_contents(&mut buf);
-        return Some(buf);
-    }
-    None
-}
-
-guest_cb!(fs_read, |args, rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    match world_mut(scope).fs.read_string(&path) {
-        Ok(text) => rv.set(str_local(scope, &text).into()),
-        Err(e) => throw(scope, &e),
-    }
-});
-
-guest_cb!(fs_read_bytes, |args, rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    let bytes = match world_mut(scope).fs.read_bytes(&path) {
-        Ok(b) => b,
-        Err(e) => return throw(scope, &e),
-    };
-    // The backing store owns the bytes; the Uint8Array is a view over it.
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
-    let len = store.byte_length();
-    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
-    let view = v8::Uint8Array::new(scope, buffer, 0, len).unwrap();
-    rv.set(view.into());
-});
-
-guest_cb!(fs_write, |args, _rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    let data = match arg_bytes(scope, args.get(1)) {
-        Some(d) => d,
-        None => return throw(scope, "write data must be a string, ArrayBuffer, or typed array"),
-    };
-    if let Err(e) = world_mut(scope).fs.write(&path, data) {
-        throw(scope, &e);
-    }
-});
-
-guest_cb!(fs_list, |args, rv, scope| {
-    let dir = if args.length() > 0 && !args.get(0).is_undefined() {
-        to_rust_string(scope, &args.get(0))
-    } else {
-        "/".to_string()
-    };
-    match world_mut(scope).fs.list(&dir) {
-        Ok(names) => rv.set(str_array(scope, names).into()),
-        Err(e) => throw(scope, &e),
-    }
-});
-
-guest_cb!(fs_remove, |args, rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    let recursive = opt_flag(scope, &args, 1, "recursive");
-    if let Err(e) = world_mut(scope).fs.remove(&path, recursive) {
-        throw(scope, &e);
-    }
-    rv.set(v8::Boolean::new(scope, true).into());
-});
-
-guest_cb!(fs_mkdir, |args, _rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    let recursive = opt_flag(scope, &args, 1, "recursive");
-    if let Err(e) = world_mut(scope).fs.mkdir(&path, recursive) {
-        throw(scope, &e);
-    }
-});
-
-guest_cb!(fs_exists, |args, rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    let hit = world_mut(scope).fs.exists(&path);
-    rv.set(v8::Boolean::new(scope, hit).into());
-});
-
-guest_cb!(fs_stat, |args, rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    let st = match world_mut(scope).fs.stat(&path) {
-        Ok(st) => st,
-        Err(e) => return throw(scope, &e),
-    };
-    let obj = v8::Object::new(scope);
-    let ty = if st.is_dir { "dir" } else { "file" };
-    let key = str_local(scope, "type");
-    let ty = str_local(scope, ty);
-    obj.set(scope, key.into(), ty.into());
-    let key = str_local(scope, "size");
-    let num = v8::Number::new(scope, st.size as f64);
-    obj.set(scope, key.into(), num.into());
-    rv.set(obj.into());
-});
-
-guest_cb!(fs_readdir, |args, rv, scope| {
-    let path = to_rust_string(scope, &args.get(0));
-    match world_mut(scope).fs.readdir(&path) {
-        Ok(names) => rv.set(str_array(scope, names).into()),
-        Err(e) => throw(scope, &e),
-    }
-});
-
-guest_cb!(fs_rename, |args, _rv, scope| {
-    let from = to_rust_string(scope, &args.get(0));
-    let to = to_rust_string(scope, &args.get(1));
-    if let Err(e) = world_mut(scope).fs.rename(&from, &to) {
-        throw(scope, &e);
-    }
-});
-
-guest_cb!(fs_snapshot, |_args, rv, scope| {
-    let json = world_mut(scope).fs.snapshot_json();
-    rv.set(str_local(scope, &json).into());
-});
-
-guest_cb!(fs_restore, |args, _rv, scope| {
-    let json = to_rust_string(scope, &args.get(0));
-    if let Err(e) = world_mut(scope).fs.restore(&json) {
-        throw(scope, &e);
-    }
-});
 
 #[cfg(test)]
 mod tests {
@@ -805,12 +673,15 @@ mod tests {
         assert_eq!(normalize("a/b").unwrap_err(), "path must be absolute: a/b");
         assert_eq!(normalize("///").unwrap(), "/");
         assert!(normalize("/a/\0").unwrap_err().starts_with("path contains NUL"));
+        assert!(normalize("/a/\u{fffd}")
+            .unwrap_err()
+            .starts_with("path contains U+FFFD"));
     }
 
     #[test]
     fn write_creates_parents_and_reads_back() {
         let mut f = fs();
-        f.write("/a/b/c.txt", "hi".into()).unwrap();
+        f.write("/a/b/c.txt", b"hi".to_vec()).unwrap();
         assert_eq!(f.read_string("/a/b/c.txt").unwrap(), "hi");
         assert!(f.exists("/a") && f.exists("/a/b"));
         assert_eq!(f.readdir("/a").unwrap(), vec!["b".to_string()]);
@@ -820,11 +691,14 @@ mod tests {
     fn write_rejects_directory_and_file_conflicts() {
         let mut f = fs();
         f.mkdir("/d", false).unwrap();
-        assert_eq!(f.write("/d", "x".into()).unwrap_err(), "is a directory: /d");
-        f.write("/f", "x".into()).unwrap();
+        assert_eq!(f.write("/d", b"x".to_vec()).unwrap_err(), "is a directory: /d");
+        f.write("/f", b"x".to_vec()).unwrap();
         assert_eq!(f.mkdir("/f", false).unwrap_err(), "already exists: /f");
         assert_eq!(f.mkdir("/f/x", false).unwrap_err(), "not a directory: /f");
-        assert_eq!(f.write("/f/x", "x".into()).unwrap_err(), "not a directory: /f");
+        assert_eq!(
+            f.write("/f/x", b"x".to_vec()).unwrap_err(),
+            "not a directory: /f"
+        );
     }
 
     #[test]
@@ -840,9 +714,9 @@ mod tests {
     #[test]
     fn stat_reports_kind_and_size() {
         let mut f = fs();
-        f.write("/f.txt", "héllo".into()).unwrap(); // 6 UTF-8 bytes
+        f.write("/f.txt", "héllo".as_bytes().to_vec()).unwrap(); // 6 UTF-8 bytes
         f.mkdir("/d", false).unwrap();
-        f.write("/d/x", "1".into()).unwrap();
+        f.write("/d/x", b"1".to_vec()).unwrap();
         f.mkdir("/d/sub", false).unwrap();
         let file = f.stat("/f.txt").unwrap();
         assert_eq!((file.is_dir, file.size), (false, 6));
@@ -854,39 +728,148 @@ mod tests {
     #[test]
     fn list_is_recursive_full_paths_files_only() {
         let mut f = fs();
-        f.write("/d/a.txt", "A".into()).unwrap();
-        f.write("/d/e/b.txt", "B".into()).unwrap();
+        f.write("/d/a.txt", b"A".to_vec()).unwrap();
+        f.write("/d/e/b.txt", b"B".to_vec()).unwrap();
         f.mkdir("/d/empty", false).unwrap();
         assert_eq!(
             f.list("/d").unwrap(),
             vec!["/d/a.txt".to_string(), "/d/e/b.txt".to_string()]
         );
         assert_eq!(f.list("/d/empty").unwrap(), Vec::<String>::new());
-        assert_eq!(f.list("/d/a.txt").unwrap_err(), "not a directory: /d/a.txt");
+        assert_eq!(
+            f.list("/d/a.txt").unwrap_err(),
+            "not a directory: /d/a.txt"
+        );
+    }
+
+    #[test]
+    fn listing_a_dir_ignores_longer_sibling_prefixes() {
+        let mut f = fs();
+        f.write("/a/x", b"1".to_vec()).unwrap();
+        f.write("/ab/y", b"2".to_vec()).unwrap();
+        f.mkdir("/ab/d", false).unwrap();
+        assert_eq!(f.list("/a").unwrap(), vec!["/a/x".to_string()]);
+        assert_eq!(f.readdir("/a").unwrap(), vec!["x".to_string()]);
+        assert_eq!(
+            f.readdir("/ab").unwrap(),
+            vec!["d".to_string(), "y".to_string()]
+        );
     }
 
     #[test]
     fn readdir_lists_immediate_children_only() {
         let mut f = fs();
-        f.write("/d/a.txt", "A".into()).unwrap();
+        f.write("/d/a.txt", b"A".to_vec()).unwrap();
         f.mkdir("/d/sub", false).unwrap();
-        f.write("/d/sub/deep.txt", "D".into()).unwrap();
-        assert_eq!(f.readdir("/d").unwrap(), vec!["a.txt".to_string(), "sub".to_string()]);
-        assert_eq!(f.readdir("/d/a.txt").unwrap_err(), "not a directory: /d/a.txt");
+        f.write("/d/sub/deep.txt", b"D".to_vec()).unwrap();
+        assert_eq!(
+            f.readdir("/d").unwrap(),
+            vec!["a.txt".to_string(), "sub".to_string()]
+        );
+        assert_eq!(
+            f.readdir("/d/a.txt").unwrap_err(),
+            "not a directory: /d/a.txt"
+        );
         assert_eq!(f.readdir("/missing").unwrap_err(), "no such file: /missing");
+    }
+
+    #[test]
+    fn remove_handles_files_dirs_and_subtrees() {
+        let mut f = fs();
+        f.write("/d/a.txt", b"A".to_vec()).unwrap();
+        f.remove("/d/a.txt", false).unwrap();
+        assert_eq!(
+            f.remove("/d/a.txt", false).unwrap_err(),
+            "no such file: /d/a.txt"
+        );
+        f.mkdir("/d/sub", false).unwrap();
+        assert_eq!(
+            f.remove("/d", false).unwrap_err(),
+            "directory not empty: /d"
+        );
+        f.remove("/d", true).unwrap();
+        assert!(!f.exists("/d") && !f.exists("/d/sub"));
+        assert_eq!(f.remove("/", true).unwrap_err(), "cannot remove root");
+    }
+
+    #[test]
+    fn rename_moves_and_replaces() {
+        let mut f = fs();
+        f.write("/a.txt", b"1".to_vec()).unwrap();
+        f.write("/b.txt", b"2".to_vec()).unwrap();
+        f.rename("/a.txt", "/b.txt").unwrap();
+        assert_eq!(f.read_string("/b.txt").unwrap(), "1");
+        assert!(!f.exists("/a.txt"));
+
+        f.mkdir("/d", false).unwrap();
+        f.write("/d/x", b"X".to_vec()).unwrap();
+        f.mkdir("/e", false).unwrap();
+        f.rename("/d", "/e").unwrap();
+        assert_eq!(f.read_string("/e/x").unwrap(), "X");
+        assert!(f.exists("/e") && !f.exists("/d"));
+    }
+
+    #[test]
+    fn rename_rejects_bad_targets() {
+        let mut f = fs();
+        f.write("/f", b"1".to_vec()).unwrap();
+        f.mkdir("/d", false).unwrap();
+        f.mkdir("/d/sub", false).unwrap();
+        assert_eq!(
+            f.rename("/missing", "/x").unwrap_err(),
+            "no such file: /missing"
+        );
+        assert_eq!(f.rename("/f", "/d").unwrap_err(), "is a directory: /d");
+        assert_eq!(f.rename("/d", "/f").unwrap_err(), "not a directory: /f");
+        assert_eq!(
+            f.rename("/d", "/d/sub").unwrap_err(),
+            "cannot rename a directory into itself: /d/sub"
+        );
+        f.write("/deep/x", b"1".to_vec()).unwrap();
+        assert_eq!(f.rename("/deep", "/nope/x").unwrap_err(), "no such file: /nope");
+        // onto a non-empty directory
+        f.mkdir("/full", false).unwrap();
+        f.write("/full/kid", b"k".to_vec()).unwrap();
+        assert_eq!(
+            f.rename("/d", "/full").unwrap_err(),
+            "directory not empty: /full"
+        );
+        // rename onto itself is the POSIX no-op success
+        f.rename("/f", "/f").unwrap();
+        assert_eq!(f.read_string("/f").unwrap(), "1");
+    }
+
+    #[test]
+    fn rename_refuses_re_keyed_paths_past_the_cap() {
+        let mut f = fs();
+        let deep = format!("/a/{}/x", "b".repeat(MAX_PATH_BYTES - 5));
+        assert_eq!(deep.len(), MAX_PATH_BYTES);
+        f.write(&deep, b"1".to_vec()).unwrap();
+        // Renaming /a to /cccccc would push the child past the cap.
+        let err = f.rename("/a", "/cccccc").unwrap_err();
+        assert_eq!(err, format!("path too long after rename (max {})", MAX_PATH_BYTES));
+        assert!(f.exists(&deep)); // nothing moved
+        // A same-length destination re-keys within the cap.
+        f.rename("/a", "/z").unwrap();
+        let moved = format!("/z/{}/x", "b".repeat(MAX_PATH_BYTES - 5));
+        assert!(f.exists(&moved));
     }
 
     #[test]
     fn binary_contents_roundtrip_and_lossy_read() {
         let mut f = fs();
         f.write("/b.bin", vec![0xff, 0xfe, 0x00, b'A']).unwrap();
-        assert_eq!(f.read_bytes("/b.bin").unwrap(), vec![0xff, 0xfe, 0x00, b'A']);
+        assert_eq!(
+            f.read_bytes("/b.bin").unwrap(),
+            vec![0xff, 0xfe, 0x00, b'A']
+        );
         let text = f.read_string("/b.bin").unwrap();
         assert_eq!(text.chars().count(), 4); // two U+FFFD chars + NUL + 'A'
         assert_eq!(text, "\u{fffd}\u{fffd}\0A");
         f.write("/empty", Vec::new()).unwrap();
         assert_eq!(f.read_string("/empty").unwrap(), "");
         assert_eq!(f.stat("/empty").unwrap().size, 0);
+        assert_eq!(f.read_bytes("/missing").unwrap_err(), "no such file: /missing");
     }
 
     #[test]
@@ -899,8 +882,9 @@ mod tests {
     }
 
     #[test]
-    fn quota_exact_fit_passes_one_more_byte_fails() {
-        let mut f = RamFs::new(ENTRY_OVERHEAD + 10);
+    fn quota_counts_keys_directories_and_content() {
+        // "/f" is 2 bytes of key: 64 overhead + 2 key + 10 content = 76.
+        let mut f = RamFs::new(76);
         f.write("/f", vec![0u8; 10]).unwrap(); // fills the quota exactly
         assert_eq!(f.write("/f", vec![0u8; 11]).unwrap_err(), "fs quota exceeded");
         assert_eq!(f.read_bytes("/f").unwrap().len(), 10); // unchanged after failure
@@ -911,33 +895,77 @@ mod tests {
     }
 
     #[test]
-    fn quota_counts_directories_and_survives_structural_ops() {
-        let mut f = RamFs::new(ENTRY_OVERHEAD * 2 + 1);
-        f.mkdir("/d", true).unwrap(); // 64
-        f.write("/d/a", vec![1]).unwrap(); // +65 = 129, the whole quota
+    fn long_keys_hit_the_quota_early() {
+        // ~2997-byte keys: each empty file costs 64 + key bytes.
+        let base = format!("/k{}", "a".repeat(2995));
+        let one = 64 + base.len() as u64;
+        let mut f = RamFs::new(one); // room for exactly one
+        assert!(f.write(&base, Vec::new()).is_ok());
+        assert_eq!(
+            f.write(&format!("{}2", base), Vec::new()).unwrap_err(),
+            "fs quota exceeded"
+        );
+        // With a flat 64-byte rule a 100_000 quota would hold ~1500 of
+        // these; charging keys must cut that to a few dozen.
+        let mut roomy = RamFs::new(100_000);
+        let mut wrote = 0u64;
+        while roomy.write(&format!("{}{}", base, wrote), Vec::new()).is_ok() {
+            wrote += 1;
+        }
+        assert!(
+            (wrote * one..(wrote + 1) * one).contains(&100_000) || wrote * one <= 100_000,
+            "wrote {}",
+            wrote
+        );
+        assert!(wrote < 100, "keys must be charged: {} entries fit", wrote);
+    }
+
+    #[test]
+    fn quota_survives_structural_ops() {
+        // "/d" costs 66, "/d/a" with one byte costs 70: 136 total.
+        let mut f = RamFs::new(136);
+        f.mkdir("/d", true).unwrap();
+        f.write("/d/a", vec![1]).unwrap();
         assert_eq!(f.write("/d/b", vec![1]).unwrap_err(), "fs quota exceeded");
         assert!(!f.exists("/d/b"));
         f.remove("/d/a", false).unwrap(); // free the file, keep the dir
         f.rename("/d", "/e").unwrap(); // re-keying must not double-count
         f.write("/e/b", vec![1]).unwrap();
         assert!(f.exists("/e/b") && !f.exists("/d"));
-        let mut f2 = RamFs::new(0); // 0 disables the quota entirely
-        f2.write("/x", vec![0u8; 8192]).unwrap();
-        assert_eq!(f2.read_bytes("/x").unwrap().len(), 8192);
+        let mut off = RamFs::new(0); // 0 disables the quota entirely
+        off.write("/x", vec![0u8; 8192]).unwrap();
+        assert_eq!(off.read_bytes("/x").unwrap().len(), 8192);
+    }
+
+    #[test]
+    fn rename_growth_is_quota_checked() {
+        let mut f = RamFs::new(file_cost("/a", 0)); // exactly one empty file
+        f.write("/a", Vec::new()).unwrap();
+        // Renaming to the longer /bbbbbb would grow past the quota.
+        assert_eq!(f.rename("/a", "/bbbbbb").unwrap_err(), "fs quota exceeded");
+        assert!(f.exists("/a"));
     }
 
     #[test]
     fn path_and_entry_caps_have_clear_errors() {
         let mut f = fs();
         let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
-        assert!(f.write(&long, vec![]).unwrap_err().starts_with("path too long"));
+        assert!(
+            f.write(&long, Vec::new())
+                .unwrap_err()
+                .starts_with("path too long")
+        );
         let exact = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
-        f.write(&exact, vec![]).unwrap(); // at the cap is fine
+        f.write(&exact, Vec::new()).unwrap(); // at the cap is fine
         let mut full = fs();
         for i in 0..MAX_ENTRIES {
             full.mkdir(&format!("/d{}", i), false).unwrap();
         }
-        assert!(full.mkdir("/over", false).unwrap_err().contains("fs entry limit exceeded"));
+        assert!(
+            full.mkdir("/over", false)
+                .unwrap_err()
+                .contains("fs entry limit exceeded")
+        );
     }
 
     #[test]
@@ -949,134 +977,65 @@ mod tests {
         f.remove("/m", false).unwrap();
         f.rename("/a", "/z").unwrap();
         f.write("/z/b/c", vec![9]).unwrap();
-        let recount = f.files.values().map(|d| file_cost(d.len())).sum::<u64>()
-            + ENTRY_OVERHEAD * (f.dirs.len() as u64 - 1); // root is free
-        assert_eq!(f.used, recount);
+        assert_eq!(f.used, usage(&f.files, &f.dirs));
     }
 
     #[test]
-    fn b64_roundtrips_everything_and_rejects_junk() {
-        let all: Vec<u8> = (0..=255u8).collect();
-        for len in [0, 1, 2, 3, 4, 5, 63, 64, 255, 256] {
-            let data = &all[..len];
-            assert_eq!(b64::decode(&b64::encode(data)).unwrap(), data, "len {}", len);
+    fn restore_rejects_a_directory_landing_on_a_file() {
+        let mut f = fs();
+        f.write("/a", b"x".to_vec()).unwrap();
+        let snap = r#"{"version":2,"files":{},"dirs":["/a/b"]}"#.to_string();
+        assert_eq!(f.restore(&snap).unwrap_err(), "not a directory: /a");
+        assert_eq!(f.read_string("/a").unwrap(), "x"); // atomic: still there
+    }
+
+    #[test]
+    fn restore_rejects_a_file_landing_on_a_directory() {
+        let mut f = fs();
+        f.mkdir("/d", false).unwrap();
+        let snap = r#"{"version":2,"files":{"/d":{"text":"x"}},"dirs":[]}"#.to_string();
+        assert_eq!(f.restore(&snap).unwrap_err(), "is a directory: /d");
+        assert!(f.is_dir("/d") && !f.files.contains_key("/d"));
+    }
+
+    #[test]
+    fn restore_rejects_oversized_payloads_before_parsing() {
+        let mut f = RamFs::new(1024);
+        let big = format!(
+            "{{\"version\":2,\"files\":{{\"/x\":{{\"b64\":\"{}\"}}}}}}",
+            "A".repeat(4 * 1024 + (1 << 20) + 8)
+        );
+        let err = f.restore(&big).unwrap_err();
+        assert!(err.starts_with("snapshot too large for the quota"), "{}", err);
+        assert!(f.list("/").unwrap().is_empty());
+        // just under the wire parses, then fails on the content quota
+        let edge = "A".repeat(4 * 1024 + (1 << 20) - 128);
+        let snap = format!("{{\"version\":2,\"files\":{{\"/x\":{{\"b64\":\"{}\"}}}}}}", edge);
+        assert_eq!(f.restore(&snap).unwrap_err(), "fs quota exceeded");
+    }
+
+    #[test]
+    fn restore_enforces_the_entry_cap_while_walking() {
+        let mut files = String::from("{\"version\":2,\"files\":{");
+        for i in 0..=MAX_ENTRIES {
+            files.push_str(&format!(
+                "\"/f{}\":{{\"text\":\"\"}}{}",
+                i,
+                if i == MAX_ENTRIES { "" } else { "," }
+            ));
         }
-        assert_eq!(b64::encode(b"f"), "Zg==");
-        assert_eq!(b64::encode(b"fo"), "Zm8=");
-        assert_eq!(b64::encode(b"foo"), "Zm9v");
-        assert_eq!(b64::decode("Zm9v").unwrap(), b"foo");
-        assert_eq!(b64::decode("===="), None); // more than two pads
-        assert_eq!(b64::decode("A"), None); // not a multiple of four
-        assert_eq!(b64::decode("Zm9*"), None); // outside the alphabet
-        assert_eq!(b64::decode("Z=9v"), None); // interior padding
+        files.push_str("},\"dirs\":[]}");
+        let mut f = fs();
+        let err = f.restore(&files).unwrap_err();
+        assert!(err.contains("fs entry limit exceeded"), "{}", err);
+        assert!(f.list("/").unwrap().is_empty());
     }
 
     #[test]
-    fn snapshot_v2_roundtrips_text_bytes_and_dirs() {
+    fn restore_merges_and_keeps_unmentioned_entries() {
         let mut f = fs();
-        f.write("/a.txt", b"text".to_vec()).unwrap();
-        f.write("/bin", vec![0xff, 0x00, 0x81]).unwrap();
-        f.mkdir("/empty/deep", true).unwrap();
-        let json = f.snapshot_json();
-        // serde_json's map is a BTreeMap, so the layout is deterministic.
-        assert!(json.starts_with("{\"dirs\":[\"/\",\"/empty\",\"/empty/deep\"],\"files\":"));
-        assert!(json.contains("\"/a.txt\":{\"text\":\"text\"}"));
-        assert!(json.contains("\"/bin\":{\"b64\":\"/wCB\"}"));
-        let mut g = fs();
-        g.restore(&json).unwrap();
-        assert_eq!(g.read_bytes("/a.txt").unwrap(), b"text");
-        assert_eq!(g.read_bytes("/bin").unwrap(), vec![0xff, 0x00, 0x81]);
-        assert!(g.exists("/empty") && g.exists("/empty/deep"));
-        assert_eq!(g.readdir("/empty").unwrap(), vec!["deep".to_string()]);
-        assert_eq!(g.readdir("/empty/deep").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn restore_accepts_the_legacy_flat_map() {
-        let mut f = fs();
-        f.restore(r#"{"/greeting.txt":"hello","/lib/util.js":"u=7"}"#).unwrap();
-        assert_eq!(f.read_string("/greeting.txt").unwrap(), "hello");
-        assert!(f.exists("/lib")); // implicit parents materialize as dirs
-        assert_eq!(f.readdir("/lib").unwrap(), vec!["util.js".to_string()]);
-        // and it merges into existing state like the old per-file writes
         f.write("/keep", b"k".to_vec()).unwrap();
         f.restore("{\"/new\":\"n\"}").unwrap();
         assert!(f.exists("/keep") && f.exists("/new"));
-    }
-
-    #[test]
-    fn restore_is_validated_and_atomic() {
-        let mut f = fs();
-        f.write("/keep", b"k".to_vec()).unwrap();
-        assert!(f.restore("{not json").unwrap_err().contains("invalid snapshot"));
-        assert!(f.restore("[]").unwrap_err().contains("invalid snapshot"));
-        assert!(f.restore("{}").is_ok()); // an empty legacy map is fine
-        let v2 =
-            serde_json::json!({"version": 2, "files": {"/x": "a string, not an object"}});
-        assert!(f.restore(&v2.to_string()).unwrap_err().contains("invalid snapshot"));
-        let bad_b64 = serde_json::json!({"version": 2, "files": {"/x": {"b64": "!!"}}});
-        assert!(f.restore(&bad_b64.to_string()).unwrap_err().contains("bad base64"));
-        assert!(f.restore(r#"{"/../escape": "x"}"#).unwrap_err().contains("path escapes root"));
-        assert!(f.restore(r#"{"n": 1}"#).unwrap_err().contains("old-format values"));
-        // a snapshot that does not fit changes nothing
-        let mut q = RamFs::new(ENTRY_OVERHEAD + 5);
-        let big = serde_json::json!({"version": 2, "files": {"/big": {"text": "0000000000"}}});
-        assert_eq!(q.restore(&big.to_string()).unwrap_err(), "fs quota exceeded");
-        assert!(!q.exists("/big") && q.list("/").unwrap().is_empty());
-        // a file cannot land on a directory the snapshot itself declares
-        let clash = serde_json::json!({"version": 2, "files": {"/d": {"text": "x"}}, "dirs": ["/d"]});
-        assert_eq!(f.restore(&clash.to_string()).unwrap_err(), "is a directory: /d");
-        assert!(f.exists("/keep")); // still untouched by every failure above
-    }
-
-    #[test]
-    fn remove_handles_files_dirs_and_subtrees() {
-        let mut f = fs();
-        f.write("/d/a.txt", "A".into()).unwrap();
-        f.remove("/d/a.txt", false).unwrap();
-        assert_eq!(f.remove("/d/a.txt", false).unwrap_err(), "no such file: /d/a.txt");
-        f.mkdir("/d/sub", false).unwrap();
-        assert_eq!(f.remove("/d", false).unwrap_err(), "directory not empty: /d");
-        f.remove("/d", true).unwrap();
-        assert!(!f.exists("/d") && !f.exists("/d/sub"));
-        assert_eq!(f.remove("/", true).unwrap_err(), "cannot remove root");
-    }
-
-    #[test]
-    fn rename_moves_and_replaces() {
-        let mut f = fs();
-        f.write("/a.txt", "1".into()).unwrap();
-        f.write("/b.txt", "2".into()).unwrap();
-        f.rename("/a.txt", "/b.txt").unwrap();
-        assert_eq!(f.read_string("/b.txt").unwrap(), "1");
-        assert!(!f.exists("/a.txt"));
-
-        f.mkdir("/d", false).unwrap();
-        f.write("/d/x", "X".into()).unwrap();
-        f.mkdir("/e", false).unwrap();
-        f.rename("/d", "/e").unwrap();
-        assert_eq!(f.read_string("/e/x").unwrap(), "X");
-        assert!(f.exists("/e") && !f.exists("/d"));
-    }
-
-    #[test]
-    fn rename_rejects_bad_targets() {
-        let mut f = fs();
-        f.write("/f", "1".into()).unwrap();
-        f.mkdir("/d", false).unwrap();
-        f.mkdir("/d/sub", false).unwrap();
-        assert_eq!(f.rename("/missing", "/x").unwrap_err(), "no such file: /missing");
-        assert_eq!(f.rename("/f", "/d").unwrap_err(), "is a directory: /d");
-        assert_eq!(f.rename("/d", "/f").unwrap_err(), "not a directory: /f");
-        assert_eq!(f.rename("/d", "/d/sub").unwrap_err(), "cannot rename a directory into itself: /d/sub");
-        f.write("/deep/x", "1".into()).unwrap();
-        assert_eq!(f.rename("/deep", "/nope/x").unwrap_err(), "no such file: /nope");
-        // onto a non-empty directory
-        f.mkdir("/full", false).unwrap();
-        f.write("/full/kid", "k".into()).unwrap();
-        assert_eq!(f.rename("/d", "/full").unwrap_err(), "directory not empty: /full");
-        // rename onto itself is a no-op success
-        f.rename("/f", "/f").unwrap();
-        assert_eq!(f.read_string("/f").unwrap(), "1");
     }
 }

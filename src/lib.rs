@@ -19,9 +19,11 @@ mod diag;
 mod event_loop;
 mod exit;
 mod fs;
+mod fs_api;
 mod host;
 mod net;
 mod serve;
+mod snapshot;
 mod stdin;
 mod timers;
 mod watchdog;
@@ -54,8 +56,8 @@ pub struct Config {
     /// True when the entry source was read from stdin, so guest stdin is
     /// already at EOF.
     pub stdin_consumed: bool,
-    /// RAM filesystem quota in bytes: file content plus 64 bytes per file
-    /// or directory entry. 0 disables it. Default 64 MiB.
+    /// RAM filesystem quota in bytes: per entry, content plus path bytes
+    /// plus 64 of bookkeeping. 0 disables it. Default 64 MiB.
     pub fs_quota_bytes: u64,
 }
 
@@ -155,7 +157,14 @@ fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
         }
     };
     let key = v8::String::new(scope, "__PRELOAD__").unwrap();
-    let val = v8::String::new_from_utf8(scope, state.as_bytes(), v8::NewStringType::Normal).unwrap();
+    let val = match v8::String::new_from_utf8(scope, state.as_bytes(), v8::NewStringType::Normal) {
+        Some(v) => v,
+        // Past V8's maximum string length: refuse the run, do not panic.
+        None => {
+            eprintln!("v8vm: preload {:?} is too large to load", preload);
+            return Some(2);
+        }
+    };
     let global = scope.get_current_context().global(scope);
     global.set(scope, key.into(), val.into());
     let mut tc = v8::TryCatch::new(scope);

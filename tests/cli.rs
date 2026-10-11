@@ -169,7 +169,7 @@ fn fs_quota_flag_enforces_the_limit_and_leaves_state_unchanged() {
     // overhead fits exactly, one byte more does not.
     let path = script(
         "quota-cli",
-        "const CAP = 1048576 - 64;
+        "const CAP = 1048576 - 64 - '/f'.length;
          vm.fs.write('/f', new Uint8Array(CAP));
          console.log(vm.fs.stat('/f').size);
          try { vm.fs.write('/f', new Uint8Array(CAP + 1)); console.log('no throw'); }
@@ -178,7 +178,7 @@ fn fs_quota_flag_enforces_the_limit_and_leaves_state_unchanged() {
     );
     let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    assert_eq!(r.stdout, "1048512\nfs quota exceeded 1048512\nfs quota exceeded false\n");
+    assert_eq!(r.stdout, "1048510\nfs quota exceeded 1048510\nfs quota exceeded false\n");
 }
 
 #[test]
@@ -255,6 +255,144 @@ fn restore_in_the_guest_accepts_both_formats_and_reports_bad_ones() {
     );
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, "legacy true\nlegacy\ninvalid snapshot: expected an object\n");
+}
+
+
+#[test]
+fn fs_write_rejects_detached_and_out_of_bounds_views() {
+    let r = run_js(
+        "fs-buffers",
+        "const ab = new ArrayBuffer(8);
+         const view = new Uint8Array(ab);
+         ab.transfer(); // detaches ab and view with it
+         try { vm.fs.write('/d1', view); console.log('view no throw'); }
+         catch (e) { console.log(e.message); }
+         try { vm.fs.write('/d2', ab); console.log('ab no throw'); }
+         catch (e) { console.log(e.message); }
+         const rab = new ArrayBuffer(16, {maxByteLength: 32});
+         const oob = new Uint8Array(rab, 8, 4);
+         rab.resize(4); // the view no longer fits the buffer
+         try { vm.fs.write('/d3', oob); console.log('oob no throw'); }
+         catch (e) { console.log(e.message); }
+         // shared buffers and views over them are accepted
+         const sab = new SharedArrayBuffer(4);
+         const sv = new Uint8Array(sab);
+         sv.set([9, 8, 7, 6]);
+         vm.fs.write('/s1', sv);
+         vm.fs.write('/s2', sab);
+         console.log(Array.from(vm.fs.readBytes('/s1')).join(','), Array.from(vm.fs.readBytes('/s2')).join(','));
+         try { vm.fs.write('/x', 42); console.log('no throw'); } catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "cannot write from a detached ArrayBuffer\ncannot write from a detached ArrayBuffer\ncannot write from an out-of-bounds view\n9,8,7,6 9,8,7,6\nwrite data must be a string, ArrayBuffer, or typed array\n"
+    );
+}
+
+#[test]
+fn fs_paths_reject_lone_surrogates() {
+    let r = run_js(
+        "fs-surrogates",
+        "try { vm.fs.write('/\\uD800', 'x'); console.log('no throw'); } catch (e) { console.log(e.message.startsWith('path contains U+FFFD')); }
+         vm.fs.write('/real', 'x');
+         console.log(vm.fs.exists('/\\uD801'), vm.fs.exists('/\\uFFFD'));
+         try { vm.fs.read('/\\uD800'); } catch (e) { console.log('read:', e.message.startsWith('path contains U+FFFD')); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "true\nfalse false\nread: true\n");
+}
+
+#[test]
+fn fs_path_arguments_propagate_to_string_exceptions() {
+    let r = run_js(
+        "fs-tostring",
+        "try { vm.fs.read({ toString() { throw new Error('boom'); } }); console.log('no throw'); }
+         catch (e) { console.log(e.message); }
+         try { vm.fs.write({ toString() { throw new Error('bad path'); } }, 'x'); console.log('no throw'); }
+         catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "boom\nbad path\n");
+}
+
+#[test]
+fn fs_read_and_read_bytes_of_a_directory_throw() {
+    let r = run_js(
+        "fs-dirs",
+        "vm.fs.mkdir('/d', {recursive: true});
+         for (const f of [() => vm.fs.read('/d'), () => vm.fs.readBytes('/d')]) {
+           try { f(); console.log('no throw'); } catch (e) { console.log(e.message); }
+         }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "is a directory: /d\nis a directory: /d\n");
+}
+
+#[test]
+fn fs_remove_returns_undefined() {
+    let r = run_js(
+        "fs-remove-undef",
+        "vm.fs.write('/f', 'x');
+         const r = vm.fs.remove('/f');
+         console.log(typeof r);",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "undefined\n");
+}
+
+#[test]
+fn restore_rejects_bad_versions_and_non_canonical_base64() {
+    let r = run_js(
+        "restore-strict",
+        "try { vm.restore('{\"version\":3,\"files\":{}}'); } catch (e) { console.log(e.message); }
+         try { vm.restore('{\"version\":2,\"files\":{\"/x\":{\"b64\":\"AA==AAAA\"}}}'); } catch (e) { console.log(e.message); }
+         try { vm.restore('{\"version\":2,\"files\":{\"/x\":{\"b64\":\"AB==\"}}}'); } catch (e) { console.log(e.message); }
+         vm.restore('{\"version\":2,\"files\":{}}');
+         console.log('empty v2 ok');",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(
+        r.stdout,
+        "unsupported snapshot version 3\ninvalid snapshot: bad base64\ninvalid snapshot: bad base64\nempty v2 ok\n"
+    );
+}
+
+#[test]
+fn fs_quota_flag_multiplication_overflow_exits_2() {
+    // 2^64 bytes would need an mb value whose << 20 overflows u64.
+    assert_eq!(v8vm(&["--fs-quota=17592186044416", "-"], b"").code, 2);
+    assert_eq!(v8vm(&["--fs-quota=17592186044415", "-"], b"").code, 0);
+}
+
+#[test]
+fn preload_accepts_relative_legacy_keys() {
+    let fixture =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/legacy-relative.json");
+    let path = script(
+        "legacy-relative",
+        "console.log(vm.fs.read('/rel/a.txt'), vm.fs.read('/abs.txt'), vm.fs.list('/').join(','));",
+    );
+    let r = v8vm(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "relative key ok absolute key ok /abs.txt,/rel/a.txt\n");
+}
+
+#[test]
+fn fs_file_too_large_to_read_as_a_string() {
+    // Above V8's maximum string length (~536.87 M chars), read must throw
+    // a normal guest Error while readBytes still works. Memory-heavy on
+    // purpose: nothing smaller can cross the engine's string limit.
+    let path = script(
+        "fs-huge-read",
+        "vm.fs.write('/f', new Uint8Array(540 * 1024 * 1024));
+         try { vm.fs.read('/f'); console.log('no throw'); }
+         catch (e) { console.log(e.message); }
+         console.log(vm.fs.readBytes('/f').length);",
+    );
+    let r = v8vm(&["--fs-quota=0", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "file too large to read as a string\n566231040\n");
 }
 
 #[test]

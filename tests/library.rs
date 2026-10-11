@@ -117,15 +117,16 @@ fn early_vm_exit_stays_per_run_while_another_guest_is_pending() {
 
 #[test]
 fn fs_quota_boundary_from_the_library_config() {
-    // 10 bytes of content + 64 for the entry itself.
     let cfg = Config {
-        fs_quota_bytes: 74,
+        // 64 bookkeeping + 2 key bytes ("/f") + 10 content.
+        fs_quota_bytes: 76,
         stdin_consumed: true, // hermetic: never touch the harness stdin
         ..Config::new()
     };
     // A 10-byte file fills it exactly; no vm.exit inside try blocks here:
-    // a termination raised in a callback can be caught by guest JS, and
-    // later statements would then overwrite the exit code.
+    // vm.exit returns normally and the guest keeps running until V8's
+    // next stack-guard check, so later statements would overwrite the
+    // exit code (a separate branch owns that fix).
     let exact = "vm.fs.write('/f', '0123456789');";
     assert_eq!(v8vm::run(exact, "quota-exact.js", &cfg), 0);
     // One byte over, on a fresh fs: the write must throw (exit 1).
