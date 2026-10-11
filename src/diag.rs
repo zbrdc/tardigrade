@@ -7,8 +7,11 @@ pub(crate) fn to_rust_string(scope: &mut v8::HandleScope, v: &v8::Value) -> Stri
     }
 }
 
+/// Throws a guest Error. Building the message string cannot fail for any
+/// realistic length (paths are capped at 4096 bytes), but if V8 ever
+/// refuses, an empty message still beats a panic across extern "C".
 pub(crate) fn throw(scope: &mut v8::HandleScope, msg: &str) {
-    let msg = v8::String::new(scope, msg).unwrap();
+    let msg = v8::String::new(scope, msg).unwrap_or_else(|| v8::String::empty(scope));
     let exc = v8::Exception::error(scope, msg);
     scope.throw_exception(exc);
 }

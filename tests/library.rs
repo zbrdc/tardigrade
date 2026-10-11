@@ -126,3 +126,54 @@ fn preload_data_alone_seeds_the_filesystem() {
     let guest = "if (vm.fs.read('/k') !== 'v') vm.exit(9);";
     assert_eq!(v8vm::run(guest, "preload-data.js", &cfg), 0);
 }
+
+#[test]
+fn preload_data_takes_the_same_restore_path_as_a_preload_file() {
+    // A sandboxed host hands over pre-read text; it must meet the same v2,
+    // legacy and version checks a file read does, not a private shortcut.
+    let run_with = |data: &str, guest: &str| {
+        let cfg = Config {
+            preload_data: Some(data.to_string()),
+            stdin_consumed: true,
+            ..Config::new()
+        };
+        v8vm::run(guest, "preload-data-paths.js", &cfg)
+    };
+    let v2 = r#"{"dirs":["/","/d"],"files":{"/d/b.bin":{"b64":"AP8="}},"version":2}"#;
+    let check_v2 = "const b = vm.fs.readBytes('/d/b.bin');
+                    if (b.length !== 2 || b[0] !== 0 || b[1] !== 255) vm.exit(9);";
+    assert_eq!(run_with(v2, check_v2), 0, "v2 snapshot with a binary file");
+    let legacy = r#"{"rel/x.txt":"hi"}"#;
+    assert_eq!(run_with(legacy, "if (vm.fs.read('/rel/x.txt') !== 'hi') vm.exit(9);"), 0);
+    // restore throws on an unknown version, which aborts the run with 2.
+    assert_eq!(run_with(r#"{"version":3}"#, "vm.exit(0);"), 2);
+}
+
+#[test]
+fn fs_quota_boundary_from_the_library_config() {
+    let cfg = Config {
+        // 64 bookkeeping + 2 key bytes ("/f") + 10 content.
+        fs_quota_bytes: 76,
+        stdin_consumed: true, // hermetic: never touch the harness stdin
+        ..Config::new()
+    };
+    // A 10-byte file fills it exactly; no vm.exit inside try blocks here:
+    // vm.exit returns normally and the guest keeps running until V8's
+    // next stack-guard check, so later statements would overwrite the
+    // exit code (a separate branch owns that fix).
+    let exact = "vm.fs.write('/f', '0123456789');";
+    assert_eq!(v8vm::run(exact, "quota-exact.js", &cfg), 0);
+    // One byte over, on a fresh fs: the write must throw (exit 1).
+    let over = "vm.fs.write('/f', '01234567890');";
+    assert_eq!(v8vm::run(over, "quota-over.js", &cfg), 1);
+    // Failure leaves the filesystem unchanged: still the original content.
+    let unchanged = "vm.fs.write('/f', '0123456789');
+                    let ok = false;
+                    try { vm.fs.write('/f', '01234567890'); } catch (e) {
+                      ok = e.message === 'fs quota exceeded'
+                        && vm.fs.stat('/f').size === 10
+                        && vm.fs.read('/f') === '0123456789';
+                    }
+                    if (!ok) throw new Error('fs changed by a failed write');";
+    assert_eq!(v8vm::run(unchanged, "quota-unchanged.js", &cfg), 0);
+}

@@ -26,7 +26,7 @@ check: build
 	@printf 'hello stdin' | $(OUT) examples/echo-stdin.js | grep -qx 'stdin bytes: 11'
 	@P=$(dir $(OUT))fs.json; $(OUT) --dump=$$P examples/ramfs-demo.js >/dev/null; printf 'console.log(vm.fs.list("/").join(","))' | $(OUT) --preload=$$P - | grep -qx '/greeting.txt'
 	@W=$(dir $(OUT))ws.json; printf 'vm.fs.write("/app/app.js", "globalThis.sum = (xs) => xs.reduce((a, b) => a - b, 0);");' | $(OUT) - --dump=$$W >/dev/null; $(OUT) --preload=$$W examples/agent-driver.js >/dev/null 2>&1; test $$? -eq 1
-	@W=$(dir $(OUT))ws.json; printf 'vm.fs.write("/app/app.js", "globalThis.sum = (xs) => xs.reduce((a, b) => a + b, 0);");' | $(OUT) - --preload=$$W --dump=$$W >/dev/null; $(OUT) --preload=$$W examples/agent-driver.js | grep -qx PASS
+	@W=$(dir $(OUT))ws.json; printf 'vm.fs.write("/app/app.js", "globalThis.sum = (xs) => xs.reduce((a, b) => a + b, 0);");' | $(OUT) - --preload=$$W --dump=$$W >/dev/null; R=$$($(OUT) --preload=$$W --dump=$$W examples/agent-driver.js) || exit 1; printf '%s\n' "$$R" | grep -qx PASS
 	@OUT=$(OUT) BRIDGE=$(BRIDGE) bash examples/serve-demo.sh
 	@echo OK
 
@@ -37,7 +37,11 @@ ci:
 	$(MAKE) clippy
 	$(MAKE) check
 
+# Memory-heavy tests (multi-hundred-megabyte guests); not part of ci.
+test-heavy:
+	$(CARGO) test --release $(CARGOFLAGS) -- --ignored
+
 clean:
 	$(CARGO) clean
 
-.PHONY: check clean build test clippy ci
+.PHONY: check clean build test clippy ci test-heavy

@@ -19,15 +19,19 @@ mod diag;
 mod event_loop;
 mod exit;
 mod fs;
+mod fs_api;
 mod host;
 mod net;
 mod serve;
+mod snapshot;
 mod stdin;
 mod timers;
 mod watchdog;
 mod world;
 
 pub mod sandbox;
+
+pub use fs::DEFAULT_FS_QUOTA_BYTES;
 
 use std::io::Write;
 use std::sync::mpsc;
@@ -58,6 +62,9 @@ pub struct Config {
     /// before applying [`sandbox::apply`] (which then denies re-opening it).
     /// Used instead of reading `preload`, and works without it.
     pub preload_data: Option<String>,
+    /// RAM filesystem quota in bytes: per entry, content plus path bytes
+    /// plus 64 of bookkeeping. 0 disables it. Default 64 MiB.
+    pub fs_quota_bytes: u64,
 }
 
 impl Default for Config {
@@ -70,6 +77,7 @@ impl Default for Config {
             dump: None,
             stdin_consumed: false,
             preload_data: None,
+            fs_quota_bytes: DEFAULT_FS_QUOTA_BYTES,
         }
     }
 }
@@ -145,24 +153,49 @@ fn eval_prelude(scope: &mut v8::HandleScope) -> bool {
     true
 }
 
-/// Seeds vm.fs from a snapshot dump; Some(code) aborts the run.
-fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
+/// The preload snapshot text and a name for it in messages; Ok(None) when
+/// no preload was requested, Err(code) for a run that must not start.
+fn preload_text(cfg: &Config) -> Result<Option<(String, String)>, i32> {
     // preload_data is the file the host already read before it applied the
     // sandbox (the sandbox denies re-opening the path), so it wins over, and
-    // works without, the path.
-    let state = match (&cfg.preload_data, &cfg.preload) {
-        (Some(data), _) => data.clone(),
-        (None, Some(path)) => match read_path(path) {
-            Some(state) => state,
-            None => {
-                eprintln!("v8vm: cannot open preload {:?}", path);
-                return Some(2);
-            }
-        },
-        (None, None) => return None,
+    // works without, the path. Both feed the same restore path in
+    // apply_preload, so sandboxed and plain runs accept and refuse exactly
+    // the same snapshots.
+    let name = match &cfg.preload {
+        Some(path) => format!("{:?}", path),
+        None => "data".to_string(),
+    };
+    if let Some(data) = &cfg.preload_data {
+        return Ok(Some((data.clone(), name)));
+    }
+    let Some(path) = &cfg.preload else {
+        return Ok(None);
+    };
+    match read_path(path) {
+        Some(state) => Ok(Some((state, name))),
+        None => {
+            eprintln!("v8vm: cannot open preload {}", name);
+            Err(2)
+        }
+    }
+}
+
+/// Seeds vm.fs from a snapshot dump; Some(code) aborts the run.
+fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
+    let (state, name) = match preload_text(cfg) {
+        Ok(Some(found)) => found,
+        Ok(None) => return None,
+        Err(code) => return Some(code),
     };
     let key = v8::String::new(scope, "__PRELOAD__").unwrap();
-    let val = v8::String::new_from_utf8(scope, state.as_bytes(), v8::NewStringType::Normal).unwrap();
+    let val = match v8::String::new_from_utf8(scope, state.as_bytes(), v8::NewStringType::Normal) {
+        Some(v) => v,
+        // Past V8's maximum string length: refuse the run, do not panic.
+        None => {
+            eprintln!("v8vm: preload {} is too large to load", name);
+            return Some(2);
+        }
+    };
     let global = scope.get_current_context().global(scope);
     global.set(scope, key.into(), val.into());
     let mut tc = v8::TryCatch::new(scope);
@@ -196,21 +229,25 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
     1
 }
 
-fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) {
-    let mut tc = v8::TryCatch::new(scope);
-    match eval_src(&mut tc, "vm.snapshot()", "dump") {
-        Some(v) => {
-            let json = diag::to_rust_string(&mut tc, &v);
-            if std::fs::write(dump, json).is_err() {
-                eprintln!("v8vm: cannot write dump {:?}", dump);
-            }
+/// Writes the dump straight from the run's RamFs: serialization is pure
+/// Rust over the embedder slot, so no V8 call, no JS, and nothing that
+/// could depend on how the run ended (normal exit, vm.exit, uncaught
+/// exception, timeout). False means the dump could not be produced
+/// (serialize failure or the file could not be written).
+fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
+    let fs = &world_mut(scope).fs;
+    let json = match snapshot::encode(&fs.files, &fs.dirs) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("v8vm: snapshot failed; dump not written: {}", e);
+            return false;
         }
-        None if tc.is_execution_terminating() => {
-            tc.cancel_terminate_execution();
-        }
-        None => {
-            report(&mut tc);
-            eprintln!("v8vm: snapshot failed; dump not written");
+    };
+    match std::fs::write(dump, json) {
+        Ok(()) => true,
+        Err(_) => {
+            eprintln!("v8vm: cannot write dump {:?}", dump);
+            false
         }
     }
 }
@@ -243,7 +280,11 @@ fn execute_inner(
     drop(watchdog);
 
     if let Some(dump) = &spec.cfg.dump {
-        write_dump(scope, dump);
+        // EX_IOERR: the run was asked to produce a dump and could not.
+        // A guest that already failed keeps its own exit code.
+        if !write_dump(scope, dump) && code == 0 {
+            code = 74;
+        }
     }
     code
 }
@@ -254,7 +295,7 @@ fn execute(
     cfg: &Config,
     replies: Option<&serve::ReplySink>,
 ) -> i32 {
-    let mut world = World::new();
+    let mut world = World::new(cfg.fs_quota_bytes);
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
 

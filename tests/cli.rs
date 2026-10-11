@@ -141,6 +141,474 @@ fn ramfs_read_write_list_remove() {
 }
 
 #[test]
+fn fs_stores_bytes_and_write_accepts_strings_arrays_and_views() {
+    let r = run_js(
+        "fsbytes",
+        "vm.fs.write('/b.bin', new Uint8Array([255, 254, 0, 65]));
+         const bs = vm.fs.readBytes('/b.bin');
+         console.log(bs.constructor.name, bs.length, bs[0], bs[3]);
+         const u8 = new Uint8Array([1, 2, 3, 4]);
+         vm.fs.write('/v.bin', u8.buffer);
+         vm.fs.write('/dv.bin', new DataView(u8.buffer));
+         vm.fs.write('/off.bin', new Uint8Array(u8.buffer, 1, 2));
+         vm.fs.write('/s.bin', 'hé');
+         vm.fs.write('/z', new Uint8Array(0));
+         const rd = (p) => Array.from(vm.fs.readBytes(p)).join(',');
+         console.log(rd('/v.bin'), rd('/dv.bin'), rd('/off.bin'), rd('/s.bin'), vm.fs.readBytes('/z').length);
+         const text = vm.fs.read('/b.bin');
+         console.log(text.charCodeAt(0) === 0xFFFD, text.charCodeAt(3));
+         try { vm.fs.write('/x', 42); console.log('no throw'); } catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(
+        r.stdout,
+        "Uint8Array 4 255 65\n1,2,3,4 1,2,3,4 2,3 104,195,169 0\ntrue 65\nwrite data must be a string, ArrayBuffer, or typed array\n"
+    );
+}
+
+#[test]
+fn fs_quota_flag_enforces_the_limit_and_leaves_state_unchanged() {
+    // 1 MiB quota; a root-level file of quota minus the 64-byte entry
+    // overhead fits exactly, one byte more does not.
+    let path = script(
+        "quota-cli",
+        "const CAP = 1048576 - 64 - '/f'.length;
+         vm.fs.write('/f', new Uint8Array(CAP));
+         console.log(vm.fs.stat('/f').size);
+         try { vm.fs.write('/f', new Uint8Array(CAP + 1)); console.log('no throw'); }
+         catch (e) { console.log(e.message, vm.fs.stat('/f').size); }
+         try { vm.fs.mkdir('/d', {recursive: true}); } catch (e) { console.log(e.message, vm.fs.exists('/d')); }",
+    );
+    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1048510\nfs quota exceeded 1048510\nfs quota exceeded false\n");
+}
+
+#[test]
+fn fs_quota_zero_disables_the_limit_and_bad_values_exit_2() {
+    let path = script("quota-off", "vm.fs.write('/f', new Uint8Array(1048576 + 1)); console.log(vm.fs.stat('/f').size);");
+    let r = v8vm(&["--fs-quota=0", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1048577\n");
+    assert_eq!(v8vm(&["--fs-quota=x", "-"], b"").code, 2);
+    assert_eq!(v8vm(&["--fs-quota=18446744073709551616", "-"], b"").code, 2);
+}
+
+#[test]
+fn snapshot_reports_version_2_with_text_and_b64_entries() {
+    let r = run_js(
+        "snap-shape",
+        "vm.fs.write('/t.txt', 'plain');
+         vm.fs.write('/b.bin', new Uint8Array([255, 254]));
+         const snap = JSON.parse(vm.snapshot());
+         console.log(snap.version, snap.dirs.join(','), snap.files['/t.txt'].text, snap.files['/b.bin'].b64);",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "2 / plain //4=\n");
+}
+
+#[test]
+fn dump_preload_roundtrips_binary_files_and_dirs() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bin-roundtrip.json");
+    let writer = script(
+        "bin-writer",
+        "vm.fs.write('/img.bin', new Uint8Array([0, 255, 254, 1, 254, 255, 0]));
+         vm.fs.mkdir('/cfg', {recursive: true});
+         vm.fs.write('/cfg/x', 't');",
+    );
+    let w = v8vm(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
+    assert_eq!(w.code, 0, "stderr: {}", w.stderr);
+    let reader = script(
+        "bin-reader",
+        "const b = vm.fs.readBytes('/img.bin');
+         console.log(Array.from(b).join(','), vm.fs.stat('/img.bin').size, vm.fs.exists('/cfg'), vm.fs.read('/cfg/x'), vm.fs.stat('/cfg').type);",
+    );
+    let r = v8vm(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "0,255,254,1,254,255,0 7 true t dir\n");
+}
+
+#[test]
+fn preload_accepts_the_legacy_snapshot_fixture() {
+    let fixture =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/legacy-snapshot.json");
+    let path = script(
+        "legacy-reader",
+        "console.log(vm.fs.read('/greeting.txt'), vm.fs.exists('/lib'), vm.fs.list('/').join(','));
+         vm.run('/lib/util.js');
+         console.log(globalThis.seven);",
+    );
+    let r = v8vm(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "hello from the old format true /greeting.txt,/lib/util.js\n7\n");
+}
+
+#[test]
+fn restore_in_the_guest_accepts_both_formats_and_reports_bad_ones() {
+    let r = run_js(
+        "restore-formats",
+        "vm.fs.write('/now', 'x');
+         vm.restore('{\"/old\":\"legacy\"}');
+         console.log(vm.fs.read('/old'), vm.fs.exists('/now'));
+         const snap = vm.snapshot();
+         vm.fs.remove('/old', {recursive: true});
+         vm.restore(snap);
+         console.log(vm.fs.read('/old'));
+         try { vm.restore('[]'); } catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "legacy true\nlegacy\ninvalid snapshot: expected an object\n");
+}
+
+
+#[test]
+fn fs_write_rejects_detached_but_out_of_bounds_views_write_empty() {
+    let r = run_js(
+        "fs-buffers",
+        "const ab = new ArrayBuffer(8);
+         const view = new Uint8Array(ab);
+         ab.transfer(); // detaches ab and view with it
+         try { vm.fs.write('/d1', view); console.log('view no throw'); }
+         catch (e) { console.log(e.message); }
+         try { vm.fs.write('/d2', ab); console.log('ab no throw'); }
+         catch (e) { console.log(e.message); }
+         const rab = new ArrayBuffer(16, {maxByteLength: 32});
+         const oob = new Uint8Array(rab, 8, 4);
+         rab.resize(4); // the view no longer fits the buffer
+         try { vm.fs.write('/d3', oob); console.log('oob wrote', vm.fs.readBytes('/d3').length, 'bytes'); }
+         catch (e) { console.log('oob threw', e.message); }
+         // shared buffers and views over them are accepted
+         const sab = new SharedArrayBuffer(4);
+         const sv = new Uint8Array(sab);
+         sv.set([9, 8, 7, 6]);
+         vm.fs.write('/s1', sv);
+         vm.fs.write('/s2', sab);
+         console.log(Array.from(vm.fs.readBytes('/s1')).join(','), Array.from(vm.fs.readBytes('/s2')).join(','));
+         try { vm.fs.write('/x', 42); console.log('no throw'); } catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "cannot write from a detached ArrayBuffer\ncannot write from a detached ArrayBuffer\noob wrote 0 bytes\n9,8,7,6 9,8,7,6\nwrite data must be a string, ArrayBuffer, or typed array\n"
+    );
+}
+
+#[test]
+fn fs_partially_and_fully_out_of_bounds_views_write_empty() {
+    // A view left out of bounds by a resizable shrink has byteLength 0,
+    // exactly as the guest sees it, so the write stores an empty file.
+    let r = run_js(
+        "fs-oob-views",
+        "const cases = [];
+         const mk = (off, len) => { const r = new ArrayBuffer(16, {maxByteLength: 32});
+                                    const v = new Uint8Array(r, off, len); r.resize(4); return v; };
+         vm.fs.write('/partial', mk(2, 8));
+         vm.fs.write('/far', mk(8, 4));
+         const dv = (() => { const r = new ArrayBuffer(16, {maxByteLength: 32});
+                             const v = new DataView(r, 8, 4); r.resize(4); return v; })();
+         vm.fs.write('/dv', dv);
+         console.log(vm.fs.readBytes('/partial').length, vm.fs.readBytes('/far').length, vm.fs.readBytes('/dv').length);
+         // regrown: the view is valid again and writes its real bytes
+         const reg = (() => { const r = new ArrayBuffer(16, {maxByteLength: 32});
+                              const v = new Uint8Array(r, 8, 4);
+                              r.resize(4); r.resize(16); v.set([1,2,3,4]); return v; })();
+         vm.fs.write('/reg', reg);
+         console.log(Array.from(vm.fs.readBytes('/reg')).join(','));",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "0 0 0\n1,2,3,4\n");
+}
+
+#[test]
+fn fs_paths_reject_lone_surrogates_but_allow_real_replacement_chars() {
+    let r = run_js(
+        "fs-surrogates",
+        "try { vm.fs.write('/\\uD800', 'x'); console.log('no throw'); } catch (e) { console.log(e.message); }
+         vm.fs.write('/real', 'x');
+         console.log(vm.fs.exists('/\\uD801'));
+         try { vm.fs.read('/\\uD800'); } catch (e) { console.log('read:', e.message); }
+         // a genuine U+FFFD is a legal path byte and must round-trip
+         vm.fs.write('/a\\uFFFDb', 'x');
+         console.log(vm.fs.exists('/a\\uFFFDb'), vm.fs.read('/a\\uFFFDb'));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(
+        r.stdout,
+        "path contains lone surrogates\nfalse\nread: path contains lone surrogates\ntrue x\n"
+    );
+}
+
+#[test]
+fn fs_replacement_char_paths_round_trip_through_dump_and_preload() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fffd-path.json");
+    let writer = script(
+        "fffd-writer",
+        "vm.fs.write('/a\\uFFFDb', 'x'); vm.fs.mkdir('/d\\uFFFD', {recursive: true}); vm.fs.write('/d\\uFFFD/f', 'y');",
+    );
+    let w = v8vm(&[&format!("--dump={}", dump.display()), writer.to_str().unwrap()], b"");
+    assert_eq!(w.code, 0, "stderr: {}", w.stderr);
+    let reader = script(
+        "fffd-reader",
+        "console.log(vm.fs.read('/a\\uFFFDb'), vm.fs.exists('/d\\uFFFD'), vm.fs.read('/d\\uFFFD/f'));\n         console.log(vm.fs.list('/').includes('/a\\uFFFDb'), vm.fs.readdir('/').includes('d\\uFFFD'));\n         console.log(vm.snapshot().includes('a\\uFFFDb'));",
+    );
+    let r = v8vm(&[&format!("--preload={}", dump.display()), reader.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "x true y\ntrue true\ntrue\n");
+}
+
+#[test]
+fn fs_path_arguments_propagate_to_string_exceptions() {
+    let r = run_js(
+        "fs-tostring",
+        "try { vm.fs.read({ toString() { throw new Error('boom'); } }); console.log('no throw'); }
+         catch (e) { console.log(e.message); }
+         try { vm.fs.write({ toString() { throw new Error('bad path'); } }, 'x'); console.log('no throw'); }
+         catch (e) { console.log(e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "boom\nbad path\n");
+}
+
+#[test]
+fn fs_read_and_read_bytes_of_a_directory_throw() {
+    let r = run_js(
+        "fs-dirs",
+        "vm.fs.mkdir('/d', {recursive: true});
+         for (const f of [() => vm.fs.read('/d'), () => vm.fs.readBytes('/d')]) {
+           try { f(); console.log('no throw'); } catch (e) { console.log(e.message); }
+         }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "is a directory: /d\nis a directory: /d\n");
+}
+
+#[test]
+fn fs_remove_returns_undefined() {
+    let r = run_js(
+        "fs-remove-undef",
+        "vm.fs.write('/f', 'x');
+         const r = vm.fs.remove('/f');
+         console.log(typeof r);",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "undefined\n");
+}
+
+#[test]
+fn restore_rejects_bad_versions_and_non_canonical_base64() {
+    let r = run_js(
+        "restore-strict",
+        "try { vm.restore('{\"version\":3,\"files\":{}}'); } catch (e) { console.log(e.message); }
+         try { vm.restore('{\"version\":2,\"files\":{\"/x\":{\"b64\":\"AA==AAAA\"}}}'); } catch (e) { console.log(e.message); }
+         try { vm.restore('{\"version\":2,\"files\":{\"/x\":{\"b64\":\"AB==\"}}}'); } catch (e) { console.log(e.message); }
+         vm.restore('{\"version\":2,\"files\":{}}');
+         console.log('empty v2 ok');",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(
+        r.stdout,
+        "unsupported snapshot version 3\ninvalid snapshot: bad base64\ninvalid snapshot: bad base64\nempty v2 ok\n"
+    );
+}
+
+#[test]
+fn fs_quota_flag_multiplication_overflow_exits_2() {
+    // 2^64 bytes would need an mb value whose << 20 overflows u64.
+    assert_eq!(v8vm(&["--fs-quota=17592186044416", "-"], b"").code, 2);
+    assert_eq!(v8vm(&["--fs-quota=17592186044415", "-"], b"").code, 0);
+}
+
+#[test]
+fn preload_accepts_relative_legacy_keys() {
+    let fixture =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/legacy-relative.json");
+    let path = script(
+        "legacy-relative",
+        "console.log(vm.fs.read('/rel/a.txt'), vm.fs.read('/abs.txt'), vm.fs.list('/').join(','));",
+    );
+    let r = v8vm(&[&format!("--preload={}", fixture), path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "relative key ok absolute key ok /abs.txt,/rel/a.txt\n");
+}
+
+#[test]
+#[ignore] // memory-heavy: run with `make test-heavy`
+fn fs_file_too_large_to_read_as_a_string() {
+    // Above V8's maximum string length (~536.87 M chars), read must throw
+    // a normal guest Error while readBytes still works. Memory-heavy on
+    // purpose: nothing smaller can cross the engine's string limit.
+    let path = script(
+        "fs-huge-read",
+        "vm.fs.write('/f', new Uint8Array(540 * 1024 * 1024));
+         try { vm.fs.read('/f'); console.log('no throw'); }
+         catch (e) { console.log(e.message); }
+         console.log(vm.fs.readBytes('/f').length);",
+    );
+    let r = v8vm(&["--fs-quota=0", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "file too large to read as a string\n566231040\n");
+}
+
+#[test]
+fn restore_rejects_duplicate_paths_and_keeps_the_quota_honest() {
+    // bypass.js shape, scaled: fill the quota, then try to shrink the
+    // file with many spellings of its own path.
+    let path = script(
+        "dup-bypass",
+        "const SIZE = 1048576 - 66;
+         vm.fs.write('/a', new Uint8Array(SIZE));
+         const files = {};
+         for (let i = 1; i <= 50; i++) files['/'.repeat(i) + 'a'] = { text: '' };
+         try { vm.restore(JSON.stringify({ version: 2, files })); console.log('restored'); }
+         catch (e) { console.log(e.message); }
+         console.log('a size', vm.fs.stat('/a').size);
+         try { vm.fs.write('/big', new Uint8Array(1048576)); console.log('over-quota write ok'); }
+         catch (e) { console.log(e.message); }
+         try { vm.restore('{\"b\":\"1\",\"/b\":\"2\"}'); } catch (e) { console.log(e.message); }",
+    );
+    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "duplicate path in snapshot: /a\na size 1048510\nfs quota exceeded\nduplicate path in snapshot: /b\n"
+    );
+}
+
+#[test]
+fn rename_converts_arguments_one_at_a_time() {
+    let r = run_js(
+        "rename-order",
+        "let secondRan = false;
+         try { vm.fs.rename({ toString() { throw new Error('first'); } },
+                            { toString() { secondRan = true; throw new Error('second'); } }); }
+         catch (e) { console.log('caught', e.message, 'secondRan', secondRan); }
+         try { vm.fs.rename('/x', { toString() { throw new Error('to-throws'); } }); }
+         catch (e) { console.log('caught', e.message); }",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "caught first secondRan false\ncaught to-throws\n");
+}
+
+#[test]
+fn write_probes_string_lengths_against_the_quota() {
+    // A multi-byte string is charged by its UTF-8 length, and rejected
+    // before the copy, like buffers are.
+    let path = script(
+        "str-probe",
+        "try { vm.fs.write('/s', '\\u00e9'.repeat(600000)); console.log('no throw'); }
+         catch (e) { console.log(e.message); }
+         vm.fs.write('/s', '\\u00e9'.repeat(100000));
+         console.log(vm.fs.stat('/s').size);
+         try { vm.fs.write('/t', { toString() { throw new Error('never runs'); } }); }
+         catch (e) { console.log(e.message.slice(0, 20)); }",
+    );
+    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "fs quota exceeded\n200000\nwrite data must be a\n");
+}
+
+#[test]
+fn a_failed_dump_exits_74_when_the_guest_succeeded() {
+    let path = script("dump-fail", "vm.fs.write('/f', 'x');");
+    // Writing the dump into a directory fails; the guest itself was fine.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let r = v8vm(&[&format!("--dump={}", dir.display()), path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 74);
+    assert!(r.stderr.contains("cannot write dump"), "stderr: {}", r.stderr);
+    // A guest that already failed keeps its own exit code.
+    let bad = script("dump-fail-2", "throw new Error('boom');");
+    let r2 = v8vm(&[&format!("--dump={}", dir.display()), bad.to_str().unwrap()], b"");
+    assert_eq!(r2.code, 1);
+    // A healthy dump still exits 0.
+    let ok_dump = dir.join("dump-ok.json");
+    let r3 = v8vm(&[&format!("--dump={}", ok_dump.display()), path.to_str().unwrap()], b"");
+    assert_eq!(r3.code, 0);
+}
+
+#[test]
+fn full_quota_control_characters_survive_a_snapshot_round_trip() {
+    // ctrl.js shape, scaled down: JSON escapes control characters to six
+    // bytes each, so the gate must be 6x the quota for a full-quota
+    // filesystem of them to restore from its own snapshot.
+    let path = script(
+        "ctrl-roundtrip",
+        "const base = '/' + '\\u0001'.repeat(3990);
+         let n = 0;
+         try { for (;;) { vm.fs.write(base + n, '\\u0001\\u0001\\u0001'); n++; } }
+         catch (e) { }
+         console.log('quota full after', n, 'files');
+         const snap = vm.snapshot();
+         vm.fs.remove(base + '0', {});
+         vm.restore(snap);
+         console.log('restored', vm.fs.stat('/').size === n, vm.fs.read(base + '0').length);",
+    );
+    // A 1 MiB quota: ~260 long control-character keys fill it, and their
+    // ~6 MB snapshot (control bytes escape to six each) must clear the
+    // 6x gate and restore cleanly - a 4x gate would reject it.
+    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut lines = r.stdout.lines();
+    let full = lines.next().unwrap();
+    assert!(full.starts_with("quota full after "), "stdout: {}", r.stdout);
+    let n: usize = full
+        .trim_start_matches("quota full after ")
+        .trim_end_matches(" files")
+        .parse()
+        .expect("file count");
+    assert!(n > 200, "expected the quota to hold many entries: {}", n);
+    assert_eq!(lines.next().unwrap(), "restored true 3");
+}
+
+#[test]
+fn dump_is_written_for_every_ending() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dump_has_f = |name: &str| {
+        let path = dir.join(name);
+        let json = std::fs::read_to_string(&path).unwrap_or_default();
+        path.exists() && json.contains("\"/f\"")
+    };
+    let endings = [
+        ("vm.exit(0) at top level", "vm.fs.write('/f','x'); vm.exit(0);", 0),
+        ("vm.exit(0) in a timer", "vm.fs.write('/f','x'); setTimeout(() => vm.exit(0), 5);", 0),
+        ("vm.exit(0) in a microtask", "vm.fs.write('/f','x'); Promise.resolve().then(() => vm.exit(0));", 0),
+        ("vm.exit(3)", "vm.fs.write('/f','x'); vm.exit(3);", 3),
+        (
+            "timeout",
+            "vm.fs.write('/f','x'); for (;;) {}",
+            124,
+        ),
+    ];
+    for (i, (what, src, want)) in endings.iter().enumerate() {
+        let script_path = script(&format!("ending-{}", i), src);
+        let dump = dir.join(format!("ending-{}.json", i));
+        let _ = std::fs::remove_file(&dump); // only this run's dump counts
+        let r = v8vm(
+            &[
+                "--timeout=200",
+                &format!("--dump={}", dump.display()),
+                script_path.to_str().unwrap(),
+            ],
+            b"",
+        );
+        assert_eq!(r.code, *want, "{}: exit code (stderr: {})", what, r.stderr);
+        assert!(dump_has_f(&format!("ending-{}.json", i)), "{}: dump missing /f", what);
+    }
+}
+
+#[test]
+fn fs_error_messages_truncate_huge_paths() {
+    let r = run_js(
+        "huge-path-msg",
+        "const p = 'a'.repeat(300000);
+         try { vm.fs.read(p); console.log('no throw'); }
+         catch (e) { console.log(e.message.length < 300, e.message.startsWith('path must be absolute: a'), e.message.endsWith('...')); }
+         console.log(vm.fs.exists(p));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "true true true\nfalse\n");
+}
+
+#[test]
 fn dump_then_preload_restores_the_filesystem() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.json");
     let writer = script("dump-writer", "vm.fs.write('/k', 'v\\u00e9');");
@@ -495,7 +963,10 @@ mod sandbox_run {
         assert_eq!(r.code, 0, "stderr: {}", r.stderr);
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dump).expect("dump file")).expect("dump json");
-        assert_eq!(json, serde_json::json!({"/g": "v"}));
+        assert_eq!(
+            json,
+            serde_json::json!({"dirs": ["/"], "files": {"/g": {"text": "v"}}, "version": 2})
+        );
     }
 
     /// Waits for the child to carry a seccomp filter, so a serve run that

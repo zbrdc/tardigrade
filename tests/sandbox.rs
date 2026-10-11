@@ -1728,7 +1728,10 @@ mod run {
         assert_eq!(out.status.code(), Some(0));
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dump).unwrap()).expect("dump json");
-        assert_eq!(json, serde_json::json!({"/k": "v"}));
+        assert_eq!(
+            json,
+            serde_json::json!({"dirs": ["/"], "files": {"/k": {"text": "v"}}, "version": 2})
+        );
     }
 
     fn v8vm_output(args: &[&str]) -> Output {

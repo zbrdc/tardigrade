@@ -12,6 +12,7 @@ struct Cli {
     dump: Option<std::path::PathBuf>,
     serve: bool,
     sandbox: bool,
+    fs_quota_bytes: u64,
 }
 
 fn parse(argv: &[String]) -> Result<Cli, String> {
@@ -25,6 +26,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         dump: None,
         serve: false,
         sandbox: false,
+        fs_quota_bytes: v8vm::DEFAULT_FS_QUOTA_BYTES,
     };
     for a in argv {
         if a == "--" {
@@ -39,6 +41,11 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.preload = Some(v.into());
         } else if let Some(v) = a.strip_prefix("--dump=") {
             c.dump = Some(v.into());
+        } else if let Some(v) = a.strip_prefix("--fs-quota=") {
+            let mb: u64 = v.parse().map_err(|_| format!("bad --fs-quota: {}", v))?;
+            c.fs_quota_bytes = mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| format!("bad --fs-quota: {}", v))?;
         } else if a == "--serve" {
             c.serve = true;
         } else if a == "--sandbox" {
@@ -60,7 +67,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve {
         return Err(
-            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
+            "usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--preload=<file>] [--dump=<file>] [--serve] [--sandbox] <entry.js or -> [args...]\n       v8vm --sandbox-check"
                 .to_string(),
         );
     }
@@ -108,6 +115,7 @@ fn main() {
         dump: c.dump,
         stdin_consumed,
         preload_data,
+        fs_quota_bytes: c.fs_quota_bytes,
     };
 
     let code = if c.serve {
