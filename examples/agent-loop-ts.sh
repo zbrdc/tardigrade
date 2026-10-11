@@ -42,32 +42,18 @@ ws_write() { # ws_write <path> <content>: store a file in the workspace
 }
 
 # The workspace is RAM-only, so the sources leave it through a tiny guest
-# run; each file is framed by marker lines the parse below reads.
-extract() { # extract <dir>: write the workspace's /app *.ts tree into <dir>
-  local dir=$1 listing line path rel
-  listing=$(mktemp)
-  "$OUT" --preload="$WS" - >"$listing" <<'GUEST'
-for (const p of vm.fs.list("/app")) {
-  if (p.endsWith(".ts")) {
-    console.log("===V8VM_TS_FILE " + p);
-    console.log(vm.fs.read(p));
-    console.log("===V8VM_TS_END " + p);
-  }
-}
-GUEST
-  while IFS= read -r line; do
-    case "$line" in
-      "===V8VM_TS_FILE "*)
-        path=${line#===V8VM_TS_FILE }
-        rel=${path#/app/}
-        mkdir -p "$dir/$(dirname "$rel")"
-        : >"$dir/$rel"
-        ;;
-      "===V8VM_TS_END "*) path= ;;
-      *) if [ -n "$path" ]; then printf '%s\n' "$line" >>"$dir/$rel"; fi ;;
-    esac
-  done <"$listing"
-  rm -f "$listing"
+# run (examples/ts-listing.js): one line per file, path and content each
+# base64-encoded, so file content can never masquerade as framing. The
+# host parser (examples/ts-extract.sh) validates every path before
+# writing and rejects anything unexpected loudly - a FAIL turn.
+extract() { # extract <dir>: write the workspace's /app sources into <dir>
+  local dir=$1 rc=0
+  "$OUT" --preload="$WS" "$DIR/ts-listing.js" \
+    | bash "$DIR/ts-extract.sh" "$dir" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: extraction rejected a workspace file (see message above)"
+    return 1
+  fi
 }
 
 # Checks the extracted sources (a strict tsconfig.json is generated there).

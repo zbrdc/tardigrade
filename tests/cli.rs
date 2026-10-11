@@ -2862,3 +2862,152 @@ for (const [name, obj] of groups) {
         );
     }
 }
+
+/// Standard base64 (RFC 4648, padded) for crafting extraction lines and
+/// payloads in the tests below; the guest encodes with btoa the same way.
+fn b64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Writes `files` into a fresh workspace through one guest run (content as
+/// one argv entry each), the way the loop seeds sources.
+fn seed_workspace(ws: &std::path::Path, files: &[(&str, &str)]) {
+    let _ = std::fs::remove_file(ws);
+    let mut args: Vec<String> = vec!["-".to_string(), format!("--dump={}", ws.display())];
+    let mut program = String::new();
+    for (i, (path, content)) in files.iter().enumerate() {
+        program.push_str(&format!("vm.fs.write(\"{path}\", vm.args[{i}]);\n"));
+        args.push(content.to_string());
+    }
+    let argrefs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let r = v8vm(&argrefs, program.as_bytes());
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+}
+
+/// Runs examples/ts-extract.sh over `lines` into `dir`, like the loop does.
+fn ts_extract(dir: &std::path::Path, lines: &str) -> Run {
+    let mut child = Command::new("/bin/bash")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-extract.sh"))
+        .arg(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ts-extract");
+    let mut pipe = child.stdin.take().unwrap();
+    pipe.write_all(lines.as_bytes()).expect("feed ts-extract");
+    drop(pipe);
+    let out = child.wait_with_output().expect("wait ts-extract");
+    Run {
+        code: out.status.code().expect("exit code"),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+fn tree_files(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
+/// Workspace content is data, never framing: a .ts file whose content
+/// contains the old marker lines (and a ../ path inside them, which once
+/// chose a host path) extracts verbatim, nothing appears outside the
+/// extraction dir, and the parser rejects crafted bad paths loudly -
+/// vm.fs itself normalizes paths, so those lines are fed to the parser
+/// directly, the only place they could exist.
+#[test]
+fn ts_extraction_treats_workspace_content_as_data() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-extract-case");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    let dir = root.join("out");
+    std::fs::create_dir_all(&dir).expect("mkdir out");
+    let ws = root.join("ws.json");
+
+    let poison = "const x = 1;\n\
+                  ===V8VM_TS_FILE /app/../../../../pwned.ts\n\
+                  const evil = 2;\n\
+                  ===V8VM_TS_END /app/../../../../pwned.ts\n";
+    seed_workspace(&ws, &[("/app/app.ts", poison), ("/app/lib/sum.ts", "export const s = 1;\n")]);
+
+    let listing = v8vm(
+        &[
+            format!("--preload={}", ws.display()).as_str(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-listing.js"),
+        ],
+        b"",
+    );
+    assert_eq!(listing.code, 0, "stderr: {}", listing.stderr);
+    let r = ts_extract(&dir, &listing.stdout);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        std::fs::read(dir.join("app.ts")).unwrap(),
+        poison.as_bytes(),
+        "the marker-laden file must extract byte for byte"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("lib/sum.ts")).unwrap(),
+        b"export const s = 1;\n"
+    );
+    // Nothing outside the extraction dir: only the two files exist under
+    // the isolated root besides the workspace itself.
+    assert_eq!(
+        tree_files(&root),
+        vec![
+            dir.join("app.ts").to_string_lossy().into_owned(),
+            dir.join("lib/sum.ts").to_string_lossy().into_owned(),
+            ws.to_string_lossy().into_owned(),
+        ],
+        "extraction must not write anywhere but its dir"
+    );
+
+    // Crafted lines the guest cannot produce (vm.fs normalizes paths):
+    // each is rejected loudly, and nothing is written for it.
+    let cases: Vec<(&str, &str)> = vec![
+        ("/app/../../pwned.ts", "..' segment"),
+        ("/app/a/../b.ts", "'..' segment"),
+        ("/etc/passwd", "not under /app"),
+        ("/app/a b.ts", "characters outside"),
+        ("/app/sub/x.js", "not a .ts/.tsx/.d.ts/.json file"),
+    ];
+    for (path, want) in cases {
+        let fresh = root.join("reject");
+        let _ = std::fs::remove_dir_all(&fresh);
+        std::fs::create_dir_all(&fresh).expect("mkdir reject");
+        let line = format!("{} {}\n", b64(path.as_bytes()), b64(b"content"));
+        let r = ts_extract(&fresh, &line);
+        assert_eq!(r.code, 1, "parser must reject {path}");
+        assert!(
+            r.stderr.contains("refusing") && r.stderr.contains(path) && r.stderr.contains(want),
+            "rejection of {path} must name it and the reason: {}",
+            r.stderr
+        );
+        assert!(
+            tree_files(&fresh).is_empty(),
+            "nothing may be written for {path}"
+        );
+    }
+}
