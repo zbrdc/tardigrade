@@ -8,9 +8,10 @@ cannot open host files or sockets, start processes or make system calls of
 its own.
 
 WebAssembly is part of the guest language, so programs compiled from Rust,
-C or C++ run under the same caps. A module's imports, WASI for example, are
-supplied by guest JavaScript, not by the host; examples/ts-in-guest shows a
-working WASI shim.
+C or C++ run under the same wall-clock timeout and sandbox; their linear
+memory is not counted against the heap cap. A module's imports, WASI for
+example, are supplied by guest JavaScript, not by the host;
+examples/ts-in-guest shows a working WASI shim.
 
 It is built for running code you do not fully trust, such as code written by
 an AI agent, with all of its state in one place: dump the filesystem to JSON
