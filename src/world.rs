@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::stdin::StdinSub;
@@ -51,6 +52,11 @@ pub(crate) struct World {
     // ids cleared via clear_timer while their callback was on the stack
     pub(crate) cleared: Vec<u64>,
     exit_code: AtomicI32,
+    /// Set by V8's near-heap-limit callback (through the shared Arc it
+    /// holds; the callback gets no isolate reference to reach this slot).
+    pub(crate) heap_oom: Arc<AtomicBool>,
+    /// The configured cap, for the OOM report.
+    pub(crate) heap_mb: usize,
     /// Rejections awaiting the next microtask checkpoint; first one still
     /// unhandled when the checkpoint ends fails the run.
     pub(crate) pending_rejections: Vec<PendingRejection>,
@@ -70,8 +76,25 @@ impl World {
             stdin_sub: None,
             cleared: Vec::new(),
             exit_code: AtomicI32::new(-1),
+            heap_oom: Arc::new(AtomicBool::new(false)),
+            heap_mb: 0,
             pending_rejections: Vec::new(),
         }
+    }
+
+    /// Exit code for a cancelled execution termination: a guest vm.exit()
+    /// code wins, then the heap cap (137, with a one-line report), then the
+    /// wall-clock watchdog.
+    pub(crate) fn terminated_exit(&self) -> i32 {
+        let code = self.exit_code();
+        if code >= 0 {
+            return code;
+        }
+        if self.heap_oom.load(Ordering::SeqCst) {
+            eprintln!("v8vm: heap limit exceeded ({} MB)", self.heap_mb);
+            return 137;
+        }
+        124
     }
 
     pub(crate) fn exit_code(&self) -> i32 {

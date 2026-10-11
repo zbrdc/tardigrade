@@ -39,12 +39,13 @@ and is not set by this repo.
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
-- "--memory=<mb>" V8 heap cap in MB (default 256)
+- "--memory=<mb>" V8 heap cap in MB (default 256); hitting it exits 137
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write vm.snapshot() to a file when the run ends
 - "--serve" console mode: one JS expression per stdin line, one JSON line out
   (untimed by default; stdin is the command channel, so vm.stdin is EOF)
-- uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
+- uncaught exceptions exit 1; usage errors 2; unhandled promise rejections
+  (still unhandled when the microtask queue drains) exit 1
 
 ## Library API
 
@@ -59,8 +60,9 @@ guests can run concurrently in one process and do not see each other's
 state. Process stdin is served by one process-wide reader shared by vm.stdin
 and serve() commands: input a run does not read is kept for the next run,
 and when several consumers read at once the first one receives the chunks.
-Isolation is per isolate within the process: a V8 out-of-memory abort or
-other V8 fatal error ends the whole process and every guest in it.
+Isolation is per isolate within the process: hitting the heap cap ends only
+that run (exit 137), while other V8 fatal errors end the whole process and
+every guest in it.
 
 ## Event loop
 
@@ -118,8 +120,8 @@ tsc-rs at this boundary to let agents write TypeScript.
   run. One delivery generation per loop turn.
 - This is an application-level sandbox, not a container: isolation is by
   omission of host APIs, per isolate inside one ordinary process. A V8
-  fatal error (for example the heap-cap abort below) ends the whole
-  process and every guest in it. For hostile code, run v8vm itself under
-  a container/seccomp profile.
-- Hitting the heap cap aborts with the V8 out-of-memory report.
+  fatal error ends the whole process and every guest in it. For hostile
+  code, run v8vm itself under a container/seccomp profile.
+- Hitting the heap cap terminates the guest: the run exits 137 with a
+  one-line report on stderr; the process and other guests survive.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

@@ -110,8 +110,7 @@ pub(crate) fn serve_loop(scope: &mut v8::HandleScope, replies: &ReplySink) -> i3
             None => {
                 if tc.is_execution_terminating() {
                     tc.cancel_terminate_execution();
-                    let code = world_mut(&mut tc).exit_code();
-                    return if code >= 0 { code } else { 124 };
+                    return world_mut(&mut tc).terminated_exit();
                 }
                 report(&mut tc);
                 return 1;

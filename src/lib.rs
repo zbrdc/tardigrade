@@ -19,6 +19,7 @@ mod diag;
 mod event_loop;
 mod exit;
 mod fs;
+mod heap;
 mod host;
 mod net;
 mod serve;
@@ -176,8 +177,7 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
     }
     if tc.is_execution_terminating() {
         tc.cancel_terminate_execution();
-        let exit = world_mut(&mut tc).exit_code();
-        return if exit >= 0 { exit } else { 124 };
+        return world_mut(&mut tc).terminated_exit();
     }
     report(&mut tc);
     1
@@ -244,23 +244,36 @@ fn execute(
     let mut world = World::new();
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
+    world.heap_mb = cfg.heap_mb.max(1);
 
-    // Heap cap; past it V8 aborts with its own out-of-memory report.
-    let params = v8::CreateParams::default().heap_limits(64 << 20, cfg.heap_mb << 20);
+    // V8 dies at isolate creation (a check failure, SIGTRAP) when the
+    // initial heap exceeds the cap, so the initial size is clamped to it;
+    // a 0 MB cap from library callers is clamped to 1 MB the same way.
+    let cap_mb = cfg.heap_mb.max(1);
+    let params = v8::CreateParams::default().heap_limits(cap_mb.min(64) << 20, cap_mb << 20);
     let mut isolate = v8::Isolate::new(params);
+    let handle = isolate.thread_safe_handle();
+    let mut guard = Box::new(heap::HeapGuard::new(handle.clone(), world.heap_oom.clone()));
+    isolate.add_near_heap_limit_callback(heap::on_near_heap_limit, guard.callback_data());
     // The isolate owns the world through its embedder slot. On isolate
     // teardown the annex nulls its isolate pointer before the slots are
     // dropped, so the slot's Global handles see a disposed isolate and skip
     // resetting themselves (v8 handle.rs) - no manual clearing needed.
     isolate.set_slot(world);
     isolate.set_promise_reject_callback(promise_reject_callback);
-    let handle = isolate.thread_safe_handle();
 
     let spec = RunSpec { source, entry, cfg };
-    let mut hs = v8::HandleScope::new(&mut isolate);
-    let context = v8::Context::new(&mut hs, Default::default());
-    let scope = &mut v8::ContextScope::new(&mut hs, context);
-    execute_inner(scope, &handle, &spec, replies)
+    let code = {
+        let mut hs = v8::HandleScope::new(&mut isolate);
+        let context = v8::Context::new(&mut hs, Default::default());
+        let mut scope = v8::ContextScope::new(&mut hs, context);
+        execute_inner(&mut scope, &handle, &spec, replies)
+    };
+    // The isolate is torn down while the guard is still alive: teardown can
+    // run GC, and the near-heap-limit callback would otherwise read freed
+    // memory through its data pointer. The guard drops after this point.
+    drop(isolate);
+    code
 }
 
 /// Run one guest program and return its exit code.

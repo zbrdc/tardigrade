@@ -138,6 +138,52 @@ fn timeout_kills_a_spinning_guest_with_124() {
 }
 
 #[test]
+fn memory_zero_is_a_usage_error() {
+    let path = script("mem-zero", "console.log('never runs');");
+    let r = v8vm(&["--memory=0", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("--memory"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn heap_cap_oom_exits_137_quickly_without_a_signal() {
+    // The run helper unwraps status.code(), so a signal death (V8's own
+    // OOM abort, SIGTRAP) fails this test before the code assert runs.
+    let path = script("oom", "const a = []; for (;;) a.push(new Array(1e5).fill(1));");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("v8vm: heap limit exceeded (32 MB)"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn guests_staying_under_the_cap_are_unaffected() {
+    let path = script(
+        "under-cap",
+        "const a = []; for (let i = 0; i < 100; i++) a.push(new Array(1000).fill(7));
+         console.log(a.length);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "100\n");
+}
+
+#[test]
+fn a_small_memory_cap_still_creates_the_isolate() {
+    // The initial heap used to be hard-coded at 64 MiB, so any cap below
+    // that died with a V8 check failure (SIGTRAP) before the guest ran.
+    let path = script("mem-16", "console.log('fits');");
+    let r = v8vm(&["--memory=16", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "fits\n");
+}
+
+#[test]
 fn usage_errors_exit_2() {
     assert_eq!(v8vm(&[], b"").code, 2);
     assert_eq!(v8vm(&["--bogus", "x.js"], b"").code, 2);

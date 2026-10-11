@@ -14,14 +14,12 @@ enum Outcome {
     Terminated,
 }
 
-/// Terminated means guest-requested vm.exit() if set, else the watchdog.
+/// Terminated means guest-requested vm.exit() if set, else the heap cap
+/// (137) or the watchdog (124).
 fn stop_code(world: &World, oc: Outcome) -> Option<i32> {
     match oc {
         Outcome::Ok => None,
-        Outcome::Terminated => {
-            let code = world.exit_code();
-            Some(if code >= 0 { code } else { 124 })
-        }
+        Outcome::Terminated => Some(world.terminated_exit()),
         Outcome::Exception => Some(1),
     }
 }
@@ -119,8 +117,7 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
         return check_unhandled(scope);
     }
     scope.cancel_terminate_execution();
-    let code = world_mut(scope).exit_code();
-    Some(if code >= 0 { code } else { 124 })
+    Some(world_mut(scope).terminated_exit())
 }
 
 // ---- unhandled rejections ----
@@ -179,8 +176,7 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     loop {
         if scope.is_execution_terminating() {
             scope.cancel_terminate_execution();
-            let code = world_mut(scope).exit_code();
-            return if code >= 0 { code } else { 124 };
+            return world_mut(scope).terminated_exit();
         }
         if let Some(c) = run_net(scope) {
             return c;
