@@ -33,7 +33,7 @@ impl Watchdog {
                 Some(Instant::now() + Duration::from_millis(timeout_ms))
             };
             match term2.wait_for(deadline) {
-                Wake::Stopped => {}
+                Wake::Finished => {}
                 Wake::Deadline => {
                     term2.mark(TermReason::Timeout);
                     iso.terminate_execution();

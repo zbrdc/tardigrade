@@ -55,15 +55,15 @@ pub(crate) enum TermReason {
 pub(crate) struct Termination {
     reason: AtomicU8,
     finished: AtomicBool,
-    /// Wakes the watchdog: blocked until the deadline, or until a mark,
-    /// finish, or stop wakes it (a bare atomic cannot do that).
+    /// Wakes the watchdog: blocked until the deadline, or until a mark or
+    /// finish wakes it (a bare atomic cannot do that).
     wake: (Mutex<()>, Condvar),
 }
 
 /// What ended a [Termination::wait_for].
 pub(crate) enum Wake {
-    /// The run is over; the waiter should exit.
-    Stopped,
+    /// The run has finished; the waiter should exit.
+    Finished,
     /// The deadline passed without a reason.
     Deadline,
     /// A termination reason is set and wants delivering.
@@ -86,6 +86,10 @@ impl Termination {
             TermReason::Timeout => 1,
             TermReason::Oom => 2,
         };
+        // Store and notify under the lock the waiter checks its predicate
+        // under: without it, a mark between the waiter's check and its wait
+        // is a lost wakeup.
+        let _guard = self.wake.0.lock().unwrap();
         let _ = self.reason.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
         self.wake.1.notify_all();
     }
@@ -112,6 +116,8 @@ impl Termination {
     }
 
     pub(crate) fn finish(&self) {
+        // Under the waiter's lock, like [Termination::mark].
+        let _guard = self.wake.0.lock().unwrap();
         self.finished.store(true, Ordering::SeqCst);
         self.wake.1.notify_all();
     }
@@ -124,7 +130,7 @@ impl Termination {
         let mut guard = self.wake.0.lock().unwrap();
         loop {
             if self.finished.load(Ordering::SeqCst) {
-                return Wake::Stopped;
+                return Wake::Finished;
             }
             if self.reason().is_some() {
                 return Wake::Reason;
@@ -143,7 +149,6 @@ impl Termination {
         }
     }
 }
-
 
 /// All guest world state for one run. The isolate owns it through an embedder
 /// slot (see [world_mut]); one JS thread touches it, and the watchdog thread
@@ -287,6 +292,73 @@ pub(crate) fn world_mut<S: AsMut<v8::Isolate>>(scope: &mut S) -> &mut World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs wait_for on its own thread and gives up after a few seconds, so
+    /// a lost wakeup fails the test instead of hanging it. The thread is
+    /// left behind on failure; the test process ends anyway.
+    fn wait_bounded(term: &Arc<Termination>, deadline: Option<Instant>) -> Option<Wake> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let term = term.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(term.wait_for(deadline));
+        });
+        rx.recv_timeout(Duration::from_secs(5)).ok()
+    }
+
+    #[test]
+    fn wait_for_returns_deadline_when_the_deadline_has_passed() {
+        let term = Arc::new(Termination::new());
+        let past = Instant::now();
+        assert!(matches!(wait_bounded(&term, Some(past)), Some(Wake::Deadline)));
+    }
+
+    #[test]
+    fn wait_for_returns_reason_for_a_mark_made_before_the_wait() {
+        let term = Arc::new(Termination::new());
+        term.mark(TermReason::Oom);
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(matches!(wait_bounded(&term, Some(far)), Some(Wake::Reason)));
+    }
+
+    #[test]
+    fn finish_from_another_thread_unblocks_a_wait_without_a_deadline() {
+        let term = Arc::new(Termination::new());
+        let finisher = term.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            finisher.finish();
+        });
+        assert!(matches!(wait_bounded(&term, None), Some(Wake::Finished)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn finish_takes_precedence_over_a_reason() {
+        let term = Arc::new(Termination::new());
+        term.mark(TermReason::Timeout);
+        term.finish();
+        assert!(matches!(wait_bounded(&term, None), Some(Wake::Finished)));
+    }
+
+    #[test]
+    fn mark_and_finish_publish_under_the_waiters_lock() {
+        // A store-and-notify outside the lock can land between the
+        // waiter's predicate check and its wait, and is then lost. While
+        // the test holds the lock, neither may complete.
+        let term = Arc::new(Termination::new());
+        let held = term.wake.0.lock().unwrap();
+        let marker = term.clone();
+        let t1 = std::thread::spawn(move || marker.mark(TermReason::Timeout));
+        let finisher = term.clone();
+        let t2 = std::thread::spawn(move || finisher.finish());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(term.reason().is_none(), "mark must wait for the lock");
+        assert!(!term.is_finished(), "finish must wait for the lock");
+        drop(held);
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert!(term.reason().is_some() && term.is_finished());
+    }
 
     #[test]
     fn the_first_exit_code_wins() {
