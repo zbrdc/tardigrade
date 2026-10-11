@@ -416,26 +416,6 @@ fn a_caught_arraybuffer_failure_does_not_kill_later_work() {
 }
 
 #[test]
-fn resizable_buffers_cannot_bypass_the_budget() {
-    // Both the reservation (maxByteLength) and later growth go through the
-    // counting allocator, so a resizable buffer cannot route around the
-    // cap; V8 reports the refusal as a catchable RangeError.
-    let path = script(
-        "rab-budget",
-        "let caught = 0;
-         try { const r = new ArrayBuffer(8, { maxByteLength: 1 << 30 }); r.resize(64 << 20); }
-         catch (e) { caught++; if (!(e instanceof RangeError)) throw e; }
-         const small = new ArrayBuffer(1024, { maxByteLength: 1 << 22 });
-         small.resize(1 << 21); small.resize(10);
-         console.log('caught', caught, small.byteLength);",
-    );
-    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
-    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    assert!(r.stdout.starts_with("caught"), "stdout: {}", r.stdout);
-    assert!(r.stdout.ends_with("10\n"), "stdout: {}", r.stdout);
-}
-
-#[test]
 fn a_huge_memory_flag_does_not_wrap() {
     // 16 TiB in MB used to shift-wrap to zero at two call sites.
     let path = script("huge-cap", "console.log('ok');");

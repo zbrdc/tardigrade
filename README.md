@@ -136,21 +136,25 @@ tsc-rs at this boundary to let agents write TypeScript.
   fatal error ends the whole process and every guest in it. For hostile
   code, run v8vm itself under a container/seccomp profile.
 - The heap cap terminates the guest, not the process. --memory is one
-  budget shared by the JS heap and ArrayBuffer memory (including
-  resizable ArrayBuffers and growable SharedArrayBuffers: their
-  maxByteLength reservation and every resize or grow route through the
-  same counting allocator). The JS heap is judged by a GC epilogue on the
-  post-collection live set; ArrayBuffer allocations that would cross the
-  remaining budget are refused and surface in the guest as a catchable
-  RangeError; a guest whose transient working set reaches V8's raised
-  limit (three times the cap) is stopped with the limit raised so the
-  termination is observed in JavaScript. Heap over-cap exits 137 with a
-  one-line report on stderr. Peak RSS is typically 3-6x the cap for
-  growth shapes, about 2-3x for garbage-heavy guests under the cap, and
-  near the budget line for buffers. The smallest supported cap is 8 MB;
-  growth that hits V8's structural limits (Map size, array length) or
-  string limits fails as an ordinary uncaught RangeError (exit 1), as
-  Node does.
+  budget shared by the JS heap and ArrayBuffer memory. The JS heap is
+  judged by a GC epilogue on the post-collection live set; ArrayBuffer
+  allocations that would cross the remaining budget are refused by the
+  counting allocator and surface in the guest as a catchable RangeError;
+  a guest whose transient working set reaches V8's raised limit (three
+  times the cap) is stopped with the limit raised so the termination is
+  observed in JavaScript. Heap over-cap exits 137 with a one-line report
+  on stderr. Peak RSS is typically 3-6x the cap for growth shapes, about
+  2-3x for garbage-heavy guests under the cap, and near the budget line
+  for buffers. The smallest supported cap is 8 MB; growth that hits V8's
+  structural limits (Map size, array length) or string limits fails as an
+  ordinary uncaught RangeError (exit 1), as Node does.
+- Resizable ArrayBuffers and growable SharedArrayBuffers are NOT capped:
+  their pages are committed inside V8's sandbox reservation, which does
+  not go through the ArrayBuffer allocator (there is no V8 12.9 flag to
+  disable the feature; `--no-harmony-rab-gsab` does not exist). A guest
+  can therefore exceed --memory with `new ArrayBuffer(n, {
+  maxByteLength })` plus resize/grow; treat --memory as advisory where
+  such buffers are trusted.
 - Guest-reachable process aborts remain (V8 fatal error, observed as
   SIGTRAP, exit 133): a single allocation too large for V8's raised limit
   (`new Array(1e9)`, and `new Array(1e8).fill(0)` at any cap), string
