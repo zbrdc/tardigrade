@@ -395,9 +395,20 @@ bun (required) or every checker (npx for tsc-rs, or tsc) is missing -
 never a silent pass - and V8VM_REQUIRE_TS=1 makes a missing toolchain
 fail.
 
-Limits: type-checking and bundling are host-side loop steps. At runtime
-the guest executes the bundled JavaScript; vm.run of a .ts file would
-evaluate raw TypeScript as JavaScript.
+Limits: type-checking and bundling are host-side loop steps, and vm.run
+of a .ts file would evaluate raw TypeScript as JavaScript. The compiler
+can also run inside the guest itself, though: examples/ts-in-guest loads a
+WebAssembly build of ts-rust (its crates/ts_wasm, built for
+wasm32-wasip1) from vm.fs, bridges the compiler's eight host-fs
+operations onto vm.fs and answers its WASI imports from a ~60-line shim,
+so the whole compiler runs under v8vm's caps, timeout and --sandbox:
+~187 MB peak process RSS, ~0.6 s for a two-file project, working at
+--memory=16 (WebAssembly memory sits outside the JS heap cap). The 5.9 MB
+wasm artifact is not committed; examples/ts-in-guest/README.md has the
+pinned commit, the build recipe and the artifact's SHA-256, and the test
+covering it skips loudly until TSC_RUST_WASM points at a build. In-guest
+checking remains a spike against an experimental compiler whose wasm ABI
+is not a stable interface; the agent loop above is the supported path.
 
 ## OS self-sandbox (--sandbox)
 

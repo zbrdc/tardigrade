@@ -2689,3 +2689,98 @@ fn agent_loop_ts_type_errors_fail_then_fixed_app_passes() {
     );
     assert!(stdout.lines().any(|l| l == "PASS"), "stdout: {stdout}");
 }
+
+/// The in-guest TypeScript check (examples/ts-in-guest): when
+/// TSC_RUST_WASM names a ts_rust.wasm build, the compiler runs inside the
+/// guest - type errors exit 2 with tsc-style lines, a clean project
+/// transpiles into the RAM fs. The artifact is never committed, so a
+/// missing one is a loud skip; V8VM_REQUIRE_TS=1 fails instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn ts_wasm_checks_and_transpiles_inside_the_guest() {
+    let test = "ts_wasm_checks_and_transpiles_inside_the_guest";
+    let Ok(wasm) = std::env::var("TSC_RUST_WASM") else {
+        assert!(
+            !ts_required(),
+            "V8VM_REQUIRE_TS=1 but TSC_RUST_WASM is not set to a ts_rust.wasm build"
+        );
+        ts_skipped("TSC_RUST_WASM is not set (the wasm build is not committed)", test);
+        return;
+    };
+    if !PathBuf::from(&wasm).is_file() {
+        assert!(
+            !ts_required(),
+            "V8VM_REQUIRE_TS=1 but TSC_RUST_WASM={} is not a file",
+            wasm
+        );
+        ts_skipped("TSC_RUST_WASM does not name an existing wasm build", test);
+        return;
+    }
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ts-in-guest");
+    let _ = std::fs::remove_dir_all(&root);
+    // A broken project and a clean one with emit; the tsconfigs decide.
+    let bad = root.join("bad");
+    let good = root.join("good");
+    std::fs::create_dir_all(bad.join("lib")).expect("mkdir bad");
+    std::fs::create_dir_all(good.join("lib")).expect("mkdir good");
+    std::fs::write(
+        bad.join("app.ts"),
+        "import { sum } from \"./lib/sum\";\nconst wrong: number = sum([\"a\", \"b\"]);\n",
+    )
+    .expect("write bad app");
+    std::fs::write(
+        bad.join("lib/sum.ts"),
+        "export const sum = (xs: string[]): string => xs.join(\"\");\n",
+    )
+    .expect("write bad lib");
+    std::fs::write(
+        bad.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "noEmit": true }, "include": ["app.ts", "lib"] }"#,
+    )
+    .expect("write bad tsconfig");
+    std::fs::write(
+        good.join("app.ts"),
+        "import { sum } from \"./lib/sum\";\nconsole.log(sum([\"a\", \"b\"]));\n",
+    )
+    .expect("write good app");
+    std::fs::write(
+        good.join("lib/sum.ts"),
+        "export const sum = (xs: string[]): string => xs.join(\"\");\n",
+    )
+    .expect("write good lib");
+    std::fs::write(
+        good.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "strict": true, "outDir": "out" }, "include": ["app.ts", "lib"] }"#,
+    )
+    .expect("write good tsconfig");
+
+    let run = |proj: &std::path::Path, ws: &str| {
+        let mut cmd = Command::new("/bin/bash");
+        cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ts-in-guest/run.sh"))
+            .env("OUT", env!("CARGO_BIN_EXE_v8vm"))
+            .env("TSC_RUST_WASM", &wasm)
+            .arg(proj)
+            .arg(ws);
+        output_within(cmd, 180)
+    };
+
+    let out = run(&bad, root.join("bad-ws.json").to_str().unwrap());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "stdout: {stdout}");
+    assert!(
+        stdout.contains("error TS2322") && stdout.contains("app.ts(2,7)"),
+        "the type error must print tsc-style, stdout: {stdout}"
+    );
+
+    let good_ws = root.join("good-ws.json");
+    let out = run(&good, good_ws.to_str().unwrap());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    let dump = std::fs::read_to_string(&good_ws).expect("read the workspace dump");
+    assert!(dump.contains("/app/out/app.js"), "emit must land in vm.fs: {dump}");
+    assert!(
+        dump.contains("/app/out/lib/sum.js") && dump.contains("export const sum = (xs)"),
+        "the transpiled lib must be in the dump: {dump}"
+    );
+    assert!(!root.join("good-ws.json.pre").exists(), "no stale .pre snapshot");
+}
