@@ -1,0 +1,143 @@
+// Type definitions for the v8vm guest API, kept in sync with the Guest API
+// table of README.md by tests/cli.rs (vm_dts_members_match_the_runtime).
+//
+// v8vm guests are not DOM environments: the tsconfig should not pull in
+// lib.dom (the tsconfig that examples/agent-loop-ts.sh generates sets
+// "lib": ["esnext"]), or TextEncoder and friends would be declared twice.
+
+declare namespace vm {
+  /** The V8 engine version string. */
+  const version: string;
+
+  /** The guest arguments after the entry path. */
+  const args: string[];
+
+  /** Stop the program with an exit code; the first exit wins. */
+  function exit(code?: number): never;
+
+  /** Load-and-eval a file from the RAM filesystem; the eval's result. */
+  function run(path: string): unknown;
+
+  /** The whole filesystem as snapshot JSON (the --dump/--preload format). */
+  function snapshot(): string;
+
+  /** Replace the filesystem from a snapshot JSON (version 2 or legacy). */
+  function restore(json: string): void;
+
+  namespace fs {
+    /**
+     * Write a file, creating missing parent directories; an existing file
+     * is replaced wholesale.
+     */
+    function write(
+      path: string,
+      data: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView,
+    ): void;
+
+    /** Read as a string; bytes that are not valid UTF-8 become U+FFFD. */
+    function read(path: string): string;
+
+    /** Read as a freshly copied Uint8Array. */
+    function readBytes(path: string): Uint8Array;
+
+    /** Recursive listing of file paths under dir (default "/"), sorted. */
+    function list(dir?: string): string[];
+
+    /** Immediate child names (files and directories), sorted. */
+    function readdir(path: string): string[];
+
+    /** Create a directory; recursive also creates parents. */
+    function mkdir(path: string, options?: { recursive?: boolean }): void;
+
+    /** True when the path is a file or directory. */
+    function exists(path: string): boolean;
+
+    /**
+     * Content bytes for a file, immediate child count for a directory.
+     */
+    function stat(path: string): { type: "file" | "dir"; size: number };
+
+    /** POSIX-shaped move: a file replaces a file, a directory moves onto
+     *  an empty directory. */
+    function rename(from: string, to: string): void;
+
+    /** Delete a file, an empty directory, or with recursive a subtree. */
+    function remove(path: string, options?: { recursive?: boolean }): void;
+  }
+
+  namespace net {
+    /** A fresh port number. */
+    function port(): number;
+
+    /** Receive messages on a port; payload is always a string. */
+    function listen(
+      port: number,
+      handler: (payload: string, from: number) => void,
+    ): void;
+
+    /** Queue a message to a port; throws when nothing listens there. */
+    function send(fromPort: number, toPort: number, payload: string): void;
+
+    /** Stop listening on a port. */
+    function close(port: number): void;
+  }
+
+  namespace stdin {
+    /** The next stdin chunk as a string; "" at EOF. */
+    function read(): Promise<string>;
+  }
+}
+
+declare const console: {
+  log(...data: unknown[]): void;
+  info(...data: unknown[]): void;
+  warn(...data: unknown[]): void;
+  error(...data: unknown[]): void;
+};
+
+declare function setTimeout<A extends unknown[]>(
+  handler: (...args: A) => void,
+  delay?: number,
+  ...args: A
+): number;
+declare function setInterval<A extends unknown[]>(
+  handler: (...args: A) => void,
+  delay?: number,
+  ...args: A
+): number;
+declare function clearTimeout(id?: number): void;
+declare function clearInterval(id?: number): void;
+declare function queueMicrotask(fn: () => void): void;
+
+declare class TextEncoder {
+  get encoding(): string;
+  encode(input?: string): Uint8Array;
+  encodeInto(
+    source: string,
+    destination: ArrayBufferView,
+  ): { read: number; written: number };
+}
+
+declare class TextDecoder {
+  constructor(
+    label?: string,
+    options?: { fatal?: boolean; ignoreBOM?: boolean },
+  );
+  get encoding(): string;
+  get fatal(): boolean;
+  get ignoreBOM(): boolean;
+  decode(
+    input?: ArrayBuffer | ArrayBufferView,
+    options?: { stream?: boolean },
+  ): string;
+}
+
+declare function atob(data: string): string;
+declare function btoa(data: string): string;
+
+/** No transfer list exists: a { transfer } option throws at runtime. */
+declare function structuredClone<T>(value: T): T;
+
+/** Monotonic milliseconds since the run started (virtual under
+ *  --clock=virtual). */
+declare const performance: { now(): number };

@@ -102,8 +102,12 @@ build_app() {
     echo "workspace has no /app/app.ts to build" >&2
     exit 1
   fi
+  # vm.d.ts types the guest API (vm, console, timers, TextEncoder, ...) so
+  # the app type-checks against v8vm, not against a DOM or Node lib: the
+  # tsconfig keeps lib.dom out with "lib": ["esnext"].
+  cp "$DIR/vm.d.ts" "$dir/vm.d.ts"
   cat >"$dir/tsconfig.json" <<'EOF'
-{ "compilerOptions": { "strict": true, "noEmit": true }, "include": ["**/*.ts"] }
+{ "compilerOptions": { "strict": true, "noEmit": true, "lib": ["esnext"] }, "include": ["**/*.ts"] }
 EOF
   typecheck "$dir" || rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -123,7 +127,10 @@ EOF
 
 app_ts=$(cat <<'EOF'
 import { sum } from "./lib/sum";
+// vm comes from vm.d.ts; using it proves the guest API is typed.
+const engine: string = vm.version;
 (globalThis as any).sum = sum;
+(globalThis as any).engine = engine;
 EOF
 )
 sum_type_error=$(cat <<'EOF'

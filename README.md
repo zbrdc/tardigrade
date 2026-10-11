@@ -410,6 +410,15 @@ covering it skips loudly until TSC_RUST_WASM points at a build. In-guest
 checking remains a spike against an experimental compiler whose wasm ABI
 is not a stable interface; the agent loop above is the supported path.
 
+examples/vm.d.ts types the guest API for TypeScript guests - vm and its
+fs, net and stdin namespaces, console, the timers, queueMicrotask,
+TextEncoder/TextDecoder, atob/btoa, structuredClone and performance - so
+a project type-checks against v8vm instead of picking up DOM or Node
+types: it assumes "lib": ["esnext"] (which the loop's generated tsconfig
+sets), because v8vm is not a DOM environment. A cli test keeps it honest
+in both directions: every vm.* member it names exists in a live guest,
+and every runtime member is named.
+
 ## OS self-sandbox (--sandbox)
 
 For hostile code, `--sandbox` puts kernel-level containment around the run.

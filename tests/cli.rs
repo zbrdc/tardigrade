@@ -2784,3 +2784,81 @@ fn ts_wasm_checks_and_transpiles_inside_the_guest() {
     );
     assert!(!root.join("good-ws.json.pre").exists(), "no stale .pre snapshot");
 }
+
+/// Members named by examples/vm.d.ts: (scope, name) with scope "vm",
+/// "vm.fs", .... A namespace line records the name and opens a scope, a
+/// lone "}" closes it, and function/const lines name their scope's
+/// members. Doc comments never match those shapes.
+fn vm_dts_members(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim().strip_prefix("declare ").unwrap_or(raw.trim());
+        let (opens, rest) = if let Some(rest) = line.strip_prefix("namespace ") {
+            (true, rest)
+        } else if let Some(rest) = line.strip_prefix("function ") {
+            (false, rest)
+        } else if let Some(rest) = line.strip_prefix("const ") {
+            (false, rest)
+        } else if line == "}" {
+            stack.pop();
+            continue;
+        } else {
+            continue;
+        };
+        let name = rest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        out.push((stack.join("."), name.to_string()));
+        if opens {
+            stack.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// examples/vm.d.ts must name every vm.* member a live guest has, and the
+/// guest must have every member it names, so the types cannot drift from
+/// the runtime (and so from the README's Guest API table).
+#[test]
+fn vm_dts_members_match_the_runtime() {
+    let source = r#"
+const groups = [["vm", vm], ["vm.fs", vm.fs], ["vm.net", vm.net], ["vm.stdin", vm.stdin]];
+for (const [name, obj] of groups) {
+  console.log(name + ": " + Object.getOwnPropertyNames(obj).sort().join(" "));
+}
+"#;
+    let r = run_js("vm-dts-members", source);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let mut runtime = Vec::new();
+    for line in r.stdout.lines() {
+        let (scope, names) = line.split_once(": ").expect("scope: names line");
+        for name in names.split(' ') {
+            runtime.push((scope.to_string(), name.to_string()));
+        }
+    }
+    let dts = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/vm.d.ts"))
+        .expect("read examples/vm.d.ts");
+    let declared: Vec<(String, String)> = vm_dts_members(&dts)
+        .into_iter()
+        .filter(|(scope, _)| !scope.is_empty())
+        .collect();
+    assert!(!declared.is_empty(), "vm.d.ts parsed to nothing");
+
+    for (scope, name) in &declared {
+        assert!(
+            runtime.contains(&(scope.clone(), name.clone())),
+            "vm.d.ts declares {scope}.{name} but the runtime does not have it"
+        );
+    }
+    for (scope, name) in &runtime {
+        assert!(
+            declared.contains(&(scope.clone(), name.clone())),
+            "the runtime has {scope}.{name} but vm.d.ts does not declare it"
+        );
+    }
+}
