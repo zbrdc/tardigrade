@@ -1,3 +1,4 @@
+CARGO ?= cargo
 # Override CARGO_TARGET_DIR (env or make var) to relocate build output.
 CARGO_TARGET_DIR ?= target
 export CARGO_TARGET_DIR
@@ -6,6 +7,9 @@ BRIDGE := $(CARGO_TARGET_DIR)/release/serve_bridge
 
 build:
 	$(CARGO) build --release
+
+test:
+	$(CARGO) test --release
 
 check: build
 	@$(OUT) examples/hello.js | grep -qx 'hello from ram'
@@ -23,4 +27,4 @@ check: build
 clean:
 	$(CARGO) clean
 
-.PHONY: check clean build
+.PHONY: check clean build test

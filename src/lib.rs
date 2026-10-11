@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -111,7 +111,6 @@ impl World {
 // Callbacks are raw extern "C" without captures, so the world and isolate
 // are reached through process-lifetime pointers valid for the duration of a
 // run (single JS thread; watchdog only terminates).
-static RAW_ISOLATE: AtomicPtr<v8::Isolate> = AtomicPtr::new(std::ptr::null_mut());
 static RAW_WORLD: AtomicPtr<World> = AtomicPtr::new(std::ptr::null_mut());
 
 struct SendPtr(*mut v8::Isolate);
@@ -340,8 +339,30 @@ guest_cb!(stdin_read, |_args, rv, scope, world| {
     rv.set(resolver.get_promise(scope).into());
 });
 
+/// Length of the prefix of `buf` that can go to the guest now. A multi-byte
+/// UTF-8 sequence cut by a read boundary is held back for the next chunk;
+/// invalid bytes are not held back and decode lossily.
+fn complete_utf8_len(buf: &[u8]) -> usize {
+    let n = buf.len();
+    for back in 1..=n.min(3) {
+        let b = buf[n - back];
+        if b & 0xC0 == 0x80 {
+            continue; // continuation byte: keep looking for its lead byte
+        }
+        let need = match b {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 1,
+        };
+        return if need > back { n - back } else { n };
+    }
+    n
+}
+
 /// Lazily spawns the blocking stdin reader. It sends chunks down a channel
 /// the event loop polls; on EOF it sends None and exits. No libc needed.
+/// Chunks end on UTF-8 boundaries so the guest never sees a split character.
 static STDIN_CHUNKS: LazyLock<Mutex<Option<Receiver<Option<Vec<u8>>>>>> =
     LazyLock::new(|| Mutex::new(None));
 
@@ -356,14 +377,25 @@ fn start_stdin_thread(world: &mut World) {
         use std::io::Read;
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 65536];
+        let mut pending: Vec<u8> = Vec::new();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => {
+                    if !pending.is_empty() {
+                        let _ = sender.send(Some(std::mem::take(&mut pending)));
+                    }
                     let _ = sender.send(None);
                     break;
                 }
                 Ok(n) => {
-                    if sender.send(Some(buf[..n].to_vec())).is_err() {
+                    pending.extend_from_slice(&buf[..n]);
+                    let ready_len = complete_utf8_len(&pending);
+                    if ready_len == 0 {
+                        continue;
+                    }
+                    let rest = pending.split_off(ready_len);
+                    let ready = std::mem::replace(&mut pending, rest);
+                    if sender.send(Some(ready)).is_err() {
                         break;
                     }
                 }
@@ -383,8 +415,9 @@ extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
     if world.unhandled_rejection.is_some() {
         return;
     }
-    let isolate = unsafe { &mut *RAW_ISOLATE.load(Ordering::SeqCst) };
-    let scope = &mut v8::HandleScope::new(isolate);
+    // The callback runs inside V8's own scope; opening a second HandleScope
+    // on the isolate would panic ("active scope can't be dropped") and abort.
+    let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
     // ponytail: first rejection wins; a later handler does not un-fail the
     // run. The value is stringified later, inside the guest context scope.
     match msg.get_value() {
@@ -737,6 +770,18 @@ fn event_loop(scope: &mut v8::HandleScope) -> i32 {
 
 // ---- serve mode ----
 
+/// Wraps one command line as a guest expression that always yields a JSON
+/// string. The line sits between newlines so a trailing `//` comment ends at
+/// the newline instead of swallowing the closing brackets. JSON.stringify
+/// returns undefined for undefined/functions; that becomes `null` so every
+/// output line is valid JSON. Concatenation, not format!: a missing brace in
+/// an escaped template becomes a guest SyntaxError.
+fn wrap_serve_expr(line: &str) -> String {
+    String::from("(function(){try{var r=JSON.stringify((\n")
+        + line
+        + "\n));return r===undefined?\"null\":r}catch(e){return JSON.stringify({$error:String(e&&e.message||e)})}})()"
+}
+
 /// One JS expression per input line, one JSON value per output line. All
 /// encoding happens guest-side (JSON.stringify), so the host stays JSON-free.
 fn serve_loop<R: BufRead, W: Write>(scope: &mut v8::HandleScope, input: R, mut output: W) -> i32 {
@@ -748,11 +793,7 @@ fn serve_loop<R: BufRead, W: Write>(scope: &mut v8::HandleScope, input: R, mut o
         if line.is_empty() {
             continue;
         }
-        // Concatenation, not format!: keeps the wrapper free of brace-escaping
-        // mistakes (a missing brace here becomes a guest SyntaxError).
-        let wrapped = String::from("(function(){try{return JSON.stringify((")
-            + &line
-            + "))}catch(e){return JSON.stringify({$error:String(e&&e.message||e)})}})()";
+        let wrapped = wrap_serve_expr(&line);
         let src = v8::String::new_from_utf8(scope, wrapped.as_bytes(), v8::NewStringType::Normal)
             .unwrap();
         let name = v8::String::new(scope, "serve").unwrap();
@@ -997,7 +1038,6 @@ fn execute(
     let params = v8::CreateParams::default().heap_limits(64 << 20, cfg.heap_mb << 20);
     let mut isolate = v8::Isolate::new(params);
     let iso_ptr: *mut v8::Isolate = &mut *isolate;
-    RAW_ISOLATE.store(iso_ptr, Ordering::SeqCst);
     isolate.set_promise_reject_callback(promise_reject_callback);
 
     let code = {
@@ -1013,7 +1053,6 @@ fn execute(
     world_box.listeners.clear();
     world_box.stdin_waiters.clear();
     RAW_WORLD.store(std::ptr::null_mut(), Ordering::SeqCst);
-    RAW_ISOLATE.store(std::ptr::null_mut(), Ordering::SeqCst);
     code
 }
 
@@ -1028,4 +1067,43 @@ pub fn serve<W: Write>(output: W, source: &str, entry: &str, cfg: &Config) -> i3
     let mut output = output;
     let out: &mut dyn Write = &mut output;
     execute(source, entry, cfg, true, Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_len_passes_complete_input() {
+        assert_eq!(complete_utf8_len(b""), 0);
+        assert_eq!(complete_utf8_len(b"abc"), 3);
+        assert_eq!(complete_utf8_len("aé日😀".as_bytes()), "aé日😀".len());
+    }
+
+    #[test]
+    fn utf8_len_holds_back_cut_sequences() {
+        let two = "é".as_bytes(); // C3 A9
+        assert_eq!(complete_utf8_len(&[b'a', two[0]]), 1);
+        let three = "日".as_bytes();
+        assert_eq!(complete_utf8_len(&three[..1]), 0);
+        assert_eq!(complete_utf8_len(&three[..2]), 0);
+        let four = "😀".as_bytes();
+        for cut in 1..4 {
+            assert_eq!(complete_utf8_len(&[b'x', b'y'].iter().chain(&four[..cut]).copied().collect::<Vec<_>>()), 2);
+        }
+    }
+
+    #[test]
+    fn utf8_len_does_not_hold_back_invalid_bytes() {
+        assert_eq!(complete_utf8_len(&[0xFF]), 1);
+        assert_eq!(complete_utf8_len(&[b'a', 0x80, 0x80]), 3);
+        assert_eq!(complete_utf8_len(&[0xC0]), 1);
+    }
+
+    #[test]
+    fn serve_wrapper_isolates_the_line() {
+        let w = wrap_serve_expr("1 + 1 // note");
+        assert!(w.contains("\n1 + 1 // note\n"));
+        assert!(w.ends_with("})()"));
+    }
 }
