@@ -114,3 +114,31 @@ fn early_vm_exit_stays_per_run_while_another_guest_is_pending() {
     assert_eq!(join_bounded(quick, 30), 31, "early exit code belongs to its own run");
     assert_eq!(join_bounded(slow, 30), 0, "naturally-finished guest sees no leaked exit code");
 }
+
+#[test]
+fn fs_quota_boundary_from_the_library_config() {
+    // 10 bytes of content + 64 for the entry itself.
+    let cfg = Config {
+        fs_quota_bytes: 74,
+        stdin_consumed: true, // hermetic: never touch the harness stdin
+        ..Config::new()
+    };
+    // A 10-byte file fills it exactly; no vm.exit inside try blocks here:
+    // a termination raised in a callback can be caught by guest JS, and
+    // later statements would then overwrite the exit code.
+    let exact = "vm.fs.write('/f', '0123456789');";
+    assert_eq!(v8vm::run(exact, "quota-exact.js", &cfg), 0);
+    // One byte over, on a fresh fs: the write must throw (exit 1).
+    let over = "vm.fs.write('/f', '01234567890');";
+    assert_eq!(v8vm::run(over, "quota-over.js", &cfg), 1);
+    // Failure leaves the filesystem unchanged: still the original content.
+    let unchanged = "vm.fs.write('/f', '0123456789');
+                    let ok = false;
+                    try { vm.fs.write('/f', '01234567890'); } catch (e) {
+                      ok = e.message === 'fs quota exceeded'
+                        && vm.fs.stat('/f').size === 10
+                        && vm.fs.read('/f') === '0123456789';
+                    }
+                    if (!ok) throw new Error('fs changed by a failed write');";
+    assert_eq!(v8vm::run(unchanged, "quota-unchanged.js", &cfg), 0);
+}

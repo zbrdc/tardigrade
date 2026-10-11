@@ -11,6 +11,7 @@ struct Cli {
     preload: Option<std::path::PathBuf>,
     dump: Option<std::path::PathBuf>,
     serve: bool,
+    fs_quota_bytes: u64,
 }
 
 fn parse(argv: &[String]) -> Result<Cli, String> {
@@ -23,6 +24,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         preload: None,
         dump: None,
         serve: false,
+        fs_quota_bytes: v8vm::DEFAULT_FS_QUOTA_BYTES,
     };
     for a in argv {
         if a == "--" {
@@ -37,6 +39,11 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.preload = Some(v.into());
         } else if let Some(v) = a.strip_prefix("--dump=") {
             c.dump = Some(v.into());
+        } else if let Some(v) = a.strip_prefix("--fs-quota=") {
+            let mb: u64 = v.parse().map_err(|_| format!("bad --fs-quota: {}", v))?;
+            c.fs_quota_bytes = mb
+                .checked_mul(1024 * 1024)
+                .ok_or_else(|| format!("bad --fs-quota: {}", v))?;
         } else if a == "--serve" {
             c.serve = true;
         } else if a.starts_with('-') && a != "-" {
@@ -48,7 +55,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         }
     }
     if c.entry.is_empty() && !c.serve {
-        return Err("usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]".to_string());
+        return Err("usage: v8vm [--timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--preload=<file>] [--dump=<file>] [--serve] <entry.js or -> [args...]".to_string());
     }
     if c.serve && c.entry == "-" {
         return Err("--serve needs a file entry; stdin is the command channel".into());
@@ -93,6 +100,7 @@ fn main() {
         preload: c.preload,
         dump: c.dump,
         stdin_consumed,
+        fs_quota_bytes: c.fs_quota_bytes,
     };
 
 

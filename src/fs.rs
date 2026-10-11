@@ -14,6 +14,20 @@ use crate::world::world_mut;
 
 pub(crate) type FsResult<T> = Result<T, String>;
 
+/// Every file and directory costs this many quota bytes on top of its
+/// content, covering its key and its map entry.
+pub(crate) const ENTRY_OVERHEAD: u64 = 64;
+/// Normalized paths at or under this UTF-8 length are accepted.
+pub(crate) const MAX_PATH_BYTES: usize = 4096;
+/// Upper bound on the number of files plus directories.
+pub(crate) const MAX_ENTRIES: usize = 100_000;
+/// The Config.fs_quota_bytes default: 64 MiB.
+pub const DEFAULT_FS_QUOTA_BYTES: u64 = 64 << 20;
+
+fn file_cost(len: usize) -> u64 {
+    ENTRY_OVERHEAD + len as u64
+}
+
 /// Collapses `.`/`..`/duplicate slashes and rejects anything that is not an
 /// absolute path inside the sandbox root.
 fn normalize(path: &str) -> FsResult<String> {
@@ -36,11 +50,15 @@ fn normalize(path: &str) -> FsResult<String> {
             other => parts.push(other),
         }
     }
-    Ok(if parts.is_empty() {
+    let norm = if parts.is_empty() {
         "/".to_string()
     } else {
         format!("/{}", parts.join("/"))
-    })
+    };
+    if norm.len() > MAX_PATH_BYTES {
+        return Err(format!("path too long: {} bytes (max {})", norm.len(), MAX_PATH_BYTES));
+    }
+    Ok(norm)
 }
 
 /// Proper ancestors of a normalized path, shallowest first:
@@ -81,18 +99,42 @@ fn child_name<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// The filesystem state: byte-valued files plus the set of directories
 /// that exist in their own right (root included). Every file's ancestors
-/// are directories; `write` and `restore` maintain that invariant.
+/// are directories; `write` and `restore` maintain that invariant. `used`
+/// tracks content bytes plus ENTRY_OVERHEAD per entry so growth can be
+/// checked before anything mutates.
 pub(crate) struct RamFs {
     files: BTreeMap<String, Vec<u8>>,
     dirs: BTreeSet<String>,
+    /// 0 disables the limit.
+    quota: u64,
+    used: u64,
 }
 
 impl RamFs {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(quota: u64) -> Self {
         RamFs {
             files: BTreeMap::new(),
             dirs: BTreeSet::from(["/".to_string()]),
+            quota,
+            used: 0,
         }
+    }
+
+    fn entries(&self) -> usize {
+        // The root itself is not a counted entry; `used` mirrors this.
+        self.files.len() + self.dirs.len() - 1
+    }
+
+    /// Growth gate: fails without mutating when the post-operation state
+    /// would pass the entry cap or the quota.
+    fn reserve(&self, used_after: u64, entries_after: usize) -> FsResult<()> {
+        if entries_after > MAX_ENTRIES {
+            return Err(format!("fs entry limit exceeded (max {})", MAX_ENTRIES));
+        }
+        if self.quota != 0 && used_after > self.quota {
+            return Err("fs quota exceeded".to_string());
+        }
+        Ok(())
     }
 
     fn is_dir(&self, path: &str) -> bool {
@@ -172,8 +214,13 @@ impl RamFs {
             return Err(format!("is a directory: {}", p));
         }
         let missing = self.missing_dirs(&p)?;
+        let old = self.files.get(&p).map_or(0, |d| file_cost(d.len()));
+        let add = file_cost(data.len()) + ENTRY_OVERHEAD * missing.len() as u64;
+        let new_file = usize::from(!self.files.contains_key(&p));
+        self.reserve(self.used + add - old, self.entries() + missing.len() + new_file)?;
         self.insert_dirs(missing);
         self.files.insert(p, data);
+        self.used += add - old;
         Ok(())
     }
 
@@ -196,8 +243,14 @@ impl RamFs {
             }
         }
         let missing = self.missing_dirs(&p)?;
+        let add = missing.len() as u64 + 1;
+        self.reserve(
+            self.used + ENTRY_OVERHEAD * add,
+            self.entries() + add as usize,
+        )?;
         self.insert_dirs(missing);
         self.dirs.insert(p);
+        self.used += ENTRY_OVERHEAD * add;
         Ok(())
     }
 
@@ -249,7 +302,8 @@ impl RamFs {
         if p == "/" {
             return Err("cannot remove root".to_string());
         }
-        if self.files.remove(&p).is_some() {
+        if let Some(data) = self.files.remove(&p) {
+            self.used -= file_cost(data.len());
             return Ok(());
         }
         if !self.is_dir(&p) {
@@ -260,12 +314,16 @@ impl RamFs {
             return Err(format!("directory not empty: {}", p));
         }
         for f in files {
-            self.files.remove(&f);
+            if let Some(data) = self.files.remove(&f) {
+                self.used -= file_cost(data.len());
+            }
         }
+        let freed = ENTRY_OVERHEAD * (dirs.len() as u64 + 1);
         for d in dirs {
             self.dirs.remove(&d);
         }
         self.dirs.remove(&p);
+        self.used -= freed;
         Ok(())
     }
 
@@ -291,6 +349,9 @@ impl RamFs {
         if from_is_dir && t.starts_with(&child_prefix(&f)) {
             return Err(format!("cannot rename a directory into itself: {}", t));
         }
+        if from_is_dir {
+            self.check_move_fits(&f, &t)?;
+        }
         let to_is_dir = self.is_dir(&t);
         let to_is_file = self.files.contains_key(&t);
         if to_is_file && from_is_dir {
@@ -303,15 +364,39 @@ impl RamFs {
             return Err(format!("directory not empty: {}", t));
         }
         if to_is_file {
-            self.files.remove(&t);
+            if let Some(data) = self.files.remove(&t) {
+                self.used -= file_cost(data.len());
+            }
         }
         if to_is_dir {
             self.dirs.remove(&t);
+            self.used -= ENTRY_OVERHEAD;
         }
         if from_is_dir {
             self.move_subtree(&f, &t);
         } else if let Some(data) = self.files.remove(&f) {
             self.files.insert(t, data);
+        }
+        Ok(())
+    }
+
+    /// Renaming onto a longer path grows every re-keyed descendant; none
+    /// of them may cross the path cap. Checked before any mutation.
+    fn check_move_fits(&self, from: &str, to: &str) -> FsResult<()> {
+        let growth = to.len() as isize - from.len() as isize;
+        if growth <= 0 {
+            return Ok(());
+        }
+        let prefix = child_prefix(from);
+        let too_long =
+            |k: &str| k.len() as isize + growth > MAX_PATH_BYTES as isize;
+        let keys = self
+            .files
+            .keys()
+            .map(String::as_str)
+            .chain(self.dirs.iter().map(String::as_str));
+        if keys.filter(|k| k.starts_with(&prefix)).any(too_long) {
+            return Err(format!("path too long after rename (max {})", MAX_PATH_BYTES));
         }
         Ok(())
     }
@@ -508,7 +593,7 @@ mod tests {
     use super::*;
 
     fn fs() -> RamFs {
-        RamFs::new()
+        RamFs::new(0) // unlimited: these tests are about structure
     }
 
     #[test]
@@ -610,6 +695,62 @@ mod tests {
         f.write("/f", vec![9]).unwrap();
         assert_eq!(f.read_bytes("/f").unwrap(), vec![9]);
         assert_eq!(f.stat("/f").unwrap().size, 1);
+    }
+
+    #[test]
+    fn quota_exact_fit_passes_one_more_byte_fails() {
+        let mut f = RamFs::new(ENTRY_OVERHEAD + 10);
+        f.write("/f", vec![0u8; 10]).unwrap(); // fills the quota exactly
+        assert_eq!(f.write("/f", vec![0u8; 11]).unwrap_err(), "fs quota exceeded");
+        assert_eq!(f.read_bytes("/f").unwrap().len(), 10); // unchanged after failure
+        assert_eq!(f.write("/g", vec![0]).unwrap_err(), "fs quota exceeded");
+        assert!(!f.exists("/g"));
+        f.write("/f", vec![0u8; 9]).unwrap(); // shrinking always fits
+        f.write("/f", vec![0u8; 10]).unwrap(); // and refills to the brim
+    }
+
+    #[test]
+    fn quota_counts_directories_and_survives_structural_ops() {
+        let mut f = RamFs::new(ENTRY_OVERHEAD * 2 + 1);
+        f.mkdir("/d", true).unwrap(); // 64
+        f.write("/d/a", vec![1]).unwrap(); // +65 = 129, the whole quota
+        assert_eq!(f.write("/d/b", vec![1]).unwrap_err(), "fs quota exceeded");
+        assert!(!f.exists("/d/b"));
+        f.remove("/d/a", false).unwrap(); // free the file, keep the dir
+        f.rename("/d", "/e").unwrap(); // re-keying must not double-count
+        f.write("/e/b", vec![1]).unwrap();
+        assert!(f.exists("/e/b") && !f.exists("/d"));
+        let mut f2 = RamFs::new(0); // 0 disables the quota entirely
+        f2.write("/x", vec![0u8; 8192]).unwrap();
+        assert_eq!(f2.read_bytes("/x").unwrap().len(), 8192);
+    }
+
+    #[test]
+    fn path_and_entry_caps_have_clear_errors() {
+        let mut f = fs();
+        let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
+        assert!(f.write(&long, vec![]).unwrap_err().starts_with("path too long"));
+        let exact = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
+        f.write(&exact, vec![]).unwrap(); // at the cap is fine
+        let mut full = fs();
+        for i in 0..MAX_ENTRIES {
+            full.mkdir(&format!("/d{}", i), false).unwrap();
+        }
+        assert!(full.mkdir("/over", false).unwrap_err().contains("fs entry limit exceeded"));
+    }
+
+    #[test]
+    fn used_accounting_matches_a_full_recount() {
+        let mut f = fs();
+        f.write("/a/b/c", vec![1, 2, 3]).unwrap();
+        f.mkdir("/x/y", true).unwrap();
+        f.write("/m", vec![0u8; 100]).unwrap();
+        f.remove("/m", false).unwrap();
+        f.rename("/a", "/z").unwrap();
+        f.write("/z/b/c", vec![9]).unwrap();
+        let recount = f.files.values().map(|d| file_cost(d.len())).sum::<u64>()
+            + ENTRY_OVERHEAD * (f.dirs.len() as u64 - 1); // root is free
+        assert_eq!(f.used, recount);
     }
 
     #[test]

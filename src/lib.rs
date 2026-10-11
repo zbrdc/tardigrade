@@ -27,6 +27,8 @@ mod timers;
 mod watchdog;
 mod world;
 
+pub use fs::DEFAULT_FS_QUOTA_BYTES;
+
 use std::io::Write;
 use std::sync::mpsc;
 
@@ -52,6 +54,9 @@ pub struct Config {
     /// True when the entry source was read from stdin, so guest stdin is
     /// already at EOF.
     pub stdin_consumed: bool,
+    /// RAM filesystem quota in bytes: file content plus 64 bytes per file
+    /// or directory entry. 0 disables it. Default 64 MiB.
+    pub fs_quota_bytes: u64,
 }
 
 impl Default for Config {
@@ -63,6 +68,7 @@ impl Default for Config {
             preload: None,
             dump: None,
             stdin_consumed: false,
+            fs_quota_bytes: DEFAULT_FS_QUOTA_BYTES,
         }
     }
 }
@@ -241,7 +247,7 @@ fn execute(
     cfg: &Config,
     replies: Option<&serve::ReplySink>,
 ) -> i32 {
-    let mut world = World::new();
+    let mut world = World::new(cfg.fs_quota_bytes);
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
 

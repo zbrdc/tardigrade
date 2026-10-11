@@ -49,9 +49,9 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(fs_quota_bytes: u64) -> Self {
         World {
-            fs: RamFs::new(),
+            fs: RamFs::new(fs_quota_bytes),
             timers: Vec::new(),
             next_timer_id: 1,
             net: VecDeque::new(),

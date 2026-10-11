@@ -164,6 +164,34 @@ fn fs_stores_bytes_and_write_accepts_strings_arrays_and_views() {
 }
 
 #[test]
+fn fs_quota_flag_enforces_the_limit_and_leaves_state_unchanged() {
+    // 1 MiB quota; a root-level file of quota minus the 64-byte entry
+    // overhead fits exactly, one byte more does not.
+    let path = script(
+        "quota-cli",
+        "const CAP = 1048576 - 64;
+         vm.fs.write('/f', new Uint8Array(CAP));
+         console.log(vm.fs.stat('/f').size);
+         try { vm.fs.write('/f', new Uint8Array(CAP + 1)); console.log('no throw'); }
+         catch (e) { console.log(e.message, vm.fs.stat('/f').size); }
+         try { vm.fs.mkdir('/d', {recursive: true}); } catch (e) { console.log(e.message, vm.fs.exists('/d')); }",
+    );
+    let r = v8vm(&["--fs-quota=1", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1048512\nfs quota exceeded 1048512\nfs quota exceeded false\n");
+}
+
+#[test]
+fn fs_quota_zero_disables_the_limit_and_bad_values_exit_2() {
+    let path = script("quota-off", "vm.fs.write('/f', new Uint8Array(1048576 + 1)); console.log(vm.fs.stat('/f').size);");
+    let r = v8vm(&["--fs-quota=0", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1048577\n");
+    assert_eq!(v8vm(&["--fs-quota=x", "-"], b"").code, 2);
+    assert_eq!(v8vm(&["--fs-quota=18446744073709551616", "-"], b"").code, 2);
+}
+
+#[test]
 fn dump_then_preload_restores_the_filesystem() {
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("roundtrip.json");
     let writer = script("dump-writer", "vm.fs.write('/k', 'v\\u00e9');");
