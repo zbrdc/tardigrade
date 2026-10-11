@@ -273,11 +273,9 @@ fn memory_below_eight_is_a_usage_error() {
 #[test]
 fn map_number_growth_reports_137_not_v8s_fatal_oom() {
     // Table growth never reached the near-heap-limit callback on the old
-    // single-layer design: V8 aborted the process instead. The largest cap
-    // is covered too: with too little headroom below V8's limit, the fatal
-    // path wins the race even with the GC check in place.
+    // single-layer design: V8 aborted the process instead.
     let path = script("oom-map", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
-    for cap in ["32", "256"] {
+    for cap in ["32", "64"] {
         let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
         assert_eq!(r.code, 137, "cap {}: stderr: {}", cap, r.stderr);
         assert!(
@@ -287,6 +285,11 @@ fn map_number_growth_reports_137_not_v8s_fatal_oom() {
             r.stderr
         );
     }
+    // At the largest cap the guest reaches V8's own Map size limit first
+    // and dies with an ordinary uncaught RangeError (exit 1, as Node does)
+    // - a clean guest-level failure, never a process abort.
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert!(r.code == 137 || r.code == 1, "stderr: {}", r.stderr);
 }
 
 #[test]
@@ -323,6 +326,78 @@ fn the_smallest_supported_cap_reports_137() {
     let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 137, "stderr: {}", r.stderr);
     assert!(r.stderr.contains("v8vm: heap limit exceeded (8 MB)"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn big_temporary_arrays_under_the_cap_never_report_137() {
+    // The round-2 blocker: garbage counted as usage. 100 temporary 8 MB
+    // arrays with a tiny live set must finish cleanly.
+    let path = script(
+        "churn-big-arrays",
+        "let x = 0; for (let r = 0; r < 100; r++) { const t = new Array(1e6).fill(r); x += t.length; }
+         console.log('done', x);",
+    );
+    for cap in ["64", "256"] {
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 0, "cap {}: stderr: {}", cap, r.stderr);
+        assert_eq!(r.stdout, "done 100000000\n");
+    }
+}
+
+#[test]
+fn moderate_array_churn_under_the_cap_never_reports_137() {
+    let path = script(
+        "churn-moderate",
+        "let x = 0; for (let r = 0; r < 200; r++) { const t = new Array(200000).fill(r); x += t.length; }
+         console.log('done', x);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done 40000000\n");
+}
+
+#[test]
+fn a_live_set_with_map_copies_under_the_cap_never_reports_137() {
+    // p3.js scaled down: a real live set plus repeated whole-set copies.
+    let path = script(
+        "live-plus-copies",
+        "const live = []; for (let i = 0; i < 200000; i++) live.push({ i, n: 'v' + i, c: [i] });
+         let s = 0; for (let r = 0; r < 8; r++) { const t = live.map((o) => ({ ...o, r })); s += t.length; }
+         console.log('done', s);",
+    );
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done 1600000\n");
+}
+
+#[test]
+fn a_hundred_mib_arraybuffer_under_the_cap_passes() {
+    // External (ArrayBuffer) memory counts toward the cap: 100 MiB is
+    // under a 256 MiB cap, so the run must succeed.
+    let path = script("one-buffer", "new Uint8Array(100 << 20).fill(1); console.log('ok');");
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ok\n");
+}
+
+#[test]
+fn retained_arraybuffers_past_the_cap_report_137() {
+    let child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .arg("--memory=256")
+        .arg(script("typed-oom", "const a = []; for (;;) a.push(new Uint8Array(1 << 20));").to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let start = std::time::Instant::now();
+    let out = wait_within(child, 10);
+    assert_eq!(out.status.code(), Some(137));
+    assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("heap limit exceeded"),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

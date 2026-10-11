@@ -243,6 +243,10 @@ fn execute_inner(
         spec.cfg.timeout_ms,
         world_mut(scope).term.clone(),
     );
+    let heap_watch = heap::HeapWatch::new(
+        handle.clone(),
+        world_mut(scope).heap_guard,
+    );
 
     let mut code = eval_entry(scope, spec);
     if code == 0 {
@@ -252,6 +256,7 @@ fn execute_inner(
         };
     }
     drop(watchdog);
+    drop(heap_watch);
 
     if let Some(dump) = &spec.cfg.dump {
         if world_mut(scope).heap_oom_happened {
@@ -275,21 +280,20 @@ fn execute(
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
 
-    // The user cap is enforced below V8's own hard limit: V8 may grow into
-    // the headroom so allocation paths that never reach the near-heap-limit
-    // callback still pass a GC first and are stopped by the prologue check.
-    // The headroom is twice the cap (at least 32 MiB): shapes that grow by
-    // doubling (tables) request their next size while still under the cap,
-    // and a smaller margin lets that request hit V8's fatal path first.
-    // Caps below 8 MB cannot sustain V8 and are clamped up.
-    let cap_mb = cfg.heap_mb.max(8);
-    let v8_max_mb = cap_mb + (2 * cap_mb).max(32);
+    // The user cap (JS heap plus ArrayBuffer memory) is enforced below
+    // V8's own hard limit: V8 may grow into the headroom so allocation
+    // paths that never reach the near-heap-limit callback still pass a GC
+    // first and are judged post-collection. The heap starts small: a large
+    // explicit initial size makes this V8 saturate the old generation near
+    // that size ("reduce" GCs, then its fatal OOM) far below the maximum.
+    let (cap_mb, v8_max_bytes) = heap::plan(cfg.heap_mb);
     world.heap_mb = cap_mb;
+    world.heap_cap_bytes = cap_mb << 20;
     let term = world.term.clone();
-    // A large explicit initial heap makes this V8 saturate the old
-    // generation near that size ("reduce" GCs, then its fatal OOM) well
-    // below the raised max, so the heap starts small and grows instead.
-    let params = v8::CreateParams::default().heap_limits(0, v8_max_mb << 20);
+    let external = world.external_bytes.clone();
+    let params = v8::CreateParams::default()
+        .heap_limits(0, v8_max_bytes)
+        .array_buffer_allocator(heap::counting_allocator(external.clone()));
 
     // The guard must outlive the isolate even on a panic unwind (drop
     // order is reverse declaration), because isolate teardown runs GC that
@@ -302,6 +306,8 @@ fn execute(
             handle.clone(),
             term.clone(),
             cap_mb << 20,
+            external.clone(),
+            v8_max_bytes,
         )));
         let data = guard.callback_data();
         isolate.add_near_heap_limit_callback(heap::on_near_heap_limit, data);
@@ -311,6 +317,7 @@ fn execute(
     // teardown the annex nulls its isolate pointer before the slots are
     // dropped, so the slot's Global handles see a disposed isolate and skip
     // resetting themselves (v8 handle.rs) - no manual clearing needed.
+    world.heap_guard = guard_slot.as_deref().expect("guard installed") as *const heap::HeapGuard;
     isolate.set_slot(world);
     isolate.set_promise_reject_callback(promise_reject_callback);
 

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -124,6 +124,14 @@ pub(crate) struct World {
     pub(crate) term: Arc<Termination>,
     /// The effective cap, for the OOM report.
     pub(crate) heap_mb: usize,
+    /// The cap in bytes (heap + external memory) the checks judge against.
+    pub(crate) heap_cap_bytes: usize,
+    /// Live ArrayBuffer backing-store bytes from the counting allocator.
+    pub(crate) external_bytes: Arc<AtomicUsize>,
+    /// This run's heap guard, set once it exists; read-only for the
+    /// heap-watch thread (its fields are atomics or immutable) and not
+    /// dereferenced after the run concludes.
+    pub(crate) heap_guard: *const crate::heap::HeapGuard,
     /// Sticky: an OOM concluded this run (the reason itself is consumed by
     /// the single take that decides the exit code).
     pub(crate) heap_oom_happened: bool,
@@ -150,6 +158,9 @@ impl World {
             exit_code: AtomicI32::new(-1),
             term: Arc::new(Termination::new()),
             heap_mb: 0,
+            heap_cap_bytes: 0,
+            external_bytes: Arc::new(AtomicUsize::new(0)),
+            heap_guard: std::ptr::null(),
             heap_oom_happened: false,
             pending_rejections: HashMap::new(),
             next_rejection_seq: 0,

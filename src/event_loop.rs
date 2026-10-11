@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 use crate::diag::{rejection_text, report};
+use crate::heap;
 use crate::stdin;
 use crate::world::{world_mut, NetMsg, World};
 use v8::HandleScope;
@@ -230,6 +231,7 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
 
 pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     loop {
+        heap::host_checkpoint(scope);
         if let Some(c) = stopped(scope) {
             return c;
         }
@@ -266,6 +268,7 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     // still count, and a termination that landed as the loop wound down
     // (idle runs notice the watchdog only through the reason flag) ends
     // the run instead of falling through to a clean exit.
+    heap::host_checkpoint(scope);
     scope.perform_microtask_checkpoint();
     if let Some(c) = stopped(scope).or_else(|| check_unhandled(scope)) {
         return c;
