@@ -71,4 +71,5 @@ localhost:
   instead of answering 502 and restarting the guest;
 - the status code and content type returned by the guest are written into
   the response unchecked: a content type containing CR or LF can inject
-  headers, and every status is sent with the reason phrase `OK`.
+  headers, and every status other than 200, 500 and 504 is sent with the reason
+  phrase `OK`.
