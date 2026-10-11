@@ -291,6 +291,16 @@ fn map_number_growth_reports_137_not_v8s_fatal_oom() {
 }
 
 #[test]
+fn small_object_growth_reports_137() {
+    // Fine-grained growth never reaches the near-heap-limit callback in
+    // this V8; the GC epilogue is what catches it at the cap.
+    let path = script("oom-objects", "const a = []; for (;;) a.push({});");
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+}
+
+#[test]
 fn set_growth_reports_137_at_the_largest_cap() {
     // The deterministic over-cap shape at 256: the Map-size race above does
     // not exist for string Sets.
@@ -417,11 +427,12 @@ fn a_caught_arraybuffer_failure_does_not_kill_later_work() {
 
 #[test]
 fn a_huge_memory_flag_does_not_wrap() {
-    // 16 TiB in MB used to shift-wrap to zero at two call sites.
-    let path = script("huge-cap", "console.log('ok');");
+    // 16 TiB in MB used to shift-wrap to zero at two call sites; a zero
+    // cap would refuse this buffer.
+    let path = script("huge-cap", "const b = new Uint8Array(1 << 20); b[0] = 1; console.log('ok', b[0]);");
     let r = v8vm(&["--memory=17592186044416", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    assert_eq!(r.stdout, "ok\n");
+    assert_eq!(r.stdout, "ok 1\n");
 }
 
 #[test]
