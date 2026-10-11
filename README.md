@@ -38,12 +38,12 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Contact
 
-Use [GitHub issues](https://github.com/zbrdc/v8-vm/issues) for problems and
+Use [GitHub issues](https://github.com/zbrdc/tardigrade/issues) for problems and
 questions, and pull requests for changes.
 
 ## Source code
 
-    git clone https://github.com/zbrdc/v8-vm
+    git clone https://github.com/zbrdc/tardigrade
 
 ## Security problems
 
