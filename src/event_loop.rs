@@ -239,7 +239,26 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
 }
 
 pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
+    turn_loop(scope, &mut |_| false)
+}
+
+/// event_loop that also returns 0 as soon as `done` is satisfied (checked
+/// at each turn and after each microtask drain): a caller waiting for one
+/// promise must not also wait out every other pending job. Leftover work
+/// stays scheduled for the next caller, exactly as an idle return would
+/// leave it.
+pub(crate) fn event_loop_while(
+    scope: &mut HandleScope,
+    done: &mut dyn FnMut(&mut HandleScope) -> bool,
+) -> i32 {
+    turn_loop(scope, done)
+}
+
+fn turn_loop(scope: &mut HandleScope, done: &mut dyn FnMut(&mut HandleScope) -> bool) -> i32 {
     loop {
+        if done(scope) {
+            return 0;
+        }
         if let Some(c) = stopped(scope) {
             return c;
         }
@@ -251,6 +270,9 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
         }
         if let Some(c) = drain_microtasks(scope) {
             return c;
+        }
+        if done(scope) {
+            return 0;
         }
         if stdin::poll_stdin(scope) {
             // Resolving a waiter runs its continuations; a rejection or a

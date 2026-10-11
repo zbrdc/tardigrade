@@ -1855,6 +1855,126 @@ fn the_command_timeout_bounds_a_repeating_timer() {
 }
 
 #[test]
+fn vm_exit_at_the_deadline_wins_or_never_happened() {
+    // Spin right at the budget, then vm.exit(9): either vm.exit ran and
+    // the session ends with 9 and no reply, or the deadline killed the
+    // spin before vm.exit ran and the session answers and continues.
+    // The bug signature - exit 9 together with replies - must not occur.
+    let path = script("serve-exit-race", "globalThis.state = { n: 0 };");
+    for i in 0..10 {
+        let spin = [1.7, 1.85, 1.95, 2.0, 2.05][i % 5];
+        let cmd = format!(
+            "(function(){{var t=performance.now();while(performance.now()-t<{spin});vm.exit(9)}})()\n'x'\n"
+        );
+        let r = v8vm_bounded(
+            &["--command-timeout=2", "--serve", path.to_str().unwrap()],
+            cmd.as_bytes(),
+            std::time::Duration::from_secs(20),
+        );
+        let exited = r.code == 9;
+        assert_eq!(exited, r.stdout.is_empty(), "session {}: code {} stdout {:?}", i, r.code, r.stdout);
+        if !exited {
+            assert_eq!(r.code, 0, "session {}: stderr {}", i, r.stderr);
+        }
+    }
+}
+
+#[test]
+fn vm_exit_in_a_leftover_timer_ends_the_session_after_the_reply() {
+    let r = serve_with(&["--command-timeout=500"], "serve-exit-timer", "setTimeout(() => vm.exit(4), 10), 1\n");
+    assert_eq!(r.code, 4, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n", "the reply goes out before the exit lands");
+}
+
+#[test]
+fn vm_exit_wins_when_the_command_timeout_fires_on_top_of_it() {
+    // The timer sets the exit code and then spins: the command timeout
+    // that stops the spin must not swallow the exit - the session ends
+    // with 4, no later command runs, no timeout is reported.
+    let r = serve_with(
+        &["--command-timeout=400"],
+        "serve-exit-over-timeout",
+        "setTimeout(() => { vm.exit(4); for (;;) {} }, 10), 1\n'x'\n",
+    );
+    assert_eq!(r.code, 4, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n");
+    assert!(!r.stderr.contains("timed out"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn an_await_is_not_held_hostage_by_other_pending_work() {
+    // A live repeating timer must not hold the reply until the budget:
+    // the loop runs turn by turn and stops when the promise settles.
+    // (Each later boundary still spends its own budget on the interval,
+    // hence the stderr lines and the generous bound.)
+    let r = v8vm_bounded(
+        &["--command-timeout=400", "--serve", script("serve-await-turns", "globalThis.state = { n: 0 };").to_str().unwrap()],
+        b"(setInterval(() => {}, 10), new Promise((r) => setTimeout(() => r(1), 50)))\n2\n",
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "1\n2\n", "the reply is the settled value, not a timeout");
+    assert!(r.stderr.contains("timed out after its reply"), "stderr: {}", r.stderr);
+}
+
+/// Spawns a serve session, feeds `commands`, and reads the first reply
+/// line within `limit` (None: none came). The child is killed by pid:
+/// leftover repeating work can hold the session long past its reply.
+fn serve_first_reply(args: &[&str], commands: &[u8], limit: std::time::Duration) -> Option<String> {
+    use std::io::BufRead;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let mut pipe = child.stdin.take().unwrap();
+    let input = commands.to_vec();
+    std::thread::spawn(move || {
+        let _ = pipe.write_all(&input);
+    });
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let got = std::io::BufReader::new(out).read_line(&mut line).unwrap_or(0);
+        let _ = tx.send((got > 0).then(|| line.trim_end().to_string()));
+    });
+    let reply = rx.recv_timeout(limit).ok().flatten();
+    child.kill().expect("kill serve child");
+    let _ = child.wait();
+    reply
+}
+
+#[test]
+fn an_await_answers_promptly_without_a_command_timeout() {
+    // Without --command-timeout the old code waited for the loop to go
+    // idle; a live interval meant no reply ever. The reply must arrive
+    // while the interval still runs (the session itself is then killed by
+    // pid: that interval holds its boundary forever - pre-existing).
+    let path = script("serve-await-noflag", "globalThis.state = { n: 0 };");
+    let reply = serve_first_reply(
+        &["--serve", path.to_str().unwrap()],
+        b"(setInterval(() => {}, 10), new Promise((r) => setTimeout(() => r(1), 50)))\n",
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(reply.as_deref(), Some("1"));
+}
+
+#[test]
+fn a_hijacked_then_cannot_break_the_one_line_protocol() {
+    // A guest-replaced Promise.prototype.then can hand back arbitrary
+    // text; the reply contract (one JSON line) wins over it.
+    let r = serve(
+        "serve-hijacked-then",
+        "Promise.prototype.then = function () { return 'multi\\nline'; }, Promise.resolve(1)\n5\n",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{\"$error\":\"<encoding failed>\"}\n5\n");
+}
+
+#[test]
 fn vm_exit_wins_over_the_command_timeout() {
     let r = serve_with(&["--command-timeout=100000"], "serve-exit-cmd", "vm.exit(7)\n");
     assert_eq!(r.code, 7, "stderr: {}", r.stderr);
@@ -1910,28 +2030,52 @@ fn serve_command_timeout_breaks_a_spinning_await_and_state_survives() {
 
 #[test]
 fn a_command_finishing_at_its_deadline_does_not_poison_the_next() {
-    // Each command spins exactly its budget, so the watchdog fires right
-    // as the command finishes: the pending terminate request must be
-    // cancelled (a request is invisible to is_execution_terminating until
-    // processed), or the next command dies with no reply and exit 124.
+    // Interleaved: each spin runs right at the 2 ms budget, so the
+    // watchdog fires just as the command finishes, and the trivial
+    // command after it must still answer exactly. A leftover pending
+    // terminate (or a late one) shows up as a false "timed out" on a
+    // trivial command, a dropped reply, or a killed session.
     let mut commands = String::new();
-    for i in 0..300 {
+    for i in 0..4000 {
+        let spin = [1.7, 1.85, 1.95, 2.0, 2.05, 2.15][i % 6];
         commands.push_str(&format!(
-            "(function(){{var t=performance.now();while(performance.now()-t<2);return {i}}})()\n"
+            "(function(){{var t=performance.now();while(performance.now()-t<{spin});}})()\n'ok{i}'\n"
         ));
     }
-    let r = v8vm_bounded(
-        &["--command-timeout=2", "--serve", script("serve-edge", "globalThis.state = { n: 0 };").to_str().unwrap()],
-        commands.as_bytes(),
-        std::time::Duration::from_secs(60),
-    );
-    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
-    let lines: Vec<&str> = r.stdout.lines().collect();
-    assert_eq!(lines.len(), 300, "every command answered");
-    for (i, line) in lines.iter().enumerate() {
-        let ok = *line == format!("{i}") || *line == "{\"$error\":\"command timed out\"}";
-        assert!(ok, "line {}: {}", i, line);
+    let path = script("serve-edge", "globalThis.state = { n: 0 };");
+    let args = ["--command-timeout=2", "--serve", path.to_str().unwrap()];
+    // One retry: a microsecond command can honestly expire when the
+    // parallel test harness stalls its process past the tiny 2 ms budget
+    // (its own watchdog, wall clock) - the session survives either way.
+    // The ordering bug instead kills the session or drops replies: no
+    // retry can mask that, and the retry run must be clean.
+    let mut first_corrupt: Option<Vec<String>> = None;
+    for _ in 0..2 {
+        let r = v8vm_bounded(&args, commands.as_bytes(), std::time::Duration::from_secs(60));
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        let lines: Vec<&str> = r.stdout.lines().collect();
+        assert_eq!(lines.len(), 8000, "every command answered, none lost");
+        for i in (0..8000).step_by(2) {
+            assert!(
+                lines[i] == "null" || lines[i].contains("$error"),
+                "spin {}: {}",
+                i,
+                lines[i]
+            );
+        }
+        let corrupt: Vec<&str> = (0..8000)
+            .step_by(2)
+            .map(|i| lines[i + 1])
+            .enumerate()
+            .filter(|(j, l)| **l != format!("\"ok{}\"", j))
+            .map(|(_, l)| l)
+            .collect();
+        if corrupt.is_empty() {
+            return;
+        }
+        first_corrupt = Some(corrupt.iter().map(|s| s.to_string()).collect());
     }
+    panic!("trivial commands corrupted in both runs: {:?}", first_corrupt);
 }
 
 #[test]
@@ -2076,6 +2220,7 @@ fn v8vm_bounded_started(
     limit: std::time::Duration,
     started: impl FnOnce(u32),
 ) -> Run {
+    use std::io::Read;
     let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
         .args(args)
         .stdin(Stdio::piped())
@@ -2090,6 +2235,20 @@ fn v8vm_bounded_started(
         let _ = pipe.write_all(&input);
         // pipe drops here: EOF without any trailing newline from us
     });
+    // Drain both pipes while waiting: a long session outproduces the pipe
+    // capacity and would otherwise block on its own stdout forever.
+    let mut out_pipe = child.stdout.take().unwrap();
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let mut err_pipe = child.stderr.take().unwrap();
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll v8vm") {
@@ -2103,11 +2262,12 @@ fn v8vm_bounded_started(
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     feeder.join().unwrap();
-    let out = child.wait_with_output().expect("collect v8vm output");
+    let stdout = String::from_utf8(out_reader.join().expect("stdout reader")).unwrap();
+    let stderr = String::from_utf8(err_reader.join().expect("stderr reader")).unwrap();
     Run {
         code: status.code().expect("exit code, not a signal"),
-        stdout: String::from_utf8(out.stdout).unwrap(),
-        stderr: String::from_utf8(out.stderr).unwrap(),
+        stdout,
+        stderr,
     }
 }
 

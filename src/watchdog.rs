@@ -54,21 +54,19 @@ impl Watchdog {
                         std::thread::sleep(DELIVER_SLICE);
                     }
                     Wake::Reason => {
-                        // A command timeout is serve's to recover from;
-                        // delivering it here would kill the session the
-                        // recovery is about to save.
-                        if term2.reason() == Some(TermReason::CommandTimeout) {
-                            std::thread::sleep(DELIVER_SLICE);
-                            continue;
-                        }
-                        // Deliver: keep re-requesting until the run ends,
-                        // so a request lost inside a V8 callback gets
-                        // retried from outside the isolate.
-                        while !term2.is_finished() {
+                        // Deliver a run-level reason, re-checking it every
+                        // slice: serve_loop consumes CommandTimeout reasons
+                        // to recover a session, and a reason read as None
+                        // (consumed between the wake and here) is nobody's
+                        // to deliver - terminating for it would kill a
+                        // healthy session with a bare 124. When the reason
+                        // is gone, fall through and wait for the next one.
+                        while !term2.is_finished()
+                            && matches!(term2.reason(), Some(r) if r != TermReason::CommandTimeout)
+                        {
                             iso.terminate_execution();
                             std::thread::sleep(DELIVER_SLICE);
                         }
-                        return;
                     }
                 }
             }
@@ -100,10 +98,12 @@ pub(crate) struct CommandWatchdog {
 }
 
 struct Guard {
+    /// Ends the thread: set once the command is over (normally or by
+    /// recovery); the thread exits its park or its re-request loop on it.
+    stop: Arc<(Mutex<bool>, Condvar)>,
     /// The spawned thread, when the spawn worked; None leaves the command
     /// without a deadline (a spawn failure must not panic here - it is the
     /// same failure it would be guarding).
-    stop: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 

@@ -308,12 +308,14 @@ structure) is a reply, not the end of the session:
   ...), and String(value) for anything else - a thrown string says
   itself
 - a thenable value (anything with a callable then; every Promise) is
-  awaited: it is adopted by Promise.resolve and the event loop runs
-  until it settles; the reply is the fulfillment value as JSON, or
-  {"$error":...} on rejection. The await is a handler, so a rejection of
-  the command's own value - a bare Promise.reject(...), an async
-  function that throws before its first await - is answered as an
-  $error and the session continues
+  awaited: it is adopted by Promise.resolve and the event loop runs,
+  turn by turn, until it settles - other pending work (a repeating
+  timer) cannot hold the reply hostage, and the leftover work stays
+  scheduled for the next command. The reply is the fulfillment value
+  as JSON, or {"$error":...} on rejection. The await is a handler, so
+  a rejection of the command's own value - a bare Promise.reject(...),
+  an async function that throws before its first await - is answered
+  as an $error and the session continues
 - unhandled rejections of other promises still fail the session as
   always: `(void Promise.reject(1), 2)` replies 2, then the run ends
   with exit 1 and one stderr line at the microtask checkpoint
@@ -328,13 +330,16 @@ structure) is a reply, not the end of the session:
   "v8vm: command timed out after its reply"), V8's pending termination
   is cancelled, and the session continues with its state intact. The
   watchdog enforcing it is per command and is settled (joined) before
-  the cancel - which is unconditional, because a terminate request
+  any cancel - which is unconditional, because a terminate request
   still pending is invisible to the engine's own flag - so neither a
   late terminate nor an unprocessed request can poison the next
-  command; a run-level reason (vm.exit, --timeout, the heap cap) that
-  races it still ends the session with its own code. Without the flag,
-  work a command leaves pending (a repeating timer) can hold the
-  session between commands indefinitely, as before
+  command. A guest vm.exit always wins, even when it lands while the
+  timeout is being recovered; a run-level reason (--timeout, the heap
+  cap) that races it still ends the session with its own code. An
+  uncaught exception thrown by a leftover timer or network listener
+  during that settling ends the session with exit 1, as in a plain
+  run. Without the flag, work a command leaves pending (a repeating
+  timer) can hold the session between commands indefinitely, as before
 
 Replies rendezvous with the caller's writer, so a reply is on stdout
 before anything the guest prints after it; output the command's own
