@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::stdin::StdinSub;
+use crate::timers::RunningTimer;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
 /// survives between loop turns.
@@ -49,8 +50,8 @@ pub(crate) struct World {
     /// This run's subscription to the process-wide stdin hub, created on the
     /// first vm.stdin.read() and dropped (released) when the run ends.
     pub(crate) stdin_sub: Option<StdinSub>,
-    // ids cleared via clear_timer while their callback was on the stack
-    pub(crate) cleared: Vec<u64>,
+    /// The timer whose callback is on the stack, if any.
+    pub(crate) running_timer: RunningTimer,
     exit_code: AtomicI32,
     /// Set by V8's near-heap-limit callback (through the shared Arc it
     /// holds; the callback gets no isolate reference to reach this slot).
@@ -74,7 +75,7 @@ impl World {
             stdin_waiters: Vec::new(),
             stdin_eof: false,
             stdin_sub: None,
-            cleared: Vec::new(),
+            running_timer: RunningTimer::new(),
             exit_code: AtomicI32::new(-1),
             heap_oom: Arc::new(AtomicBool::new(false)),
             heap_mb: 0,

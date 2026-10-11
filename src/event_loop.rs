@@ -93,19 +93,20 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
         };
         let idx = idx?;
         // Move the timer out: the callback may add/clear timers. Whether it
-        // was cleared during its own callback is tracked in world.cleared.
+        // cleared itself mid-callback is tracked in world.running_timer.
         let mut timer = world_mut(scope).timers.swap_remove(idx);
         let (id, repeat, interval_ms) = (timer.id, timer.repeat, timer.interval_ms);
+        world_mut(scope).running_timer.enter(id);
         let oc = call_fn(scope, &timer.cb);
+        world_mut(scope).running_timer.exit();
         if let Some(code) = stop_code(world_mut(scope), oc) {
             return Some(code);
         }
         let world = world_mut(scope);
-        if repeat && !world.cleared.contains(&id) {
+        if repeat && !world.running_timer.self_cleared() {
             timer.when = Instant::now() + Duration::from_millis(interval_ms.max(1));
             world.timers.push(timer);
         }
-        world.cleared.retain(|&c| c != id);
     }
 }
 

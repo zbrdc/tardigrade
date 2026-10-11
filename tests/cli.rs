@@ -208,6 +208,20 @@ fn timers_fire_in_due_order_and_clear_works() {
 }
 
 #[test]
+fn a_storm_of_set_and_clear_leaves_no_timers_behind() {
+    // 100k clear calls must not accumulate per-clear bookkeeping, and none
+    // of the cleared timers may ever fire.
+    let r = run_js(
+        "clear-storm",
+        "let ran = 0;
+         for (let i = 0; i < 100000; i++) clearTimeout(setTimeout(() => { ran++; }, 300));
+         setTimeout(() => console.log('ran=' + ran), 400);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ran=0\n");
+}
+
+#[test]
 fn net_messages_arrive_one_generation_per_turn() {
     let r = run_js(
         "net",
