@@ -75,10 +75,17 @@ and is not set by this repo.
   a clock), and every intrinsic it uses at call time is captured with
   it, so replaced globals (Reflect.construct, Function.prototype
   methods, ...) neither change what runs nor trap the original
-  constructor. The rebuilt constructor is shaped like the platform's:
-  own length, name, prototype, now, parse, UTC - all non-enumerable -
-  with a non-writable prototype property and a non-constructable,
-  correctly named now.
+  constructor, and guest-installed index accessors on
+  Array.prototype/Object.prototype are never run (the constructor's
+  arguments go to Reflect.construct as the strict arguments object,
+  whose indices are own data properties). The rebuilt constructor is
+  shaped like the platform's: own length, name, prototype, now, parse,
+  UTC - all non-enumerable - with a non-writable prototype property and
+  a non-constructable, correctly named now. Two things remain
+  detectable, though neither reads a clock: Function.prototype.toString
+  of Date and Date.now shows the prelude wrapper's source instead of
+  native code, and a virtual-mode construction carries one extra stack
+  frame (the wrapper in prelude.js) inside `new Date`.
   --seed plus --clock=virtual makes a guest that touches nothing real
   byte-for-byte reproducible across runs.
 - Wall-clock rules are unchanged under "--clock=virtual": --timeout
@@ -101,8 +108,10 @@ and is not set by this repo.
   loop turn after it.
 - "--epoch=<ms>" the Date timeline's zero point under --clock=virtual
   (default 0); a usage error without --clock=virtual, and above the
-  ECMAScript maximum time value (8640000000000000) - the timeline
-  clamps there instead of leaving the Date range
+  ECMAScript maximum time value (8640000000000000) - the Date timeline
+  clamps there instead of leaving the Date range, while performance.now()
+  keeps counting the raw timeline (a u64 of milliseconds, so it saturates
+  at 18446744073709551615 rather than clamping)
 - "--preload=<file>" seed vm.fs from a snapshot() JSON dump before the app runs
 - "--dump=<file>" write the snapshot to a file when the run ends: normal
   exit, vm.exit (also from a timer, microtask or stdin read), uncaught

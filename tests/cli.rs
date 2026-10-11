@@ -1934,16 +1934,24 @@ fn every_intrinsic_the_date_override_uses_survives_being_replaced() {
         const boom = function () { throw new Error("HIJACKED"); };
         const E = 77;
         const run = () => {
-          const out = [];
-          const t = (n, f) => { try { out.push(n + "=" + String(f())); } catch (x) { out.push(n + "!" + (x && x.name)); } };
+          // String accumulation, not an array: under the index accessors
+          // below, pushing into a fresh (holey) array runs their setters,
+          // and the harness must observe the override, not itself.
+          let out = "";
+          const t = (n, f) => {
+            try { out += n + "=" + String(f()) + " "; }
+            catch (x) { out += n + "!" + (x && x.name) + " "; }
+          };
           t("now", () => Date.now() === E);
           t("new", () => new Date().getTime() === E);
           t("arg", () => new Date(5).getTime() === 5);
+          t("multi", () => new Date(2000, 5, 7).getUTCFullYear() === 2000);
+          t("coerce", () => new Date({ valueOf: () => 5 }).getTime() === 5);
           t("call", () => Date() === Date());
           t("subclass", () => new (class extends Date {})().getTime() === E);
           t("utc", () => Date.UTC(1970, 0, 1) === 0);
           t("parse", () => typeof Date.parse("2000-01-01T00:00:00Z"));
-          return out.join(" ");
+          return out.trim();
         };
         const base = run();
         if (base.includes("HIJACKED")) { console.log("baseline broken:", base); vm.exit(1); }
@@ -1960,13 +1968,38 @@ fn every_intrinsic_the_date_override_uses_survives_being_replaced() {
           if (desc) DP(o, k, desc); else delete o[k];
           if (now !== base) { console.log("DIFFERS under", String(k), ":", now, "|", base); vm.exit(1); }
         }
+        // Round-2 probe shape: index accessors on the prototype chains.
+        // The override used to copy its arguments through a fresh array,
+        // and every copied index ran these traps (new Date(2000, 5, 7)
+        // built year 99999). The strict arguments object and the array
+        // literal both carry own data indices, so nothing may touch them.
+        let trapHits = 0;
+        const saved = [];
+        for (const proto of [Array.prototype, Object.prototype]) {
+          for (const idx of [0, 1, 2]) {
+            saved.push([proto, idx, GOPD(proto, idx)]);
+            DP(proto, idx, {
+              get() { trapHits++; return 99999; },
+              set() { trapHits++; },
+              configurable: true,
+            });
+          }
+        }
+        const trapped = run();
+        for (const [proto, idx, desc] of saved) {
+          if (desc) DP(proto, idx, desc); else delete proto[idx];
+        }
+        if (trapHits !== 0 || trapped !== base) {
+          console.log("TRAPPED", trapHits, "times:", trapped, "|", base);
+          vm.exit(1);
+        }
         console.log("stable", base);
         "#,
     );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(
         r.stdout,
-        "stable now=true new=true arg=true call=true subclass=true utc=true parse=number\n"
+        "stable now=true new=true arg=true multi=true coerce=true call=true subclass=true utc=true parse=number\n"
     );
 }
 

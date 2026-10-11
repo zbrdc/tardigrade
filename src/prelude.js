@@ -166,14 +166,6 @@ if (typeof globalThis.__virtualDateMs === "function") {
   const HostDate = Date;
   const __construct = Reflect.construct;
   const __apply = Reflect.apply;
-  const __Array = Array;
-  // Copies a strict arguments object without touching replaceable
-  // intrinsics (no spread, no Array.prototype.slice).
-  const __argsOf = (argsObj) => {
-    const list = __Array(argsObj.length);
-    for (let i = 0; i < argsObj.length; i++) list[i] = argsObj[i];
-    return list;
-  };
   // Date() as a function ignores its arguments (ECMA-262 21.4.2.1) and
   // builds its string without consulting the (replaceable)
   // Date.prototype methods; the captured toString does the same.
@@ -182,14 +174,19 @@ if (typeof globalThis.__virtualDateMs === "function") {
   // strict with a simple parameter list, so it carries no own
   // arguments/caller accessors the platform's constructor does not have.
   // Reflect.construct keeps new.target (subclasses, prototype changes)
-  // honest, and an explicit argument is passed through untouched, so
-  // new Date(ms) (and every other form) stays exact.
+  // honest, an explicit argument is passed through untouched, so
+  // new Date(ms) (and every other form) stays exact, and the strict
+  // arguments object - whose indices are own data properties - goes to
+  // Reflect.construct as-is: copying through any array would run guest
+  // index accessors on Array.prototype/Object.prototype instead.
+  // The no-argument [__vnow()] is an array literal, whose elements are
+  // own data properties from creation, so it cannot hit them either.
   const VDate = function Date() {
     "use strict";
     if (new.target === undefined) {
       return __apply(__dateString, new HostDate(__vnow()), []);
     }
-    return __construct(HostDate, arguments.length ? __argsOf(arguments) : [__vnow()], new.target);
+    return __construct(HostDate, arguments.length ? arguments : [__vnow()], new.target);
   };
   VDate.prototype = HostDate.prototype;
   // now stays non-constructable like the platform's (an arrow), with
