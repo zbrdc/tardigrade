@@ -96,9 +96,14 @@ impl HubState {
     /// Pulls one event for `id`: `Some(Some(chunk))` is data, `Some(None)`
     /// is EOF (and retires the subscription), `None` means nothing to take
     /// right now - the buffer is empty and stdin is not at EOF, or another
-    /// consumer is ahead in the queue.
+    /// consumer is ahead in the queue. EOF is sticky for the consumer too: an
+    /// id retired by its EOF (or unsubscribed) keeps seeing EOF, because it
+    /// can never reach the front again and would otherwise block forever.
     fn take_event(&mut self, id: u64) -> Option<Option<Vec<u8>>> {
         if self.subs.front() != Some(&id) {
+            if self.eof && !self.subs.contains(&id) {
+                return Some(None);
+            }
             return None;
         }
         if let Some(chunk) = self.take_chunk() {
@@ -367,6 +372,60 @@ mod tests {
         assert_eq!(h.try_take(a), Some(None));
         let (b, _) = h.subscribe();
         assert_eq!(h.try_take(b), Some(None));
+    }
+
+    #[test]
+    fn hub_eof_stays_visible_to_the_consumer_it_retired() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        h.close();
+        assert_eq!(h.try_take(a), Some(None));
+        assert_eq!(h.try_take(a), Some(None), "a second pull must not look blocked");
+    }
+
+    /// Runs `f` on a thread and fails instead of hanging if it takes over 5 s.
+    fn finishes_soon<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("hub call blocked instead of returning")
+    }
+
+    #[test]
+    fn hub_wait_take_after_the_final_chunk_and_eof_does_not_block() {
+        // The serve shape: the last command has no newline, so the consumer
+        // takes the chunk, then EOF, then asks again for the next command.
+        let h = std::sync::Arc::new(Hub::new());
+        let (a, _) = h.subscribe();
+        h.push(b"1+1".to_vec());
+        h.close();
+        let h2 = h.clone();
+        let events = finishes_soon(move || {
+            (h2.wait_take(a), h2.wait_take(a), h2.wait_take(a))
+        });
+        assert_eq!(events, (Some(b"1+1".to_vec()), None, None));
+    }
+
+    #[test]
+    fn hub_close_wakes_a_consumer_parked_in_wait_take() {
+        let h = std::sync::Arc::new(Hub::new());
+        let (a, _) = h.subscribe();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let consumer = {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(h.wait_take(a));
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.close();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("close() must wake the parked consumer");
+        assert_eq!(got, None);
+        consumer.join().unwrap();
     }
 
     #[test]

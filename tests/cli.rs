@@ -265,3 +265,52 @@ fn serve_replies_reach_stdout_before_later_guest_output() {
     }
     assert_eq!(violations, 0, "reply ordering violated {} of 50 times", violations);
 }
+
+/// Like `v8vm`, but kills the child and fails if it outlives `limit`, so a
+/// hang regression is a test failure instead of a stuck test run.
+fn v8vm_bounded(args: &[&str], stdin: &[u8], limit: std::time::Duration) -> Run {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let mut pipe = child.stdin.take().unwrap();
+    let input = stdin.to_vec();
+    let feeder = std::thread::spawn(move || {
+        let _ = pipe.write_all(&input);
+        // pipe drops here: EOF without any trailing newline from us
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll v8vm") {
+            break status;
+        }
+        if start.elapsed() > limit {
+            child.kill().expect("kill hung v8vm");
+            child.wait().expect("reap v8vm");
+            panic!("v8vm still running after {:?}", limit);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    feeder.join().unwrap();
+    let out = child.wait_with_output().expect("collect v8vm output");
+    Run {
+        code: status.code().expect("exit code, not a signal"),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+    }
+}
+
+#[test]
+fn serve_answers_a_final_command_without_a_trailing_newline_and_exits() {
+    let path = script("serve-no-newline", "globalThis.s = 1;");
+    let r = v8vm_bounded(
+        &["--serve", path.to_str().unwrap()],
+        b"1+1",
+        std::time::Duration::from_secs(10),
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "2\n");
+}
