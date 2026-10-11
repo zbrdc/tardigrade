@@ -21,6 +21,7 @@ mod event_loop;
 mod exit;
 mod fs;
 mod fs_api;
+mod heap;
 mod host;
 mod net;
 mod serve;
@@ -36,11 +37,11 @@ pub mod sandbox;
 pub use fs::DEFAULT_FS_QUOTA_BYTES;
 
 use std::io::Write;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use api::install;
 use diag::report;
-use event_loop::{event_loop, promise_reject_callback};
+use event_loop::{event_loop, promise_reject_callback, stopped};
 use watchdog::Watchdog;
 use world::{world_mut, World};
 
@@ -49,7 +50,8 @@ use world::{world_mut, World};
 pub struct Config {
     /// Wall-clock cap in ms; 0 disables. Default 60000.
     pub timeout_ms: u64,
-    /// V8 heap cap in MB. Default 256.
+    /// V8 heap cap in MB. Values below 8 are clamped up to 8 (V8 cannot
+    /// sustain a smaller heap). Default 256.
     pub heap_mb: usize,
     /// Arguments exposed to the guest as vm.args.
     pub args: Vec<String>,
@@ -108,6 +110,16 @@ macro_rules! guest_cb {
         pub(crate) extern "C" fn $name(info: *const v8::FunctionCallbackInfo) {
             let info = unsafe { &*info };
             let $scope = unsafe { &mut v8::CallbackScope::new(info) };
+            // Once the run is leaving (vm.exit, timeout, heap cap), guest
+            // callbacks return without side effects: the outcome is decided
+            // and nothing after that may print, write, or schedule. V8 only
+            // observes the termination at its next stack check, so blocked
+            // callbacks also re-request it - otherwise the guest keeps
+            // running JS on undefined results until it throws.
+            if crate::world::world_mut($scope).is_leaving() {
+                $scope.terminate_execution();
+                return;
+            }
             let $args = v8::FunctionCallbackArguments::from_function_callback_info(info);
             let mut $rv = v8::ReturnValue::from_function_callback_info(info);
             $body
@@ -227,16 +239,38 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
         return 0;
     }
     let mut tc = v8::TryCatch::new(scope);
-    if eval_src(&mut tc, spec.source, spec.entry).is_some() {
-        return 0;
-    }
+    let result = eval_src(&mut tc, spec.source, spec.entry);
     if tc.is_execution_terminating() {
         tc.cancel_terminate_execution();
-        let exit = world_mut(&mut tc).exit_code();
-        return if exit >= 0 { exit } else { 124 };
+        return world_mut(&mut tc).take_terminated_exit();
     }
-    report(&mut tc);
-    1
+    match result {
+        Some(_) => {
+            drop(tc);
+            // A vm.exit inside the script can be swallowed along with its
+            // termination; the guest's exit code still wins over the
+            // checkpoint decision (Node: process.exit beats a pending
+            // rejection).
+            let exit = world_mut(scope).exit_code();
+            if exit >= 0 {
+                return exit;
+            }
+            // End of the entry tick: V8 has drained the script's
+            // microtasks, so the checkpoint decision applies now, before
+            // any timer or network turn can rescue a rejection.
+            stopped(scope)
+                .or_else(|| event_loop::check_unhandled(scope))
+                .unwrap_or(0)
+        }
+        None => {
+            let decides = world_mut(&mut tc).exception_decides();
+            let code = world_mut(&mut tc).exception_exit();
+            if decides {
+                report(&mut tc);
+            }
+            code
+        }
+    }
 }
 
 /// Writes the dump straight from the run's RamFs: serialization is pure
@@ -278,7 +312,11 @@ fn execute_inner(
         return code;
     }
 
-    let watchdog = Watchdog::new(handle.clone(), spec.cfg.timeout_ms);
+    let watchdog = Watchdog::new(
+        handle.clone(),
+        spec.cfg.timeout_ms,
+        world_mut(scope).term.clone(),
+    );
 
     let mut code = eval_entry(scope, spec);
     if code == 0 {
@@ -299,35 +337,73 @@ fn execute_inner(
     code
 }
 
-fn execute(
-    source: &str,
-    entry: &str,
-    cfg: &Config,
-    replies: Option<&serve::ReplySink>,
-) -> i32 {
+/// Owns the isolate plus its heap guard with the drop order that keeps
+/// the guard (the V8 callbacks' data pointer) alive through the isolate's
+/// teardown GC, even on a panic unwind: struct fields drop in declaration
+/// order, so the isolate goes first.
+struct Guest {
+    isolate: v8::OwnedIsolate,
+    /// Kept for drop order: the guard (the callback's data pointer) must
+    /// outlive the isolate through its teardown GC. Never read.
+    _guard: Box<heap::HeapGuard>,
+}
+
+impl Guest {
+    fn new(cfg: &Config, mut world: World) -> (Guest, v8::IsolateHandle) {
+        // --memory caps the JS heap and ArrayBuffer memory separately,
+        // each at N. V8's own limit sits above the cap with headroom: the
+        // near-heap-limit callback fires only after V8's collections
+        // failed under that limit, and the headroom gives the raise room
+        // to unwind into (no headroom left several growth shapes aborting
+        // inside V8's allocation retry, which ignores termination). The
+        // heap starts small: a large explicit initial size makes this V8
+        // saturate the old generation far below the maximum.
+        let plan = heap::plan(cfg.heap_mb);
+        world.heap_mb = plan.cap_mb;
+        let term = world.term.clone();
+        world.ab_budget = Arc::new(heap::AllocState::new(plan.cap_bytes));
+        let params = v8::CreateParams::default()
+            .heap_limits(0, plan.v8_max_bytes)
+            .array_buffer_allocator(heap::counting_allocator(&world.ab_budget));
+
+        let mut isolate = v8::Isolate::new(params);
+        let handle = isolate.thread_safe_handle();
+        let mut guard = Box::new(heap::HeapGuard::new(handle.clone(), term.clone(), &plan));
+        guard.register(&mut isolate);
+        // The isolate owns the world through its embedder slot. On isolate
+        // teardown the annex nulls its isolate pointer before the slots
+        // are dropped, so the slot's Global handles see a disposed isolate
+        // and skip resetting themselves (v8 handle.rs) - no manual
+        // clearing needed.
+        isolate.set_slot(world);
+        isolate.set_promise_reject_callback(promise_reject_callback);
+        (Guest { isolate, _guard: guard }, handle)
+    }
+}
+
+fn execute(source: &str, entry: &str, cfg: &Config, replies: Option<&serve::ReplySink>) -> i32 {
     let mut world = World::new(cfg.fs_quota_bytes);
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
     // Seeded runs keep the PRNG counter in the World, so concurrent runs
     // with different seeds stay independent.
     world.random_state = cfg.seed;
-
-    // Heap cap; past it V8 aborts with its own out-of-memory report.
-    let params = v8::CreateParams::default().heap_limits(64 << 20, cfg.heap_mb << 20);
-    let mut isolate = v8::Isolate::new(params);
-    // The isolate owns the world through its embedder slot. On isolate
-    // teardown the annex nulls its isolate pointer before the slots are
-    // dropped, so the slot's Global handles see a disposed isolate and skip
-    // resetting themselves (v8 handle.rs) - no manual clearing needed.
-    isolate.set_slot(world);
-    isolate.set_promise_reject_callback(promise_reject_callback);
-    let handle = isolate.thread_safe_handle();
+    let term = world.term.clone();
 
     let spec = RunSpec { source, entry, cfg };
-    let mut hs = v8::HandleScope::new(&mut isolate);
-    let context = v8::Context::new(&mut hs, Default::default());
-    let scope = &mut v8::ContextScope::new(&mut hs, context);
-    execute_inner(scope, &handle, &spec, replies)
+    let (mut guest, handle) = Guest::new(cfg, world);
+    let code = {
+        let mut hs = v8::HandleScope::new(&mut guest.isolate);
+        let context = v8::Context::new(&mut hs, Default::default());
+        let mut scope = v8::ContextScope::new(&mut hs, context);
+        execute_inner(&mut scope, &handle, &spec, replies)
+    };
+    // Normally Watchdog::drop already finished the run; the early returns
+    // (prelude or preload failure) get here without one. Either way heap
+    // callbacks for the teardown GC stay inert, and the guard drops after
+    // the isolate.
+    term.finish();
+    code
 }
 
 /// Run one guest program and return its exit code.

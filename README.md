@@ -21,8 +21,8 @@ repo.
 
 ## Development
 
-    make test    # cargo test --release: unit tests plus all four test targets
-                 # (cli, library, stdin_hub, sandbox)
+    make test    # cargo test --release: unit tests plus all five test targets
+                 # (cli, webapi, library, stdin_hub, sandbox)
     make clippy  # cargo clippy --release --all-targets, warnings denied
     make check   # build, then scripted smoke checks over the examples
     make ci      # test, then clippy, then check, in that order; stops at the
@@ -44,7 +44,10 @@ and is not set by this repo.
 
 - entry "-" reads the program from stdin (then vm.stdin is at EOF)
 - "--timeout=<ms>" wall-clock kill (default 60000, 0 disables); exit 124
-- "--memory=<mb>" V8 heap cap in MB (default 256)
+- "--memory=<mb>" V8 heap cap in MB, minimum 8 (default 256); the CLI
+  rejects smaller values with exit 2, library callers have them clamped up;
+  a guest whose live JS heap V8 cannot collect below its limit exits 137
+  (the exact rule is under Guarantees and limits)
 - "--fs-quota=<mb>" RAM filesystem quota in MB (default 64, 0 disables)
 - "--seed=<u64>" deterministic Math.random: two runs with the same seed
   draw identical sequences, different seeds differ, and concurrent seeded
@@ -54,7 +57,9 @@ and is not set by this repo.
 - "--dump=<file>" write the snapshot to a file when the run ends: normal
   exit, vm.exit (also from a timer, microtask or stdin read), uncaught
   exception, unhandled rejection, timeout, or --serve reaching stdin EOF.
-  No dump is written after a V8 fatal out-of-memory abort (the process is
+  A run stopped by the heap cap (exit 137) still writes its dump, because
+  the dump is serialized in Rust and runs no JavaScript. No dump is written
+  after a V8 fatal out-of-memory abort (the process is
   gone), after a prelude failure (exit 1) or a preload failure (exit 2), or
   after a panic.
   A regular file, or a path that does not exist yet, is replaced
@@ -80,7 +85,8 @@ and is not set by this repo.
 - "--sandbox" OS self-containment for hostile code (Linux only), see below
 - "--sandbox-check" (only as the sole argument) exit 0 if --sandbox can work
   here, 2 if not; after the entry it is an ordinary guest argument
-- uncaught exceptions and unhandled promise rejections exit 1; usage errors 2
+- uncaught exceptions exit 1; usage errors 2; unhandled promise rejections
+  (still unhandled when the microtask queue drains) exit 1
 - "--dump" failure (the file or its directory cannot be written; the message
   names the path and the OS error) exits 74 when the guest itself exited 0; a
   failed guest keeps its own code. A dump can exceed V8's string limit (a
@@ -100,8 +106,11 @@ guests can run concurrently in one process and do not see each other's
 state. Process stdin is served by one process-wide reader shared by vm.stdin
 and serve() commands: input a run does not read is kept for the next run,
 and when several consumers read at once the first one receives the chunks.
-Isolation is per isolate within the process: a V8 out-of-memory abort or
-other V8 fatal error ends the whole process and every guest in it.
+Isolation is per isolate within the process: hitting the heap cap ends only
+that run (exit 137 for the JS heap, a catchable RangeError for
+ArrayBuffers), while other V8 fatal errors end the whole process and
+every guest in it. What --memory guarantees, and what it does not, is
+spelled out under Guarantees and limits.
 
 For hostile code call `v8vm::sandbox::apply(dump)` once, before the first
 run()/serve() and before any thread exists; it refuses otherwise. Read a
@@ -137,7 +146,7 @@ when nothing is pending: scripts that schedule nothing terminate immediately.
 | setTimeout/setInterval/clearTimeout/clearInterval | timer id semantics as usual |
 | queueMicrotask(fn) | Promise-based microtask |
 | vm.version / vm.args | engine version, arguments after the entry path |
-| vm.exit(code) | stop the program with code |
+| vm.exit(code) | stop the program with code; all host effects (output, writes, scheduling) stop immediately and the first exit wins - pure JS computation may run briefly until V8 observes the termination |
 | vm.run(path) | load-and-eval a file from the RAM fs |
 | vm.net.port() | fresh port number |
 | vm.net.listen(port, (payload, from) => ...) | receive messages on a port |
@@ -199,7 +208,13 @@ Details and limits of the web APIs above:
   result that no longer fits the heap, or a clone whose wire buffer
   cannot be allocated still ends with V8's own report - a RangeError
   from V8 where it can build one, its fatal out-of-memory report where
-  it cannot, like the heap cap does.
+  it cannot (one of the aborts listed under Guarantees and limits).
+  Buffers are the exception: every ArrayBuffer these paths create or
+  clone is charged to the run's ArrayBuffer budget (see --memory under
+  Guarantees and limits). A TextEncoder.encode result or a
+  vm.fs.readBytes copy that the budget refuses throws RangeError, and a
+  structuredClone whose buffer copy it refuses throws DataCloneError;
+  both are catchable and the run continues.
 
 
 WebAssembly, Intl/ICU, and all of ES2023 are available.
@@ -356,7 +371,10 @@ filters are installed with TSYNC.
   and the *xattrat family once did; they fail exactly like unknown numbers.
 
 Everything the runtime needs stays allowed: threads, mmap/mprotect for the
-JIT, futex, clocks, getrandom, and reads/writes on already-open descriptors.
+JIT, futex, nanosleep, clocks, getrandom, and reads/writes on already-open
+descriptors. The heap cap and the wall-clock timeout work under --sandbox:
+the watchdog thread is created after `apply` with clone(CLONE_THREAD) and
+needs only futex and nanosleep.
 At startup V8 probes /sys/devices/system/cpu/online, /proc/stat and
 /proc/self/maps; all are denied and V8 falls back (worker-pool sizing comes
 from sched_getaffinity) — /dev/urandom is allowed as above.
@@ -405,6 +423,17 @@ On other platforms (not Linux x86_64) the sandbox tests compile away, and
 
 ## Guarantees and limits
 
+- Guest-reachable process aborts remain (V8 fatal error, observed as
+  SIGTRAP, exit 133). Plainly: `const a = []; for (;;) a.push(new
+  Array(100).fill(1))` (and the same with 1000-element arrays) aborts the
+  process at every cap, and not even the wall-clock timeout is observed,
+  because V8 runs its allocation retry there without any interrupt
+  checkpoint. Other aborting shapes: a single `.fill` of an array too
+  large for V8's raised limit (`new Array(1e8).fill(0)` at any cap; a
+  bare `new Array(1e9)` is fine, it is a sparse array), string splitting
+  past V8's maximum string size (`'ab'.repeat(2e8).split('')`), and long
+  native builtins that ignore termination (`a.length = 2**32 - 1;
+  a.fill(0, 0, 2e8)` at small caps).
 - Guests make no syscalls: the only disk access a guest can trigger is at the
   host boundary (entry source, --preload and --dump files). Verify with
   strace -f -e trace=openat: besides those files, a run of examples/hello.js
@@ -415,8 +444,52 @@ On other platforms (not Linux x86_64) the sandbox tests compile away, and
   run. One delivery generation per loop turn.
 - This is an application-level sandbox, not a container: isolation is by
   omission of host APIs, per isolate inside one ordinary process. A V8
-  fatal error (for example the heap-cap abort below) ends the whole
+  fatal error (see the aborts listed first above) ends the whole
   process and every guest in it. For hostile code, add `--sandbox`
   (above) and/or run v8vm itself under a container/seccomp profile.
-- Hitting the heap cap aborts with the V8 out-of-memory report.
+- The heap cap terminates the guest, not the process. --memory=N caps the
+  JS heap and, separately, ArrayBuffer memory, each at N MB.
+  - JS heap: the guest is stopped (exit 137, one-line report on stderr)
+    only when V8 cannot collect its heap below V8's configured limit,
+    which is the cap plus max(2 x cap, 32 MiB): 5x the cap at cap 8, 3x
+    at cap 32 and above. A guest whose live heap stays below that limit
+    completes normally, even when it sits above the cap itself, and
+    churn whose collections succeed (multi-megabyte temporaries,
+    snapshots, JSON round-trips) never trips it. The enforcement is V8's
+    near-heap-limit callback, which marks the termination and raises the
+    limit so the pending allocation succeeds and the termination is
+    observed in JavaScript.
+  - Memory use: peak RSS is a fixed process overhead of about 150 MB
+    plus a heap part that grows with the cap for growth shapes.
+    Measured peaks: about 150-194 MB at cap 8, about 194 MB at cap 32,
+    about 1.67 GB at cap 256. Budget roughly 150 MB plus up to 6x the
+    cap; churn stays lower.
+  - Worst case: a native builtin that ignores interrupts can keep
+    allocating after the callback fired, up to the raised limit of 3 x
+    V8's limit, about 9 x the cap (the raise is `limit_ceiling` in
+    src/heap.rs). Past that V8 aborts the process as above.
+  - ArrayBuffers: allocations that would cross the cap are refused by
+    the counting allocator and surface in the guest as a catchable
+    RangeError. Buffers the host builds from Rust bytes
+    (TextEncoder.encode, vm.fs.readBytes) draw on the same budget and
+    throw RangeError when it refuses them; a structuredClone whose
+    buffer copy is refused throws DataCloneError. Garbage buffers are
+    collected and the charge retried before a refusal, so churn never
+    trips it.
+  - The smallest supported cap is 8 MB. Growth that hits V8's structural
+    limits (Map size, array length) or string limits fails as an
+    ordinary uncaught RangeError (exit 1), as Node does.
+  - Residual: object-key growth with primitive values
+    (`const o = {}; for (let i = 0;; i++) o["k" + i] = i;`) at large caps
+    (measured at 256) never reaches the heap limit - V8's name
+    dictionary slows down first - and ends only at the wall-clock
+    timeout (exit 124). Keep --timeout set for untrusted code.
+- Resizable ArrayBuffers, growable SharedArrayBuffers, and
+  WebAssembly.Memory are NOT capped: their pages are committed inside
+  V8's sandbox reservation, which does not go through the ArrayBuffer
+  allocator (there is no V8 12.9 flag to disable the feature;
+  `--no-harmony-rab-gsab` does not exist). A guest can therefore exceed
+  --memory with `new ArrayBuffer(n, { maxByteLength })` plus resize or
+  `new WebAssembly.Memory({ initial })`; treat --memory as advisory
+  where such memory is trusted.
 - No ES module resolution yet (keep sources in vm.fs and vm.run them).

@@ -10,6 +10,7 @@ use crate::diag::{throw, to_rust_string};
 use crate::fs::Stat;
 use crate::guest_cb;
 use crate::snapshot;
+use crate::webapi::throw_range;
 use crate::world::world_mut;
 
 /// Getting a guest string can end three ways: it converts, the
@@ -287,13 +288,11 @@ guest_cb!(fs_read_bytes, |args, rv, scope| {
         Ok(b) => b,
         Err(e) => return throw(scope, &e),
     };
-    // The backing store owns the bytes; the Uint8Array is a view over it.
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
-    let len = store.byte_length();
-    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
-    match v8::Uint8Array::new(scope, buffer, 0, len) {
+    // The backing store owns the bytes and is charged to the run's
+    // ArrayBuffer budget; the Uint8Array is a view over it.
+    match crate::heap::uint8_array_from(scope, bytes) {
         Some(view) => rv.set(view.into()),
-        None => throw(scope, "file too large to read as bytes"),
+        None => throw_range(scope, "Array buffer allocation failed"),
     }
 });
 

@@ -16,6 +16,32 @@ fn run_returns_the_guest_exit_code_and_can_run_again() {
     assert_eq!(v8vm::run("for (;;) {}", "spin.js", &v8vm::Config { timeout_ms: 50, ..cfg }), 124);
 }
 
+#[test]
+fn heap_cap_oom_returns_137_and_later_runs_still_work() {
+    let cfg = v8vm::Config {
+        heap_mb: 32,
+        // hermetic: the guest may not consume the test harness stdin
+        stdin_consumed: true,
+        ..Config::new()
+    };
+    let src = "const a = []; for (;;) a.push(new Array(1e5).fill(1));";
+    assert_eq!(v8vm::run(src, "oom.js", &cfg), 137);
+    // The OOM run's isolate died with its run; a later guest in the same
+    // process must be unaffected (no leaked termination or callback data).
+    assert_eq!(v8vm::run("1 + 1", "after.js", &Config::new()), 0);
+}
+
+#[test]
+fn a_library_cap_below_the_minimum_is_clamped_up() {
+    let cfg = v8vm::Config {
+        heap_mb: 4,
+        stdin_consumed: true,
+        ..Config::new()
+    };
+    let src = "const m = new Map(); for (let i = 0;; i++) m.set(i, i);";
+    assert_eq!(v8vm::run(src, "clamped.js", &cfg), 137);
+}
+
 /// Joins a guest thread with a bound, so a guest whose watchdog never fires
 /// fails the test instead of hanging it.
 fn join_bounded(handle: std::thread::JoinHandle<i32>, secs: u64) -> i32 {

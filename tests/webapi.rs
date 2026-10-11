@@ -544,16 +544,21 @@ fn structured_clone_validates_options_and_rejects_shared_buffers() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn decode_of_a_huge_buffer_under_memory_pressure_throws_instead_of_aborting() {
-    // 300 MB of ASCII under a 1.4 GB address-space cap: the input buffer
+    // 300 MB of ASCII under a 2 GB address-space cap: the input buffer
     // exists, but the Rust output reserve cannot. The fallible path turns
-    // that into a guest RangeError; the old path aborted the process.
+    // that into a guest RangeError; the old path aborted the process. The
+    // cap is raised so the 300 MB input fits the ArrayBuffer budget.
     let path = script(
         "decode-pressure",
         r#"const u = new Uint8Array(300 * 1048576).fill(65);
            try { new TextDecoder().decode(u); console.log("decoded"); }
            catch (e) { console.log(e.name, e.message); }"#,
     );
-    let r = v8vm_capped(1_400_000_000, &[path.to_str().unwrap()], b"");
+    let r = v8vm_capped(
+        2_000_000_000,
+        &["--memory=400", path.to_str().unwrap()],
+        b"",
+    );
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(
         r.stdout, "RangeError decoded text too large\n",

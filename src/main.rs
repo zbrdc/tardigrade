@@ -39,6 +39,9 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.timeout_set = true;
         } else if let Some(v) = a.strip_prefix("--memory=") {
             c.heap_mb = v.parse().map_err(|_| format!("bad --memory: {}", v))?;
+            if c.heap_mb < 8 {
+                return Err("--memory must be at least 8".to_string());
+            }
         } else if let Some(v) = a.strip_prefix("--preload=") {
             c.preload = Some(v.into());
         } else if let Some(v) = a.strip_prefix("--dump=") {

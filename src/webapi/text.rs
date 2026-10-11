@@ -15,18 +15,6 @@ use std::cell::Cell;
 
 // ---- TextEncoder ----
 
-/// Builds a Uint8Array owning its own copy of the bytes (same pattern as
-/// vm.fs.readBytes).
-fn u8_view<'s>(
-    scope: &mut v8::HandleScope<'s>,
-    bytes: Vec<u8>,
-) -> Option<v8::Local<'s, v8::Uint8Array>> {
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
-    let len = store.byte_length();
-    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
-    v8::Uint8Array::new(scope, buffer, 0, len)
-}
-
 /// One code point of the source, pre-encoded. `units` counts the UTF-16
 /// code units it occupies; an unpaired surrogate becomes U+FFFD over one
 /// unit, per the WHATWG encoder.
@@ -147,7 +135,7 @@ guest_cb!(encode_utf8, |args, rv, scope| {
         return;
     };
     match encode_to_vec(scope, s) {
-        Ok(bytes) => match u8_view(scope, bytes) {
+        Ok(bytes) => match crate::heap::uint8_array_from(scope, bytes) {
             Some(v) => rv.set(v.into()),
             None => throw_range(scope, "encoded data too large"),
         },
@@ -435,7 +423,7 @@ fn decode_result<'s>(
     let text = String::from_utf8(text).ok()?;
     let text = v8::String::new_from_utf8(scope, text.as_bytes(), v8::NewStringType::Normal)?;
     crate::api::set(obj, scope, "text", text.into());
-    let carry = u8_view(scope, state.carry.clone())?;
+    let carry = crate::heap::uint8_array_from(scope, state.carry.clone())?;
     crate::api::set(obj, scope, "carry", carry.into());
     let bom = v8::Boolean::new(scope, state.bom_pending);
     crate::api::set(obj, scope, "bomPending", bom.into());

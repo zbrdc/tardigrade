@@ -28,7 +28,7 @@ fn throw_type(scope: &mut v8::HandleScope, msg: &str) {
     scope.throw_exception(exc);
 }
 
-fn throw_range(scope: &mut v8::HandleScope, msg: &str) {
+pub(crate) fn throw_range(scope: &mut v8::HandleScope, msg: &str) {
     let m = v8_str(scope, msg);
     let exc = v8::Exception::range_error(scope, m);
     scope.throw_exception(exc);

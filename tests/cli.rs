@@ -49,6 +49,30 @@ fn run_js(name: &str, source: &str) -> Run {
     v8vm(&[path.to_str().unwrap()], b"")
 }
 
+/// run_js with extra CLI flags before the script path.
+fn run_js_with(flags: &[&str], name: &str, source: &str) -> Run {
+    let path = script(name, source);
+    let mut args = flags.to_vec();
+    args.push(path.to_str().unwrap());
+    v8vm(&args, b"")
+}
+
+/// Waits for a child with a bound, so a guest that ignores its termination
+/// fails the test instead of hanging it. stdin must already be taken (and
+/// held) by the caller before calling this.
+fn wait_within(mut child: std::process::Child, secs: u64) -> std::process::Output {
+    child.stdin.take(); // never close the pipe: the guest idles on it
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => panic!("wait failed: {}", e),
+        Err(_) => panic!("guest did not exit within {} s", secs),
+    }
+}
+
 #[test]
 fn console_log_and_error_use_separate_streams() {
     let r = run_js("console", "console.log('out', 1); console.error('err');");
@@ -74,6 +98,164 @@ fn unhandled_rejection_exits_1() {
     let r = run_js("reject", "Promise.reject(new Error('nope'))");
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("nope"), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection:"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn rejection_handled_in_the_same_tick_passes() {
+    let r = run_js(
+        "rej-same-tick",
+        "const p = Promise.reject(new Error('later'));
+         p.catch((e) => console.log('caught', e.message));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "caught later\n");
+}
+
+#[test]
+fn rejection_handled_one_microtask_later_passes() {
+    let r = run_js(
+        "rej-microtask",
+        "const p = Promise.reject(1);
+         Promise.resolve().then(() => p.catch(() => console.log('ok')));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "ok\n");
+}
+
+#[test]
+fn rejection_handled_after_a_timer_fails() {
+    // Node semantics: only still-unhandled after the microtask queue drains.
+    let r = run_js(
+        "rej-after-timer",
+        "const p = Promise.reject(1);
+         setTimeout(() => p.catch(() => {}), 20);",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unhandled promise rejection: 1"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn a_zero_ms_timer_cannot_rescue_a_rejection() {
+    // The end-of-script checkpoint decides before any timer turn runs,
+    // matching Node (the busy-wait keeps the timer from firing in-script).
+    let r = run_js(
+        "rej-zero-timer",
+        "const p = Promise.reject(1);
+         setTimeout(() => p.catch(() => console.log('late-caught')), 0);
+         const t = Date.now(); while (Date.now() - t < 10) {}",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unhandled promise rejection: 1"), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "");
+}
+
+#[test]
+fn a_catch_in_a_later_timer_cannot_rescue_within_the_turn() {
+    // Both timers are due in the same turn; the checkpoint after the first
+    // callback decides before the second one runs.
+    let r = run_js(
+        "rej-two-timers",
+        "let p;
+         setTimeout(() => { p = Promise.reject(new Error('r2')); }, 5);
+         setTimeout(() => { p.catch(() => console.log('late-caught')); }, 5);
+         const t = Date.now(); while (Date.now() - t < 20) {}",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unhandled promise rejection: Error: r2"), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "");
+}
+
+#[test]
+fn vm_exit_wins_over_a_pending_rejection() {
+    // Node: process.exit(0) after Promise.reject(1) still exits 0; the
+    // rejection never reaches its tick decision.
+    let r = run_js("rej-then-exit", "Promise.reject(1); vm.exit(0);");
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn a_rejection_from_a_stdin_continuation_fails_the_run() {
+    let path = script(
+        "rej-stdin",
+        "vm.stdin.read().then(() => { throw new Error('boom') });",
+    );
+    for input in [b"hi\n" as &[u8], b""] {
+        let r = v8vm(&[path.to_str().unwrap()], input);
+        assert_eq!(r.code, 1, "input {:?}: stderr: {}", input, r.stderr);
+        assert!(r.stderr.contains("unhandled promise rejection: Error: boom"), "stderr: {}", r.stderr);
+    }
+}
+
+#[test]
+fn an_oom_inside_a_microtask_reports_137() {
+    // The termination is swallowed inside the microtask checkpoint, so the
+    // shared reason flag, not V8's state, must conclude the run.
+    let path = script(
+        "oom-microtask",
+        "const a = []; Promise.resolve().then(() => { for (;;) a.push({ x: new Array(1e4).fill(1) }); });",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("heap limit exceeded"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn the_watchdog_reaches_a_microtask_that_spins() {
+    let path = script("spin-microtask", "Promise.resolve().then(() => { for (;;) {} });");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--timeout=300", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn the_watchdog_reaches_a_guest_idle_on_a_far_timer() {
+    let path = script("idle-timer", "setTimeout(() => {}, 10000);");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--timeout=1000", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn the_watchdog_reaches_a_guest_idle_on_stdin() {
+    let path = script("idle-stdin", "vm.stdin.read().then(() => {});");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_v8vm"))
+        .args(["--timeout=1000", path.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn v8vm");
+    let _held = child.stdin.take(); // open, never written: the guest idles
+    let start = std::time::Instant::now();
+    let out = wait_within(child, 3);
+    assert_eq!(out.status.code(), Some(124));
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn rejection_value_is_stringified_in_stderr() {
+    let r = run_js("rej-stringified", "Promise.reject({ code: 42 })");
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection: [object Object]"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn async_function_throwing_without_a_catcher_fails() {
+    let r = run_js("rej-async", "(async () => { throw new Error('async boom'); })();");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("async boom"), "stderr: {}", r.stderr);
 }
 
 #[test]
@@ -81,6 +263,489 @@ fn timeout_kills_a_spinning_guest_with_124() {
     let path = script("spin", "for (;;) {}");
     let r = v8vm(&["--timeout=100", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 124);
+}
+
+#[test]
+fn memory_zero_is_a_usage_error() {
+    let path = script("mem-zero", "console.log('never runs');");
+    let r = v8vm(&["--memory=0", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("--memory"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn memory_below_eight_is_a_usage_error() {
+    let path = script("mem-four", "console.log('never runs');");
+    let r = v8vm(&["--memory=4", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("at least 8"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn map_number_growth_reports_137_not_v8s_fatal_oom() {
+    // Table growth must end in the near-heap-limit callback (137), not in
+    // V8's fatal out-of-memory abort.
+    let path = script("oom-map", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
+    for cap in ["32", "64"] {
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 137, "cap {}: stderr: {}", cap, r.stderr);
+        assert!(
+            r.stderr.contains("v8vm: heap limit exceeded"),
+            "cap {}: stderr: {}",
+            cap,
+            r.stderr
+        );
+    }
+    // (At 256 this exact guest races V8's own Map size limit - see
+    // set_growth_reports_137_at_the_largest_cap for the deterministic
+    // over-cap shape there.)
+}
+
+#[test]
+fn small_object_growth_reports_137() {
+    // Fine-grained growth of small live objects must end in the
+    // near-heap-limit callback too.
+    let path = script("oom-objects", "const a = []; for (;;) a.push({});");
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn set_growth_reports_137_at_the_largest_cap() {
+    // The deterministic over-cap shape at 256: the Map-size race above does
+    // not exist for string Sets.
+    let path = script("oom-set", "const s = new Set(); for (let i = 0;; i++) s.add('s' + i);");
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn large_array_churn_near_the_cap_passes() {
+    // The round-4 blocker: multi-megabyte temporaries with a real live set
+    // must not fire the heap cap - collections succeed, the run finishes.
+    for (live, churn, cap) in [("8", "40", "32"), ("2", "20", "64"), ("25", "20", "128")] {
+        let source = "const keep = []; for (let i = 0; i < LIVE; i++) keep.push(new Array(250000).fill(i + 0.5));
+             for (let i = 0; i < CHURN; i++) { new Array(CSZ).fill(i + 0.5); }
+             console.log('ok');"
+            .replace("LIVE", live)
+            .replace("CHURN", churn)
+            .replace("CSZ", if cap == "128" { "4000000" } else { "1000000" });
+        let path = script("churn-large-arrays", &source);
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 0, "live {}: stderr: {}", live, r.stderr);
+        assert_eq!(r.stdout, "ok\n", "live {}", live);
+    }
+}
+
+#[test]
+fn multi_megabyte_temporaries_at_a_small_cap_pass() {
+    // Same blocker, ch2.js shape: 400 x 4 MB arrays with zero live data.
+    let path = script(
+        "churn-huge-temps",
+        "let x = 0;
+         for (let i = 0; i < 400; i++) { x += new Array(500000).fill(i + 0.5).length; }
+         console.log('ok', x);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.starts_with("ok 200000000"), "stdout: {}", r.stdout);
+
+    // And z.js shape at the smallest cap: each 8 MB temporary fills the
+    // whole heap; the collections between them must keep the run alive.
+    let path = script(
+        "churn-cap-sized-temps",
+        "let x = 0;
+         for (let i = 0; i < 100; i++) { x += new Array(1000000).fill(i).length; }
+         console.log('done', x);",
+    );
+    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done 100000000\n");
+}
+
+#[test]
+fn map_of_objects_growth_reports_137() {
+    let path = script(
+        "oom-map-obj",
+        "const m = new Map(); for (let i = 0;; i++) m.set(i, { a: i, b: 'k' + i });",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn object_key_growth_reports_137() {
+    let path = script("oom-objkeys", "const o = {}; for (let i = 0;; i++) o['k' + i] = { a: i };");
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn string_concat_reports_the_range_error_not_an_abort() {
+    // Cons strings keep the live heap small; the run ends at V8's maximum
+    // string length with an ordinary uncaught RangeError (Node does the
+    // same), not with the heap cap or a fatal abort.
+    let path = script("oom-str", "let s = 'x'; for (;;) s = s + s;");
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("Invalid string length"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn the_smallest_supported_cap_reports_137() {
+    let path = script("oom-cap8", "const m = new Map(); for (let i = 0;; i++) m.set(i, i);");
+    let r = v8vm(&["--memory=8", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded (8 MB)"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn big_temporary_arrays_under_the_cap_never_report_137() {
+    // The round-2 blocker: garbage counted as usage. 100 temporary 8 MB
+    // arrays with a tiny live set must finish cleanly.
+    let path = script(
+        "churn-big-arrays",
+        "let x = 0; for (let r = 0; r < 100; r++) { const t = new Array(1e6).fill(r); x += t.length; }
+         console.log('done', x);",
+    );
+    for cap in ["64", "256"] {
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 0, "cap {}: stderr: {}", cap, r.stderr);
+        assert_eq!(r.stdout, "done 100000000\n");
+    }
+}
+
+#[test]
+fn moderate_array_churn_under_the_cap_never_reports_137() {
+    let path = script(
+        "churn-moderate",
+        "let x = 0; for (let r = 0; r < 200; r++) { const t = new Array(200000).fill(r); x += t.length; }
+         console.log('done', x);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done 40000000\n");
+}
+
+#[test]
+fn a_live_set_with_map_copies_under_the_cap_never_reports_137() {
+    // p3.js scaled down: a real live set plus repeated whole-set copies.
+    let path = script(
+        "live-plus-copies",
+        "const live = []; for (let i = 0; i < 200000; i++) live.push({ i, n: 'v' + i, c: [i] });
+         let s = 0; for (let r = 0; r < 8; r++) { const t = live.map((o) => ({ ...o, r })); s += t.length; }
+         console.log('done', s);",
+    );
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done 1600000\n");
+}
+
+#[test]
+fn arraybuffer_budget_fractions_of_the_cap() {
+    // Held buffers at 25/50/90 percent of the cap with churn on top must
+    // all pass; the allocator budget refuses only past the cap.
+    for (live, cap) in [("16", "64"), ("32", "64"), ("57", "64")] {
+        let source = "const keep = []; let n = 0;
+             for (let i = 0; i < 200; i++) {
+               const b = new Uint8Array(1048576); b[0] = i; keep.push(b);
+               if (keep.length > LIVE) keep.shift(); n++;
+               for (let k = 0; k < 2000; k++) n = (n + k * i) | 0;
+             }
+             console.log('done', n !== 0);"
+            .replace("LIVE", live);
+        let path = script("ab-fraction", &source);
+        let r = v8vm(&[&format!("--memory={}", cap), path.to_str().unwrap()], b"");
+        assert_eq!(r.code, 0, "live {}: stderr: {}", live, r.stderr);
+        assert!(r.stdout.starts_with("done"), "stdout: {}", r.stdout);
+    }
+}
+
+#[test]
+fn a_structured_clone_past_the_arraybuffer_budget_is_a_catchable_data_clone_error() {
+    // The clone needs a second 6 MB buffer; the 8 MB budget refuses it, and
+    // the refusal surfaces through webapi's DataCloneError path.
+    let r = run_js_with(
+        &["--memory=8"],
+        "clone-over-budget",
+        "try { structuredClone(new ArrayBuffer(6 * 1024 * 1024)); console.log('cloned'); }
+         catch (e) { console.log('caught', e.name); }
+         console.log(structuredClone(new Uint8Array([1, 2, 3])).length);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "caught DataCloneError\n3\n");
+}
+
+#[test]
+fn host_built_buffers_draw_on_the_arraybuffer_budget() {
+    // vm.fs.readBytes and TextEncoder.encode build their buffers from Rust
+    // bytes, not through V8's allocator; retained copies must still hit the
+    // 8 MB budget as RangeErrors instead of growing without bound.
+    let r = run_js_with(
+        &["--memory=8"],
+        "host-buffers-budget",
+        "vm.fs.write('/big', 'x'.repeat(3 * 1024 * 1024));
+         const text = 'y'.repeat(3 * 1024 * 1024);
+         for (const [name, make] of [
+           ['readBytes', () => vm.fs.readBytes('/big')],
+           ['encode', () => new TextEncoder().encode(text)],
+         ]) {
+           const keep = [];
+           try { for (let i = 0; i < 5; i++) keep.push(make()); console.log(name, 'no refusal'); }
+           catch (e) { console.log(name, e.name, keep.length); }
+         }",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "readBytes RangeError 2\nencode RangeError 2\n");
+}
+
+#[test]
+fn churning_host_built_buffers_never_trips_the_budget() {
+    // Nothing is retained: the refused charge must collect the garbage
+    // buffers and retry, as V8 does for its own allocations.
+    let r = run_js_with(
+        &["--memory=8"],
+        "host-buffers-churn",
+        "vm.fs.write('/big', 'x'.repeat(3 * 1024 * 1024));
+         const text = 'y'.repeat(3 * 1024 * 1024);
+         let n = 0;
+         for (let i = 0; i < 100; i++) {
+           n += new TextEncoder().encode(text).length + vm.fs.readBytes('/big').length;
+         }
+         console.log('churn', n);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "churn 629145600\n");
+}
+
+#[test]
+fn a_caught_arraybuffer_failure_does_not_kill_later_work() {
+    let path = script(
+        "ab-caught",
+        "for (const e of [30, 34, 36, 37, 38, 40, 45, 52]) {
+           try { const b = new ArrayBuffer(2 ** e); console.log(e, 'ok', b.byteLength); }
+           catch (err) { console.log(e, err.name); }
+         }
+         const fine = new ArrayBuffer(1 << 20); new Uint8Array(fine).fill(1);
+         setTimeout(() => console.log('later', fine.byteLength), 5);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("RangeError"), "stdout: {}", r.stdout);
+    assert!(r.stdout.ends_with("later 1048576\n"), "stdout: {}", r.stdout);
+}
+
+#[test]
+fn a_huge_memory_flag_does_not_wrap() {
+    // 16 TiB in MB used to shift-wrap to zero at two call sites; a zero
+    // cap would refuse this buffer.
+    let path = script("huge-cap", "const b = new Uint8Array(1 << 20); b[0] = 1; console.log('ok', b[0]);");
+    let r = v8vm(&["--memory=17592186044416", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ok 1\n");
+}
+
+#[test]
+fn a_guest_exit_prefers_code_then_reason_over_exceptions() {
+    // A blocked callback returns undefined, the guest throws before V8
+    // observes the termination - the exit code / reason still wins.
+    let path = script("exit-then-use", "vm.exit(2); vm.fs.read('/x').split(',');");
+    let r = v8vm(&[path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 2, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn a_timeout_beats_the_exception_from_a_blocked_callback() {
+    let path = script("hammer-exit", "vm.fs.write('/x', 'abc'); for (;;) { vm.fs.read('/x').length; }");
+    let r = v8vm(&["--timeout=50", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn a_callback_loop_oom_reports_137_not_a_type_error() {
+    let path = script(
+        "oom-callback-loop",
+        "vm.fs.write('/x', 'y'); const a = [];
+         for (;;) { a.push(vm.fs.read('/x').length, new Array(1000).fill(1)); }",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("TypeError"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn vm_exit_beats_the_stdin_continuation() {
+    let path = script("exit-stdin", "vm.exit(3); vm.stdin.read().then(() => {});");
+    let r = v8vm(&[path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 3, "stderr: {}", r.stderr);
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn a_hundred_mib_arraybuffer_under_the_cap_passes() {
+    // External (ArrayBuffer) memory counts toward the cap: 100 MiB is
+    // under a 256 MiB cap, so the run must succeed.
+    let path = script("one-buffer", "new Uint8Array(100 << 20).fill(1); console.log('ok');");
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ok\n");
+}
+
+#[test]
+fn retained_arraybuffers_past_the_cap_fail_with_a_range_error() {
+    // The counting allocator refuses the allocation that would cross the
+    // cap; V8 turns the refusal into a RangeError, which this guest does
+    // not catch (a catching guest keeps running - see the fail2 shape).
+    let path = script("typed-oom", "const a = []; for (;;) a.push(new Uint8Array(1 << 20));");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--memory=256", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    assert!(
+        r.stderr.contains("RangeError") && r.stderr.contains("Array buffer allocation failed"),
+        "stderr: {}",
+        r.stderr
+    );
+    // RSS stays near the cap: the run ends at the refusal, not gigabytes
+    // later. (Measured directly with /usr/bin/time: ~30 MB at cap 256.)
+}
+
+#[test]
+fn vm_exit_stops_host_effects_immediately() {
+    // The termination V8 needs a stack check to observe; the host must not
+    // run side effects in that window.
+    let r = run_js("exit-freeze", "vm.exit(3); console.log('after');");
+    assert_eq!(r.code, 3);
+    assert_eq!(r.stdout, "");
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn the_first_vm_exit_code_wins() {
+    let r = run_js(
+        "exit-first-wins",
+        "try { vm.exit(3) } catch (e) {} console.log('after'); vm.exit(4);",
+    );
+    assert_eq!(r.code, 3);
+    assert_eq!(r.stdout, "");
+}
+
+/// The dump holds exactly the file '/f' with content 'x': nothing a guest
+/// did after its vm.exit (write, mkdir, rename, remove, restore) landed.
+fn assert_only_f_dumped(json: &str) {
+    let dumped: serde_json::Value = serde_json::from_str(json).expect("dump json");
+    assert_eq!(
+        dumped,
+        serde_json::json!({"dirs": ["/"], "files": {"/f": {"text": "x"}}, "version": 2})
+    );
+}
+
+#[test]
+fn fs_writes_after_vm_exit_do_not_land_in_the_dump() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("exit-freeze.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script(
+        "exit-fs-freeze",
+        "vm.fs.write('/f', 'x'); vm.exit(0);
+         vm.fs.write('/g', 'y'); vm.fs.mkdir('/d'); vm.fs.rename('/f', '/h');
+         vm.fs.remove('/f'); vm.restore('{}');",
+    );
+    let r = v8vm(
+        &[&format!("--dump={}", dump.display()), path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let json = std::fs::read_to_string(&dump).expect("dump written");
+    assert_only_f_dumped(&json);
+}
+
+#[test]
+fn vm_exit_inside_a_timer_callback_stops_effects() {
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("exit-freeze-timer.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script(
+        "exit-timer-freeze",
+        "vm.fs.write('/f', 'x');
+         setTimeout(() => { vm.exit(0); vm.fs.write('/g', 'y'); console.log('after'); }, 5);",
+    );
+    let r = v8vm(
+        &[&format!("--dump={}", dump.display()), path.to_str().unwrap()],
+        b"",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "");
+    let json = std::fs::read_to_string(&dump).expect("dump written");
+    assert_only_f_dumped(&json);
+}
+
+#[test]
+fn dump_is_written_after_an_oom() {
+    // The dump is serialized host-side from the RAM fs and runs no JS, so
+    // an exhausted heap cannot hurt it: the files written before the
+    // growth are in the dump, and the exit stays 137.
+    let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("oom-dump.json");
+    let _ = std::fs::remove_file(&dump);
+    let path = script(
+        "oom-dump",
+        "vm.fs.write('/kept.txt', 'before the oom');
+         const a = []; for (;;) a.push(new Array(1e5).fill(1));",
+    );
+    let r = v8vm(
+        &[
+            "--memory=32",
+            &format!("--dump={}", dump.display()),
+            path.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("v8vm: heap limit exceeded"), "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("dump"), "no dump complaint: {}", r.stderr);
+    let json = std::fs::read_to_string(&dump).expect("dump written after an OOM");
+    assert!(json.contains("/kept.txt") && json.contains("before the oom"), "dump: {}", json);
+}
+
+#[test]
+fn heap_cap_oom_exits_137_quickly_without_a_signal() {
+    // The run helper unwraps status.code(), so a signal death (V8's own
+    // OOM abort, SIGTRAP) fails this test before the code assert runs.
+    let path = script("oom", "const a = []; for (;;) a.push(new Array(1e5).fill(1));");
+    let start = std::time::Instant::now();
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("v8vm: heap limit exceeded (32 MB)"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
+}
+
+#[test]
+fn guests_staying_under_the_cap_are_unaffected() {
+    let path = script(
+        "under-cap",
+        "const a = []; for (let i = 0; i < 100; i++) a.push(new Array(1000).fill(7));
+         console.log(a.length);",
+    );
+    let r = v8vm(&["--memory=32", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "100\n");
+}
+
+#[test]
+fn a_small_memory_cap_still_creates_the_isolate() {
+    // The initial heap used to be hard-coded at 64 MiB, so any cap below
+    // that died with a V8 check failure (SIGTRAP) before the guest ran.
+    let path = script("mem-16", "console.log('fits');");
+    let r = v8vm(&["--memory=16", path.to_str().unwrap()], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "fits\n");
 }
 
 #[test]
@@ -105,6 +770,66 @@ fn timers_fire_in_due_order_and_clear_works() {
     );
     assert_eq!(r.code, 0);
     assert_eq!(r.stdout, "a,b,iv,xy\n");
+}
+
+#[test]
+fn a_storm_of_set_and_clear_leaves_no_timers_behind() {
+    // None of the 100k cleared timers may ever fire; the loop must reach
+    // the checking timer. (Bookkeeping itself is the O(1) RunningTimer
+    // slot, covered by the unit tests.)
+    let r = run_js(
+        "clear-storm",
+        "let ran = 0;
+         for (let i = 0; i < 100000; i++) clearTimeout(setTimeout(() => { ran++; }, 300));
+         setTimeout(() => console.log('ran=' + ran), 400);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "ran=0\n");
+}
+
+#[test]
+fn a_fractional_clear_inside_its_own_callback_does_not_stop_it() {
+    // clearTimeout(iv + 0.5) must not match timer iv: the interval keeps
+    // running past the fractional clear and is only stopped by the exact
+    // clearInterval in the checking timer.
+    let r = run_js(
+        "fractional-clear",
+        "let n = 0;
+         const iv = setInterval(() => { n++; if (n === 2) clearTimeout(iv + 0.5); }, 5);
+         setTimeout(() => { clearInterval(iv); console.log('n=' + n); }, 100);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.starts_with("n="), "stdout: {}", r.stdout);
+    assert_ne!(r.stdout, "n=2\n", "the interval must survive the fractional clear");
+}
+
+#[test]
+fn rejecting_with_a_symbol_still_prints_a_reason() {
+    let r = run_js("rej-symbol", "Promise.reject(Symbol('s'))");
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection: <unprintable rejection value>"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn a_hundred_thousand_reject_then_catch_round_trips_quickly() {
+    // Forgetting used to scan every remembered rejection (O(n^2): 50k took
+    // 7 s, 200k over a minute). The bound is generous on purpose: the point
+    // is the curve, not the machine.
+    let start = std::time::Instant::now();
+    let r = run_js(
+        "rejection-storm",
+        "const ps = [];
+         for (let i = 0; i < 100000; i++) ps.push(Promise.reject(i));
+         for (const p of ps) p.catch(() => {});
+         console.log('done');",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "done\n");
+    assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
 }
 
 #[test]
@@ -436,7 +1161,9 @@ fn preload_accepts_relative_legacy_keys() {
 fn fs_file_too_large_to_read_as_a_string() {
     // Above V8's maximum string length (~536.87 M chars), read must throw
     // a normal guest Error while readBytes still works. Memory-heavy on
-    // purpose: nothing smaller can cross the engine's string limit.
+    // purpose: nothing smaller can cross the engine's string limit. The
+    // guest's 540 MB buffer and the readBytes copy both count against the
+    // ArrayBuffer budget, so the cap is raised above their sum.
     let path = script(
         "fs-huge-read",
         "vm.fs.write('/f', new Uint8Array(540 * 1024 * 1024));
@@ -444,7 +1171,7 @@ fn fs_file_too_large_to_read_as_a_string() {
          catch (e) { console.log(e.message); }
          console.log(vm.fs.readBytes('/f').length);",
     );
-    let r = v8vm(&["--fs-quota=0", path.to_str().unwrap()], b"");
+    let r = v8vm(&["--fs-quota=0", "--memory=1200", path.to_str().unwrap()], b"");
     assert_eq!(r.code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "file too large to read as a string\n566231040\n");
 }
@@ -991,6 +1718,33 @@ fn serve_settles_timers_between_commands() {
 }
 
 #[test]
+fn an_unhandled_rejection_inside_a_serve_command_fails_the_session() {
+    let path = script("serve-reject", "globalThis.p = null;");
+    let r = v8vm(
+        &["--serve", path.to_str().unwrap()],
+        b"p = Promise.reject('sv')\n42\n",
+    );
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "{}\n", "the reply goes out before the boundary decides");
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection: sv"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn an_oom_inside_a_serve_expression_reports_137() {
+    let path = script("serve-oom", "");
+    let r = v8vm(
+        &["--memory=32", "--serve", path.to_str().unwrap()],
+        b"(() => { const a = []; for (;;) a.push(new Array(1e5).fill(1)); })()\n",
+    );
+    assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("heap limit exceeded"), "stderr: {}", r.stderr);
+}
+
+#[test]
 fn serve_replies_reach_stdout_before_later_guest_output() {
     // Rendezvous: reply N must be on stdout before anything the guest prints
     // after reply N. A queued net message is delivered by the event loop's
@@ -1197,6 +1951,37 @@ fn sandboxed(test: &str, args: &[&str], stdin: &[u8]) -> Option<Run> {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod sandbox_run {
     use super::*;
+
+    /// The heap callback and the watchdog thread both run under the
+    /// filters: the watchdog is created after `apply` (clone with
+    /// CLONE_THREAD, futex, nanosleep), and the heap cap terminates and
+    /// still writes the dump through the Landlock-anchored file.
+    #[test]
+    fn sandbox_enforces_the_heap_cap_and_the_timeout() {
+        let grow = script(
+            "sb-oom",
+            "vm.fs.write('/kept', 'k'); const a = []; for (let i = 0;; i++) a.push({ i });",
+        );
+        let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sb-oom.json");
+        let _ = std::fs::remove_file(&dump);
+        let dump_arg = format!("--dump={}", dump.display());
+        let args = ["--memory=32", dump_arg.as_str(), grow.to_str().unwrap()];
+        let Some(r) = sandboxed("sandbox_enforces_the_heap_cap_and_the_timeout", &args, b"")
+        else {
+            return;
+        };
+        assert_eq!(r.code, 137, "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("v8vm: heap limit exceeded (32 MB)"), "stderr: {}", r.stderr);
+        let json = std::fs::read_to_string(&dump).expect("dump written after the OOM");
+        assert!(json.contains("/kept"), "dump: {}", json);
+
+        // Pure JS: only the watchdog thread's own terminate request can stop it.
+        let spin = script("sb-timeout", "for (;;) {}");
+        let args = ["--timeout=100", spin.to_str().unwrap()];
+        let r = sandboxed("sandbox_enforces_the_heap_cap_and_the_timeout", &args, b"")
+            .expect("the kernel sandboxed the first run");
+        assert_eq!(r.code, 124, "stderr: {}", r.stderr);
+    }
 
     #[test]
     fn sandbox_runs_a_plain_guest_end_to_end() {

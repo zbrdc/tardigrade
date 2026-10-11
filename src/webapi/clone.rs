@@ -178,9 +178,24 @@ guest_cb!(structured_clone, |args, rv, scope| {
             }
             rv.set(v)
         }
-        None => rethrow_or_throw(&mut tc, "structuredClone: could not deserialize the value"),
+        None => deserialize_failure(&mut tc),
     }
 });
+
+/// The serializer just produced this data, so a failed read is V8 refusing
+/// an allocation while rebuilding it - in practice an ArrayBuffer the run's
+/// budget would not grant. V8 raises a plain Error for it; give it the
+/// DataCloneError name the write-side refusals carry. A caught exception
+/// that is not an Error object keeps its identity.
+fn deserialize_failure(tc: &mut v8::TryCatch<v8::HandleScope>) {
+    match tc.exception() {
+        Some(exc) if exc.is_native_error() => {
+            throw_named_error(tc, exc, "DataCloneError");
+            tc.rethrow();
+        }
+        _ => rethrow_or_throw(tc, "structuredClone: could not deserialize the value"),
+    }
+}
 
 /// True when a buffer-shaped value came back a different size than its
 /// source. V8's serializer can fail its own wire allocation silently

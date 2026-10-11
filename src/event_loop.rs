@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::diag::{report, to_rust_string};
+use crate::diag::{rejection_text, report};
 use crate::stdin;
 use crate::world::{world_mut, NetMsg, World};
 use v8::HandleScope;
@@ -14,16 +14,30 @@ enum Outcome {
     Terminated,
 }
 
-/// Terminated means guest-requested vm.exit() if set, else the watchdog.
-fn stop_code(world: &World, oc: Outcome) -> Option<i32> {
+/// Terminated means guest-requested vm.exit() if set, else the heap cap
+/// (137) or the watchdog (124).
+fn stop_code(world: &mut World, oc: Outcome) -> Option<i32> {
     match oc {
         Outcome::Ok => None,
-        Outcome::Terminated => {
-            let code = world.exit_code();
-            Some(if code >= 0 { code } else { 124 })
-        }
-        Outcome::Exception => Some(1),
+        Outcome::Terminated => Some(world.take_terminated_exit()),
+        Outcome::Exception => Some(world.exception_exit()),
     }
+}
+
+/// True when an outside termination (watchdog, heap cap) or a direct V8
+/// termination should end the run right now: the shared reason is checked
+/// because V8's own flag can be swallowed inside microtask checkpoints and
+/// GC callbacks, and may not be delivered at all while the loop is parked
+/// outside V8. Cancels V8's flag and consumes the run's conclusion.
+pub(crate) fn stopped(scope: &mut HandleScope) -> Option<i32> {
+    let pending = world_mut(scope).term.reason().is_some();
+    if !pending && !scope.is_execution_terminating() {
+        return None;
+    }
+    if scope.is_execution_terminating() {
+        scope.cancel_terminate_execution();
+    }
+    Some(world_mut(scope).take_terminated_exit())
 }
 
 fn call_fn(scope: &mut HandleScope, g: &v8::Global<v8::Function>) -> Outcome {
@@ -37,7 +51,9 @@ fn call_fn(scope: &mut HandleScope, g: &v8::Global<v8::Function>) -> Outcome {
         tc.cancel_terminate_execution();
         return Outcome::Terminated;
     }
-    report(&mut tc);
+    if world_mut(&mut tc).exception_decides() {
+        report(&mut tc);
+    }
     Outcome::Exception
 }
 
@@ -70,10 +86,21 @@ fn run_net(scope: &mut HandleScope) -> Option<i32> {
             tc.cancel_terminate_execution();
             Outcome::Terminated
         } else {
-            report(&mut tc);
+            if world_mut(&mut tc).exception_decides() {
+                report(&mut tc);
+            }
             Outcome::Exception
         };
-        if let Some(code) = stop_code(world_mut(&mut tc), oc) {
+        drop(tc);
+        // V8 drains microtasks after each callback; the checkpoint decision
+        // is made right here (Node timing), not once per loop turn.
+        if let Some(code) = stopped(scope) {
+            return Some(code);
+        }
+        if let Some(code) = stop_code(world_mut(scope), oc) {
+            return Some(code);
+        }
+        if let Some(code) = check_unhandled(scope) {
             return Some(code);
         }
     }
@@ -95,76 +122,120 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
         };
         let idx = idx?;
         // Move the timer out: the callback may add/clear timers. Whether it
-        // was cleared during its own callback is tracked in world.cleared.
+        // cleared itself mid-callback is tracked in world.running_timer.
         let mut timer = world_mut(scope).timers.swap_remove(idx);
         let (id, repeat, interval_ms) = (timer.id, timer.repeat, timer.interval_ms);
+        world_mut(scope).running_timer.enter(id);
         let oc = call_fn(scope, &timer.cb);
+        world_mut(scope).running_timer.exit();
+        if let Some(code) = stopped(scope) {
+            return Some(code);
+        }
         if let Some(code) = stop_code(world_mut(scope), oc) {
             return Some(code);
         }
+        // V8 drains microtasks after each callback; the checkpoint decision
+        // is made right here (Node timing), not once per loop turn.
+        if let Some(code) = check_unhandled(scope) {
+            return Some(code);
+        }
         let world = world_mut(scope);
-        if repeat && !world.cleared.contains(&id) {
+        if repeat && !world.running_timer.self_cleared() {
             timer.when = Instant::now() + Duration::from_millis(interval_ms.max(1));
             world.timers.push(timer);
         }
-        world.cleared.retain(|&c| c != id);
     }
 }
 
 fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
     scope.perform_microtask_checkpoint();
-    if !scope.is_execution_terminating() {
-        return None;
-    }
-    scope.cancel_terminate_execution();
-    let code = world_mut(scope).exit_code();
-    Some(if code >= 0 { code } else { 124 })
+    stopped(scope).or_else(|| check_unhandled(scope))
 }
 
 // ---- unhandled rejections ----
 
-pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
-    if msg.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
-        return;
-    }
-    // The callback runs inside V8's own scope; opening a second HandleScope
-    // on the isolate would panic ("active scope can't be dropped") and abort.
-    let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
-    if world_mut(scope).unhandled_rejection.is_some() {
-        return;
-    }
-    // ponytail: first rejection wins; a later handler does not un-fail the
-    // run. The value is stringified later, inside the guest context scope.
-    match msg.get_value() {
-        Some(v) => {
-            let g = v8::Global::new(scope, v);
-            world_mut(scope).unhandled_rejection_exc = Some(g);
-        }
-        None => world_mut(scope).unhandled_rejection = Some("unknown".to_string()),
+/// Removes the remembered rejection for `msg`'s promise, if any: a handler
+/// attached before the next checkpoint un-fails the run.
+fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
+    let promise = msg.get_promise();
+    let hash = promise.get_identity_hash().get();
+    // Bucketed by identity hash so a mass catch does not scan every
+    // remembered rejection; identity is confirmed with == inside the
+    // bucket (hashes are stable but not unique).
+    let mut bucket = match world_mut(scope).pending_rejections.remove(&hash) {
+        Some(b) => b,
+        None => return,
+    };
+    bucket.retain(|e| e.promise.open(scope) != &*promise);
+    let world = world_mut(scope);
+    if !bucket.is_empty() {
+        world.pending_rejections.insert(hash, bucket);
     }
 }
 
-/// After the loop ends: an unhandled rejection fails the run with 1.
-fn finish_unhandled(scope: &mut HandleScope) -> Option<i32> {
-    let exc = world_mut(scope).unhandled_rejection_exc.take();
-    if let Some(exc) = exc {
-        let v = exc.open(scope);
-        let text = to_rust_string(scope, v);
-        world_mut(scope).unhandled_rejection = Some(text);
+pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
+    use v8::PromiseRejectEvent::*;
+    // The callback runs inside V8's own scope; opening a second HandleScope
+    // on the isolate would panic ("active scope can't be dropped") and abort.
+    let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
+    match msg.get_event() {
+        PromiseRejectWithNoHandler => {
+            let promise = v8::Global::new(scope, msg.get_promise());
+            let value = msg.get_value().map(|v| v8::Global::new(scope, v));
+            let hash = msg.get_promise().get_identity_hash().get();
+            let world = world_mut(scope);
+            let seq = world.next_rejection_seq;
+            world.next_rejection_seq += 1;
+            world
+                .pending_rejections
+                .entry(hash)
+                .or_default()
+                .push(crate::world::PendingRejection { seq, promise, value });
+        }
+        PromiseHandlerAddedAfterReject => forget_rejection(scope, &msg),
+        _ => {}
     }
-    let rejection = world_mut(scope).unhandled_rejection.clone();
-    rejection.map(|r| {
-        eprintln!("v8vm: unhandled promise rejection: {}", r);
-        1
-    })
+}
+
+/// After a microtask checkpoint: the first (lowest seq) rejection still
+/// missing a handler fails the run with 1. A guest exit code (vm.exit)
+/// outranks the decision, matching Node's process.exit.
+pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
+    if world_mut(scope).exit_code() >= 0 {
+        return None;
+    }
+    let first = {
+        let world = world_mut(scope);
+        // Buckets keep insertion order, so each bucket's front is its
+        // earliest rejection; the minimum over the fronts is the first.
+        let hash = world
+            .pending_rejections
+            .iter()
+            .filter(|(_, b)| !b.is_empty())
+            .min_by_key(|(_, b)| b[0].seq)
+            .map(|(h, _)| *h)?;
+        let bucket = world.pending_rejections.get_mut(&hash).unwrap();
+        let first = bucket.remove(0);
+        if bucket.is_empty() {
+            world.pending_rejections.remove(&hash);
+        }
+        first
+    };
+    let text = match &first.value {
+        Some(v) => {
+            let val = v.open(scope);
+            rejection_text(scope, val)
+        }
+        None => "unknown".to_string(),
+    };
+    eprintln!("v8vm: unhandled promise rejection: {}", text);
+    Some(1)
 }
 
 pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     loop {
-        if scope.is_execution_terminating() {
-            scope.cancel_terminate_execution();
-            let code = world_mut(scope).exit_code();
-            return if code >= 0 { code } else { 124 };
+        if let Some(c) = stopped(scope) {
+            return c;
         }
         if let Some(c) = run_net(scope) {
             return c;
@@ -175,8 +246,12 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
         if let Some(c) = drain_microtasks(scope) {
             return c;
         }
-        if let Some(c) = stdin::poll_stdin(scope) {
-            return c;
+        if stdin::poll_stdin(scope) {
+            // Resolving a waiter runs its continuations; a rejection or a
+            // termination raised there meets the same checkpoint check.
+            if let Some(c) = drain_microtasks(scope) {
+                return c;
+            }
         }
         let (has_timers, has_net, has_stdin) = {
             let world = world_mut(scope);
@@ -191,8 +266,13 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
         }
         std::thread::sleep(wake_deadline(scope, has_timers, has_stdin));
     }
-    if let Some(code) = finish_unhandled(scope) {
-        return code;
+    // Final sweep: continuations queued by the very last stdin delivery
+    // still count, and a termination that landed as the loop wound down
+    // (idle runs notice the watchdog only through the reason flag) ends
+    // the run instead of falling through to a clean exit.
+    scope.perform_microtask_checkpoint();
+    if let Some(c) = stopped(scope).or_else(|| check_unhandled(scope)) {
+        return c;
     }
     let code = world_mut(scope).exit_code();
     if code >= 0 {
@@ -202,11 +282,13 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
     }
 }
 
-/// When to wake for the next loop turn. ponytail: poll stdin at 2 ms while a
-/// reader waits; else idle up to 50 ms; never past the earliest timer.
+/// When to wake for the next loop turn: poll stdin at 2 ms while a reader
+/// waits, else at most 50 ms, never past the earliest timer. The 50 ms
+/// ceiling keeps an otherwise idle run responsive to the watchdog: a far
+/// timer must not park the loop past the wall-clock timeout.
 fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> Duration {
     let cap = if has_stdin { 2 } else { 50 };
-    let mut wake = Instant::now() + Duration::from_millis(cap);
+    let mut wake = Duration::from_millis(cap);
     if has_timers {
         let earliest = world_mut(scope)
             .timers
@@ -214,10 +296,11 @@ fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> 
             .map(|t| t.when)
             .min()
             .unwrap();
-        if earliest < wake {
-            wake = earliest;
+        let till = earliest.saturating_duration_since(Instant::now());
+        if till < wake {
+            wake = till;
         }
     }
-    wake.saturating_duration_since(Instant::now())
+    wake
 }
 

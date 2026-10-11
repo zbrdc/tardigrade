@@ -303,32 +303,40 @@ fn release_idle_subscription(scope: &mut v8::HandleScope) {
     world_mut(scope).stdin_sub = None; // Drop unsubscribes from the hub
 }
 
-/// Delivers one hub event (if any) to the waiting readers.
-pub(crate) fn poll_stdin(scope: &mut v8::HandleScope) -> Option<i32> {
+/// Delivers one hub event (if any) to the waiting readers. True when a
+/// waiter was resolved: its continuations have run or are still queued,
+/// and owe the event loop a checkpoint check.
+pub(crate) fn poll_stdin(scope: &mut v8::HandleScope) -> bool {
     if world_mut(scope).stdin_waiters.is_empty() {
         release_idle_subscription(scope);
-        return None;
+        return false;
     }
     if world_mut(scope).stdin_eof {
         resolve_stdin_waiters(scope, None);
-        return None;
+        return true;
     }
     let event = world_mut(scope)
         .stdin_sub
         .as_ref()
         .and_then(|sub| sub.try_take());
-    match event {
-        Some(Some(bytes)) => resolve_stdin_waiters(scope, Some(&bytes)),
+    let delivered = match event {
+        Some(Some(bytes)) => {
+            resolve_stdin_waiters(scope, Some(&bytes));
+            true
+        }
         Some(None) => {
             world_mut(scope).stdin_eof = true;
             resolve_stdin_waiters(scope, None);
+            true
         }
-        None => {}
-    }
+        None => false,
+    };
+    // A subscription is held only while readers are pending; otherwise one
+    // long-lived reader would starve every later subscriber.
     if world_mut(scope).stdin_waiters.is_empty() {
         release_idle_subscription(scope);
     }
-    None
+    delivered
 }
 
 #[cfg(test)]

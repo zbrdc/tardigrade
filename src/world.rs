@@ -2,12 +2,16 @@
 //! one process without seeing each other.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::fs::RamFs;
+use crate::heap::AllocState;
 use crate::stdin::StdinSub;
+use crate::timers::RunningTimer;
 
 /// A scheduled guest timer. The callback is a persistent handle so it
 /// survives between loop turns.
@@ -24,6 +28,128 @@ pub(crate) struct NetMsg {
     pub(crate) from: u64,
     pub(crate) to: u64,
     pub(crate) payload: String,
+}
+
+/// A rejection V8 reported without a handler, kept until the next microtask
+/// checkpoint decides whether the run fails (Node semantics: attaching a
+/// handler late in the same tick, or in a microtask, is not a failure).
+pub(crate) struct PendingRejection {
+    /// Insertion order, so the first rejection can still be found across
+    /// the identity-hash buckets.
+    pub(crate) seq: u64,
+    pub(crate) promise: v8::Global<v8::Promise>,
+    pub(crate) value: Option<v8::Global<v8::Value>>,
+}
+
+/// Why a run was terminated from outside guest code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TermReason {
+    Timeout,
+    Oom,
+}
+
+/// Shared termination state: the watchdog thread and the heap callbacks
+/// mark the reason before calling terminate_execution, and the JS thread
+/// reads it at turn boundaries. V8's own termination flag can be swallowed
+/// inside microtask checkpoints and GC callbacks, so the flag, not
+/// is_execution_terminating(), is the reliable signal. `finished` silences
+/// the heap callbacks for teardown GCs once the run has concluded.
+pub(crate) struct Termination {
+    reason: AtomicU8,
+    finished: AtomicBool,
+    /// Wakes the watchdog: blocked until the deadline, or until a mark or
+    /// finish wakes it (a bare atomic cannot do that).
+    wake: (Mutex<()>, Condvar),
+}
+
+/// What ended a [Termination::wait_for].
+pub(crate) enum Wake {
+    /// The run has finished; the waiter should exit.
+    Finished,
+    /// The deadline passed without a reason.
+    Deadline,
+    /// A termination reason is set and wants delivering.
+    Reason,
+}
+
+impl Termination {
+    pub(crate) fn new() -> Self {
+        Termination {
+            reason: AtomicU8::new(0),
+            finished: AtomicBool::new(false),
+            wake: (Mutex::new(()), Condvar::new()),
+        }
+    }
+
+    /// Marks why the run is being terminated; the first marker wins (an
+    /// OOM found before a late watchdog firing still reports as OOM).
+    pub(crate) fn mark(&self, reason: TermReason) {
+        let code = match reason {
+            TermReason::Timeout => 1,
+            TermReason::Oom => 2,
+        };
+        // Store and notify under the lock the waiter checks its predicate
+        // under: without it, a mark between the waiter's check and its wait
+        // is a lost wakeup.
+        let _guard = self.wake.0.lock().unwrap();
+        let _ = self.reason.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+        self.wake.1.notify_all();
+    }
+
+    pub(crate) fn reason(&self) -> Option<TermReason> {
+        match self.reason.load(Ordering::SeqCst) {
+            1 => Some(TermReason::Timeout),
+            2 => Some(TermReason::Oom),
+            _ => None,
+        }
+    }
+
+    /// Reads and clears the reason: exactly one caller concludes a run.
+    pub(crate) fn take_reason(&self) -> Option<TermReason> {
+        let reason = self.reason();
+        self.reason.store(0, Ordering::SeqCst);
+        reason
+    }
+
+    /// True once the run has concluded, so heap callbacks for teardown GCs
+    /// must not mark or terminate any more.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn finish(&self) {
+        // Under the waiter's lock, like [Termination::mark].
+        let _guard = self.wake.0.lock().unwrap();
+        self.finished.store(true, Ordering::SeqCst);
+        self.wake.1.notify_all();
+    }
+
+    /// Blocks until the deadline (forever when None), waking early when a
+    /// reason or finish lands. Spurious wakes re-evaluate and wait again.
+    /// The mutex guard is dropped before returning, so callers may act on
+    /// the result (e.g. terminate the isolate) without holding it.
+    pub(crate) fn wait_for(&self, deadline: Option<Instant>) -> Wake {
+        let mut guard = self.wake.0.lock().unwrap();
+        loop {
+            if self.finished.load(Ordering::SeqCst) {
+                return Wake::Finished;
+            }
+            if self.reason().is_some() {
+                return Wake::Reason;
+            }
+            match deadline.map(|d| d.saturating_duration_since(Instant::now())) {
+                Some(Duration::ZERO) => return Wake::Deadline,
+                wait => {
+                    let (g, _) = self
+                        .wake
+                        .1
+                        .wait_timeout(guard, wait.unwrap_or(Duration::MAX))
+                        .unwrap();
+                    guard = g;
+                }
+            }
+        }
+    }
 }
 
 /// All guest world state for one run. The isolate owns it through an embedder
@@ -47,11 +173,23 @@ pub(crate) struct World {
     /// Zero point of this run's performance.now(): the moment the run's
     /// state was created, i.e. the start of the run.
     pub(crate) perf_origin: std::time::Instant,
-    // ids cleared via clear_timer while their callback was on the stack
-    pub(crate) cleared: Vec<u64>,
+    /// The timer whose callback is on the stack, if any.
+    pub(crate) running_timer: RunningTimer,
     exit_code: AtomicI32,
-    pub(crate) unhandled_rejection: Option<String>,
-    pub(crate) unhandled_rejection_exc: Option<v8::Global<v8::Value>>,
+    /// Termination reason shared with the watchdog thread and the heap
+    /// callbacks (they get no isolate reference, only this Arc).
+    pub(crate) term: Arc<Termination>,
+    /// The effective cap, for the OOM report.
+    pub(crate) heap_mb: usize,
+    /// The ArrayBuffer budget the counting allocator enforces; buffers the
+    /// host builds from Rust bytes draw on it too. Guest::new installs the
+    /// run's real one; this default never refuses.
+    pub(crate) ab_budget: Arc<AllocState>,
+    /// Rejections awaiting the next microtask checkpoint, bucketed by the
+    /// rejecting promise's identity hash so a mass catch does not scan
+    /// every remembered rejection.
+    pub(crate) pending_rejections: HashMap<i32, Vec<PendingRejection>>,
+    pub(crate) next_rejection_seq: u64,
 }
 
 impl World {
@@ -68,22 +206,75 @@ impl World {
             stdin_sub: None,
             random_state: None,
             perf_origin: Instant::now(),
-            cleared: Vec::new(),
+            running_timer: RunningTimer::new(),
             exit_code: AtomicI32::new(-1),
-            unhandled_rejection: None,
-            unhandled_rejection_exc: None,
+            term: Arc::new(Termination::new()),
+            heap_mb: 0,
+            ab_budget: Arc::new(AllocState::new(usize::MAX)),
+            pending_rejections: HashMap::new(),
+            next_rejection_seq: 0,
         }
+    }
+
+    /// Concludes a terminated run: a guest vm.exit() code wins, then the
+    /// heap cap (137, reported once on stderr), then the watchdog (124).
+    /// Exactly one caller concludes the run; `take` makes a stray second
+    /// call visibly wrong (124) instead of double-printing the report.
+    pub(crate) fn take_terminated_exit(&mut self) -> i32 {
+        let code = self.exit_code();
+        if code >= 0 {
+            return code;
+        }
+        match self.term.take_reason() {
+            Some(TermReason::Oom) => {
+                eprintln!("v8vm: heap limit exceeded ({} MB)", self.heap_mb);
+                137
+            }
+            _ => 124,
+        }
+    }
+
+    /// True once the run has decided its outcome (a vm.exit code, or an
+    /// outside termination) and guest callbacks must stop having effects.
+    pub(crate) fn is_leaving(&self) -> bool {
+        self.exit_code() >= 0 || self.term.reason().is_some() || self.term.is_finished()
+    }
+
+    /// Concludes a run whose callback or script raised an uncaught
+    /// exception: a guest exit code wins, then an outside termination
+    /// (timeout, heap cap); only with neither is the exception itself the
+    /// outcome. Callers report the exception only for the last case.
+    pub(crate) fn exception_exit(&mut self) -> i32 {
+        let code = self.exit_code();
+        if code >= 0 {
+            return code;
+        }
+        if self.term.reason().is_some() {
+            return self.take_terminated_exit();
+        }
+        1
+    }
+
+    /// True when neither an exit code nor a termination reason is set, so
+    /// a pending exception is what decides the run (and should be
+    /// reported).
+    pub(crate) fn exception_decides(&self) -> bool {
+        self.exit_code() < 0 && self.term.reason().is_none()
     }
 
     pub(crate) fn exit_code(&self) -> i32 {
         self.exit_code.load(Ordering::SeqCst)
     }
 
+    /// First exit wins: a later vm.exit during the termination window
+    /// cannot change the code (its callback is blocked anyway, but be
+    /// explicit about the contract).
     pub(crate) fn set_exit_code(&self, code: i32) {
-        self.exit_code.store(code, Ordering::SeqCst);
+        let _ = self
+            .exit_code
+            .compare_exchange(-1, code, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
-
 /// Reaches this run's World through the isolate embedder slot. Works from
 /// any scope (HandleScope, TryCatch, CallbackScope...) because they all
 /// expose the isolate. The returned reference borrows the scope, so unlike
@@ -94,4 +285,88 @@ pub(crate) fn world_mut<S: AsMut<v8::Isolate>>(scope: &mut S) -> &mut World {
         .as_mut()
         .get_slot_mut::<World>()
         .expect("world is installed in the isolate before callbacks can run")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs wait_for on its own thread and gives up after a few seconds, so
+    /// a lost wakeup fails the test instead of hanging it. The thread is
+    /// left behind on failure; the test process ends anyway.
+    fn wait_bounded(term: &Arc<Termination>, deadline: Option<Instant>) -> Option<Wake> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let term = term.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(term.wait_for(deadline));
+        });
+        rx.recv_timeout(Duration::from_secs(5)).ok()
+    }
+
+    #[test]
+    fn wait_for_returns_deadline_when_the_deadline_has_passed() {
+        let term = Arc::new(Termination::new());
+        let past = Instant::now();
+        assert!(matches!(wait_bounded(&term, Some(past)), Some(Wake::Deadline)));
+    }
+
+    #[test]
+    fn wait_for_returns_reason_for_a_mark_made_before_the_wait() {
+        let term = Arc::new(Termination::new());
+        term.mark(TermReason::Oom);
+        let far = Instant::now() + Duration::from_secs(60);
+        assert!(matches!(wait_bounded(&term, Some(far)), Some(Wake::Reason)));
+    }
+
+    #[test]
+    fn finish_from_another_thread_unblocks_a_wait_without_a_deadline() {
+        let term = Arc::new(Termination::new());
+        let finisher = term.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            finisher.finish();
+        });
+        assert!(matches!(wait_bounded(&term, None), Some(Wake::Finished)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn finish_takes_precedence_over_a_reason() {
+        let term = Arc::new(Termination::new());
+        term.mark(TermReason::Timeout);
+        term.finish();
+        assert!(matches!(wait_bounded(&term, None), Some(Wake::Finished)));
+    }
+
+    #[test]
+    fn mark_and_finish_publish_under_the_waiters_lock() {
+        // A store-and-notify outside the lock can land between the
+        // waiter's predicate check and its wait, and is then lost. While
+        // the test holds the lock, neither may complete.
+        let term = Arc::new(Termination::new());
+        let held = term.wake.0.lock().unwrap();
+        let marker = term.clone();
+        let t1 = std::thread::spawn(move || marker.mark(TermReason::Timeout));
+        let finisher = term.clone();
+        let t2 = std::thread::spawn(move || finisher.finish());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(term.reason().is_none(), "mark must wait for the lock");
+        assert!(!term.is_finished(), "finish must wait for the lock");
+        drop(held);
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert!(term.reason().is_some() && term.is_finished());
+    }
+
+    #[test]
+    fn the_first_exit_code_wins() {
+        let w = World::new(0);
+        w.set_exit_code(3);
+        w.set_exit_code(4);
+        assert_eq!(w.exit_code(), 3);
+        let w2 = World::new(0);
+        w2.set_exit_code(0);
+        w2.set_exit_code(9);
+        assert_eq!(w2.exit_code(), 0, "an explicit 0 also wins");
+    }
 }
