@@ -25,6 +25,14 @@ pub(crate) struct NetMsg {
     pub(crate) payload: String,
 }
 
+/// A rejection V8 reported without a handler, kept until the next microtask
+/// checkpoint decides whether the run fails (Node semantics: attaching a
+/// handler late in the same tick, or in a microtask, is not a failure).
+pub(crate) struct PendingRejection {
+    pub(crate) promise: v8::Global<v8::Promise>,
+    pub(crate) value: Option<v8::Global<v8::Value>>,
+}
+
 /// All guest world state for one run. The isolate owns it through an embedder
 /// slot (see [world_mut]); one JS thread touches it, and the watchdog thread
 /// only ever calls Isolate::terminate_execution().
@@ -43,8 +51,9 @@ pub(crate) struct World {
     // ids cleared via clear_timer while their callback was on the stack
     pub(crate) cleared: Vec<u64>,
     exit_code: AtomicI32,
-    pub(crate) unhandled_rejection: Option<String>,
-    pub(crate) unhandled_rejection_exc: Option<v8::Global<v8::Value>>,
+    /// Rejections awaiting the next microtask checkpoint; first one still
+    /// unhandled when the checkpoint ends fails the run.
+    pub(crate) pending_rejections: Vec<PendingRejection>,
 }
 
 impl World {
@@ -61,8 +70,7 @@ impl World {
             stdin_sub: None,
             cleared: Vec::new(),
             exit_code: AtomicI32::new(-1),
-            unhandled_rejection: None,
-            unhandled_rejection_exc: None,
+            pending_rejections: Vec::new(),
         }
     }
 

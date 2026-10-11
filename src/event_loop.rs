@@ -114,7 +114,9 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
 fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
     scope.perform_microtask_checkpoint();
     if !scope.is_execution_terminating() {
-        return None;
+        // Node-style checkpoint boundary: handlers that arrived during the
+        // drain have already been forgotten; what is left has failed.
+        return check_unhandled(scope);
     }
     scope.cancel_terminate_execution();
     let code = world_mut(scope).exit_code();
@@ -123,40 +125,54 @@ fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
 
 // ---- unhandled rejections ----
 
+/// Removes the remembered rejection for `msg`'s promise, if any: a handler
+/// attached before the next checkpoint un-fails the run.
+fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
+    // The list is taken out because matching opens each stored Global
+    // through the scope, which the world borrow would otherwise hold.
+    let mut pending = std::mem::take(&mut world_mut(scope).pending_rejections);
+    let promise = msg.get_promise();
+    pending.retain(|e| e.promise.open(scope) != &*promise);
+    world_mut(scope).pending_rejections = pending;
+}
+
 pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
-    if msg.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
-        return;
-    }
+    use v8::PromiseRejectEvent::*;
     // The callback runs inside V8's own scope; opening a second HandleScope
     // on the isolate would panic ("active scope can't be dropped") and abort.
     let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
-    if world_mut(scope).unhandled_rejection.is_some() {
-        return;
-    }
-    // ponytail: first rejection wins; a later handler does not un-fail the
-    // run. The value is stringified later, inside the guest context scope.
-    match msg.get_value() {
-        Some(v) => {
-            let g = v8::Global::new(scope, v);
-            world_mut(scope).unhandled_rejection_exc = Some(g);
+    match msg.get_event() {
+        PromiseRejectWithNoHandler => {
+            let promise = v8::Global::new(scope, msg.get_promise());
+            let value = msg.get_value().map(|v| v8::Global::new(scope, v));
+            world_mut(scope)
+                .pending_rejections
+                .push(crate::world::PendingRejection { promise, value });
         }
-        None => world_mut(scope).unhandled_rejection = Some("unknown".to_string()),
+        PromiseHandlerAddedAfterReject => forget_rejection(scope, &msg),
+        _ => {}
     }
 }
 
-/// After the loop ends: an unhandled rejection fails the run with 1.
-fn finish_unhandled(scope: &mut HandleScope) -> Option<i32> {
-    let exc = world_mut(scope).unhandled_rejection_exc.take();
-    if let Some(exc) = exc {
-        let v = exc.open(scope);
-        let text = to_rust_string(scope, v);
-        world_mut(scope).unhandled_rejection = Some(text);
-    }
-    let rejection = world_mut(scope).unhandled_rejection.clone();
-    rejection.map(|r| {
-        eprintln!("v8vm: unhandled promise rejection: {}", r);
-        1
-    })
+/// After a microtask checkpoint: the first rejection still missing a
+/// handler fails the run with 1.
+fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
+    let first = {
+        let world = world_mut(scope);
+        if world.pending_rejections.is_empty() {
+            return None;
+        }
+        world.pending_rejections.remove(0)
+    };
+    let text = match &first.value {
+        Some(v) => {
+            let val = v.open(scope);
+            to_rust_string(scope, val)
+        }
+        None => "unknown".to_string(),
+    };
+    eprintln!("v8vm: unhandled promise rejection: {}", text);
+    Some(1)
 }
 
 pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
@@ -190,9 +206,6 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
             break;
         }
         std::thread::sleep(wake_deadline(scope, has_timers, has_stdin));
-    }
-    if let Some(code) = finish_unhandled(scope) {
-        return code;
     }
     let code = world_mut(scope).exit_code();
     if code >= 0 {

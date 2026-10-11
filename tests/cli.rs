@@ -71,6 +71,63 @@ fn unhandled_rejection_exits_1() {
     let r = run_js("reject", "Promise.reject(new Error('nope'))");
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("nope"), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection:"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn rejection_handled_in_the_same_tick_passes() {
+    let r = run_js(
+        "rej-same-tick",
+        "const p = Promise.reject(new Error('later'));
+         p.catch((e) => console.log('caught', e.message));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "caught later\n");
+}
+
+#[test]
+fn rejection_handled_one_microtask_later_passes() {
+    let r = run_js(
+        "rej-microtask",
+        "const p = Promise.reject(1);
+         Promise.resolve().then(() => p.catch(() => console.log('ok')));",
+    );
+    assert_eq!(r.code, 0);
+    assert_eq!(r.stdout, "ok\n");
+}
+
+#[test]
+fn rejection_handled_after_a_timer_fails() {
+    // Node semantics: only still-unhandled after the microtask queue drains.
+    let r = run_js(
+        "rej-after-timer",
+        "const p = Promise.reject(1);
+         setTimeout(() => p.catch(() => {}), 20);",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unhandled promise rejection: 1"), "stderr: {}", r.stderr);
+}
+
+#[test]
+fn rejection_value_is_stringified_in_stderr() {
+    let r = run_js("rej-stringified", "Promise.reject({ code: 42 })");
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("v8vm: unhandled promise rejection: [object Object]"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+#[test]
+fn async_function_throwing_without_a_catcher_fails() {
+    let r = run_js("rej-async", "(async () => { throw new Error('async boom'); })();");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("async boom"), "stderr: {}", r.stderr);
 }
 
 #[test]
