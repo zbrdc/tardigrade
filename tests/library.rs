@@ -1,8 +1,6 @@
 //! Library API: run() owns per-run state, so guests can be reused
 //! sequentially and can also run concurrently in one process.
 
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -102,56 +100,17 @@ fn early_vm_exit_stays_per_run_while_another_guest_is_pending() {
         0,
         start.clone(),
     );
+    // The slow guest finishes naturally (no vm.exit of its own): with a
+    // leaked exit code it would end with 31 instead of 0.
     let slow = spawn_guest(
         r#"
         setTimeout(() => {
           if (vm.fs.list('/').length !== 0) vm.exit(30);
-          else vm.exit(32);
         }, 60);
         "#,
         0,
         start.clone(),
     );
     assert_eq!(join_bounded(quick, 30), 31, "early exit code belongs to its own run");
-    assert_eq!(join_bounded(slow, 30), 32, "pending guest keeps its own state and code");
-}
-
-#[test]
-fn stdin_hub_keeps_unread_input_for_the_next_run() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_stdin-two-runs"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn stdin-two-runs");
-    let mut stdin = child.stdin.take().expect("child stdin");
-    let stdout = child.stdout.take().expect("child stdout");
-
-    // Read child output on a thread so a starved guest fails fast instead
-    // of hanging the test.
-    let (line_tx, line_rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        while reader.read_line(&mut line).unwrap_or(0) > 0 {
-            let _ = line_tx.send(std::mem::take(&mut line));
-        }
-    });
-    let next_line = |what: &str| -> String {
-        line_rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap_or_else(|_| panic!("no {} output within 30 s", what))
-    };
-
-    stdin.write_all(b"one\n").expect("feed first chunk");
-    stdin.flush().expect("flush first chunk");
-    assert_eq!(next_line("first"), "first:\"one\\n\"\n");
-
-    // This chunk must survive the end of the first run: nothing subscribed
-    // consumes it until the second run asks for it.
-    stdin.write_all(b"two\n").expect("feed second chunk");
-    stdin.flush().expect("flush second chunk");
-    assert_eq!(next_line("second"), "second:\"two\\n\"\n");
-
-    drop(stdin); // EOF
-    assert!(child.wait().expect("wait child").success());
+    assert_eq!(join_bounded(slow, 30), 0, "naturally-finished guest sees no leaked exit code");
 }

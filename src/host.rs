@@ -1,19 +1,22 @@
 //! The one host thread that owns V8 initialization and begets every guest
 //! thread.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::LazyLock;
 
+use crate::serve::ReplySink;
 use crate::Config;
 
-/// One guest run request. `lines` carries serve-mode output lines (already
-/// newline-terminated) to the calling thread; `done` carries the exit code.
+/// One guest run request. `replies` carries serve-mode output lines to the
+/// calling thread; `done` carries the exit code or the guest's panic
+/// payload.
 pub(crate) struct Job {
     pub(crate) source: String,
     pub(crate) entry: String,
     pub(crate) cfg: Config,
-    pub(crate) lines: Option<Sender<String>>,
-    pub(crate) done: Sender<i32>,
+    pub(crate) replies: Option<ReplySink>,
+    pub(crate) done: Sender<Result<i32, Box<dyn std::any::Any + Send>>>,
 }
 
 /// Lazily spawns the host thread on the first run()/serve() call (staying
@@ -42,14 +45,25 @@ fn host_thread(rx: Receiver<Job>) {
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
     for job in rx {
-        // Spawn rather than run inline so concurrent callers overlap.
-        std::thread::Builder::new()
+        let Job { source, entry, cfg, replies, done } = job;
+        // Clone so a failed spawn still leaves a channel to answer on. A
+        // failed spawn must not take the host thread down with it: only this
+        // job fails, with exit code 70 (EX_SOFTWARE).
+        let fail_done = done.clone();
+        let spawned = std::thread::Builder::new()
             .name("v8vm-guest".to_string())
             .spawn(move || {
-                let code = crate::execute(&job.source, &job.entry, &job.cfg, job.lines.as_ref());
-                drop(job.lines); // close the line stream before reporting the code
-                let _ = job.done.send(code);
-            })
-            .expect("spawn v8vm guest thread");
+                // Panics are caught so the payload can be resumed on the
+                // calling thread (see run/serve) instead of vanishing here.
+                let code = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    crate::execute(&source, &entry, &cfg, replies.as_ref())
+                }));
+                drop(replies); // close the reply stream before the code
+                let _ = done.send(code);
+            });
+        if spawned.is_err() {
+            eprintln!("v8vm: cannot spawn guest thread");
+            let _ = fail_done.send(Ok(70));
+        }
     }
 }

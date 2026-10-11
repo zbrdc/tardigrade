@@ -7,8 +7,11 @@
 //! guest thread (a pkey requirement of the default platform), so callers may
 //! live on any thread. Each run owns its isolate and its world state, so
 //! guests can run concurrently in one process without seeing each other.
-//! Disk is touched only at the explicit host boundary (entry source,
-//! preload/dump files). Guests never make a syscall of their own.
+//! serve commands and vm.stdin share one process-wide stdin hub (see the
+//! stdin module); serve replies rendezvous with the caller's writer so
+//! output ordering matches a single-threaded embedder. Disk is touched only
+//! at the explicit host boundary (entry source, preload/dump files). Guests
+//! never make a syscall of their own.
 
 mod api;
 mod console;
@@ -205,7 +208,7 @@ fn execute_inner(
     scope: &mut v8::HandleScope,
     handle: &v8::IsolateHandle,
     spec: &RunSpec,
-    lines: Option<&mpsc::Sender<String>>,
+    replies: Option<&serve::ReplySink>,
 ) -> i32 {
     install(scope, spec.cfg);
     if !eval_prelude(scope) {
@@ -219,9 +222,8 @@ fn execute_inner(
 
     let mut code = eval_entry(scope, spec);
     if code == 0 {
-        code = match lines {
-            // serve: stdin is the command channel
-            Some(lines) => serve::serve_loop(scope, std::io::stdin().lock(), lines),
+        code = match replies {
+            Some(replies) => serve::serve_loop(scope, replies),
             None => event_loop(scope),
         };
     }
@@ -237,11 +239,11 @@ fn execute(
     source: &str,
     entry: &str,
     cfg: &Config,
-    lines: Option<&mpsc::Sender<String>>,
+    replies: Option<&serve::ReplySink>,
 ) -> i32 {
     let mut world = World::new();
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
-    world.stdin_eof = cfg.stdin_consumed || lines.is_some();
+    world.stdin_eof = cfg.stdin_consumed || replies.is_some();
 
     // Heap cap; past it V8 aborts with its own out-of-memory report.
     let params = v8::CreateParams::default().heap_limits(64 << 20, cfg.heap_mb << 20);
@@ -258,7 +260,7 @@ fn execute(
     let mut hs = v8::HandleScope::new(&mut isolate);
     let context = v8::Context::new(&mut hs, Default::default());
     let scope = &mut v8::ContextScope::new(&mut hs, context);
-    execute_inner(scope, &handle, &spec, lines)
+    execute_inner(scope, &handle, &spec, replies)
 }
 
 /// Run one guest program and return its exit code.
@@ -268,29 +270,41 @@ pub fn run(source: &str, entry: &str, cfg: &Config) -> i32 {
         source: source.to_string(),
         entry: entry.to_string(),
         cfg: cfg.clone(),
-        lines: None,
+        replies: None,
         done,
     });
-    rx.recv().expect("v8vm guest finished")
+    finish(rx.recv().expect("v8vm guest finished"))
+}
+
+/// Resumes a guest panic on the calling thread, preserving its payload.
+fn finish(outcome: Result<i32, Box<dyn std::any::Any + Send>>) -> i32 {
+    match outcome {
+        Ok(code) => code,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Serve the console protocol on the given writer (reads commands from
-/// stdin). One JS expression per line in, one JSON line out. The guest runs
-/// on the host thread's descendants; W never leaves the calling thread.
+/// process stdin through the stdin hub). One JS expression per line in, one
+/// JSON line out. The guest runs on the host thread's descendants; W never
+/// leaves the calling thread.
 pub fn serve<W: Write>(mut output: W, source: &str, entry: &str, cfg: &Config) -> i32 {
-    let (lines, line_rx) = mpsc::channel::<String>();
+    // Zero-capacity channel plus an ack per reply: the guest cannot run past
+    // a reply until the caller has written and flushed it, keeping stdout
+    // ordering identical to a single-threaded embedder.
+    let (replies, reply_rx) = mpsc::sync_channel::<serve::Reply>(0);
     let (done, rx) = mpsc::channel();
     host::submit(host::Job {
         source: source.to_string(),
         entry: entry.to_string(),
         cfg: cfg.clone(),
-        lines: Some(lines),
+        replies: Some(replies),
         done,
     });
-    for line in line_rx {
-        // Same per-line write+flush ordering the guest produced.
+    for (line, ack) in reply_rx {
         let _ = output.write_all(line.as_bytes());
         let _ = output.flush();
+        let _ = ack.send(());
     }
-    rx.recv().expect("v8vm guest finished")
+    finish(rx.recv().expect("v8vm guest finished"))
 }

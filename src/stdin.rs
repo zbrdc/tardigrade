@@ -3,62 +3,202 @@
 //! Process stdin is genuinely process-global, so it is modeled that way: one
 //! process-wide hub owns a single blocking reader thread (started on the
 //! first subscription, never restarted) that keeps the UTF-8 boundary logic
-//! of [complete_utf8_len] and parks every chunk in a hub buffer. A run
-//! holds only its [StdinSub] subscription and pulls chunks out of the hub
-//! while it polls: nothing is ever pushed at a run, so a chunk that arrives
-//! while the reading run is on its way out simply stays buffered for the
-//! next subscriber instead of dying with it. EOF is sticky. When several
-//! runs read stdin concurrently, the first subscriber (front of the queue)
-//! receives the chunks until it ends; the others' read() promises stay
-//! pending.
+//! of [complete_utf8_len] and parks every chunk in a hub buffer. Consumers -
+//! run event loops and serve sessions alike - pull chunks out of the hub:
+//! nothing is ever pushed at a run, so a chunk that arrives while the
+//! reading run is on its way out simply stays buffered for the next
+//! subscriber instead of dying with it. EOF is sticky. The buffer has a
+//! 1 MiB high-water mark: past it the reader thread blocks until chunks are
+//! pulled, so a flooding writer cannot grow it without bound.
 //!
-//! Caveats: once started, the reader thread keeps draining stdin into the
-//! hub buffer even while no run is subscribed (that is what preserves data
-//! across runs, at the cost of RAM instead of pipe backpressure), and it
-//! holds the process stdin lock while blocked, so a later serve() call in
-//! the same process waits for the reader to hit EOF first.
+//! Subscriptions are held only while needed: a run holds one while it has
+//! pending vm.stdin readers (the event loop releases it once they drain),
+//! and a serve session holds one for its lifetime while it waits for
+//! commands. When several consumers read stdin concurrently, the front of
+//! the subscriber queue receives the chunks until it unsubscribes; the
+//! others' read() promises stay pending.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use crate::guest_cb;
 use crate::world::world_mut;
 
-/// A run's subscription to the stdin hub. Dropping it releases the hub slot
-/// so a later run can receive chunks.
+/// Past this many buffered bytes the reader thread blocks until a consumer
+/// pulls chunks (backpressure for e.g. `yes | v8vm guest.js`).
+const HIGH_WATER_MARK: usize = 1 << 20;
+
+/// A run's or session's subscription to the stdin hub. Dropping it releases
+/// the hub slot so a later consumer can receive chunks.
 pub(crate) struct StdinSub {
     id: u64,
 }
 
-impl Drop for StdinSub {
-    fn drop(&mut self) {
-        unsubscribe(self.id);
+impl StdinSub {
+    /// Blocks until a chunk (or EOF) is available for this subscription.
+    pub(crate) fn wait_take(&self) -> Option<Vec<u8>> {
+        HUB.wait_take(self.id)
+    }
+
+    fn try_take(&self) -> Option<Option<Vec<u8>>> {
+        HUB.try_take(self.id)
     }
 }
 
+impl Drop for StdinSub {
+    fn drop(&mut self) {
+        HUB.unsubscribe(self.id);
+    }
+}
+
+/// Hub state. Every method runs under the hub mutex, so the logic is plain
+/// and unit-testable without threads.
 struct HubState {
-    /// Chunks read from process stdin, waiting to be pulled by the current
-    /// subscriber (or kept for the next one).
     buf: VecDeque<Vec<u8>>,
+    /// Total buffered bytes, for the high-water mark.
+    bytes: usize,
     /// Sticky: once process stdin hit EOF, every future subscriber sees it.
     eof: bool,
-    /// Subscriber queue; the front id is the run currently entitled to
+    /// Subscriber queue; the front id is the consumer currently entitled to
     /// chunks.
     subs: VecDeque<u64>,
+    next_id: u64,
     started: bool,
 }
 
-static HUB: LazyLock<Mutex<HubState>> = LazyLock::new(|| {
-    Mutex::new(HubState {
-        buf: VecDeque::new(),
-        eof: false,
-        subs: VecDeque::new(),
-        started: false,
-    })
-});
+impl HubState {
+    fn new() -> Self {
+        HubState {
+            buf: VecDeque::new(),
+            bytes: 0,
+            eof: false,
+            subs: VecDeque::new(),
+            next_id: 1,
+            started: false,
+        }
+    }
 
-static NEXT_SUB_ID: AtomicU64 = AtomicU64::new(1);
+    fn push_chunk(&mut self, chunk: Vec<u8>) {
+        self.bytes += chunk.len();
+        self.buf.push_back(chunk);
+    }
+
+    fn take_chunk(&mut self) -> Option<Vec<u8>> {
+        let chunk = self.buf.pop_front()?;
+        self.bytes -= chunk.len();
+        Some(chunk)
+    }
+
+    fn would_block(&self) -> bool {
+        self.bytes >= HIGH_WATER_MARK
+    }
+
+    /// Pulls one event for `id`: `Some(Some(chunk))` is data, `Some(None)`
+    /// is EOF (and retires the subscription), `None` means nothing to take
+    /// right now - the buffer is empty and stdin is not at EOF, or another
+    /// consumer is ahead in the queue.
+    fn take_event(&mut self, id: u64) -> Option<Option<Vec<u8>>> {
+        if self.subs.front() != Some(&id) {
+            return None;
+        }
+        if let Some(chunk) = self.take_chunk() {
+            return Some(Some(chunk));
+        }
+        if self.eof {
+            self.subs.pop_front();
+            return Some(None);
+        }
+        None
+    }
+}
+
+/// The hub: shared state plus one condvar for data, space, and front-of-
+/// queue changes.
+struct Hub {
+    state: Mutex<HubState>,
+    wake: Condvar,
+}
+
+impl Hub {
+    fn new() -> Self {
+        Hub {
+            state: Mutex::new(HubState::new()),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Parks a chunk, blocking the reader while the buffer is at the
+    /// high-water mark.
+    fn push(&self, chunk: Vec<u8>) {
+        let mut st = self.state.lock().unwrap();
+        while st.would_block() {
+            st = self.wake.wait(st).unwrap();
+        }
+        st.push_chunk(chunk);
+        self.wake.notify_all();
+    }
+
+    /// Marks process stdin at EOF (sticky).
+    fn close(&self) {
+        self.state.lock().unwrap().eof = true;
+        self.wake.notify_all();
+    }
+
+    /// Enqueues a subscriber; the bool says whether the reader thread still
+    /// needs starting (decided under the lock, so it happens once).
+    fn subscribe(&self) -> (u64, bool) {
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.subs.push_back(id);
+        let start = !st.started;
+        st.started = true;
+        drop(st);
+        self.wake.notify_all();
+        (id, start)
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(pos) = st.subs.iter().position(|sid| *sid == id) {
+            st.subs.remove(pos);
+        }
+        drop(st);
+        self.wake.notify_all();
+    }
+
+    fn try_take(&self, id: u64) -> Option<Option<Vec<u8>>> {
+        let ev = self.state.lock().unwrap().take_event(id);
+        self.wake.notify_all();
+        ev
+    }
+
+    /// Blocks until an event (chunk or EOF) exists for `id`.
+    fn wait_take(&self, id: u64) -> Option<Vec<u8>> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(ev) = st.take_event(id) {
+                self.wake.notify_all();
+                return ev;
+            }
+            st = self.wake.wait(st).unwrap();
+        }
+    }
+}
+
+static HUB: LazyLock<Hub> = LazyLock::new(Hub::new);
+
+/// Subscribes (and starts the one reader thread on first use).
+pub(crate) fn subscribe() -> StdinSub {
+    let (id, start_reader) = HUB.subscribe();
+    if start_reader {
+        std::thread::Builder::new()
+            .name("v8vm-stdin".to_string())
+            .spawn(reader_loop)
+            .expect("spawn stdin reader");
+    }
+    StdinSub { id }
+}
 
 /// Length of the prefix of `buf` that can go to the guest now. A multi-byte
 /// UTF-8 sequence cut by a read boundary is held back for the next chunk;
@@ -89,67 +229,29 @@ fn reader_loop() {
     let mut buf = [0u8; 65536];
     let mut pending: Vec<u8> = Vec::new();
     loop {
-        match stdin.read(&mut buf) {
-            Ok(0) | Err(_) => {
-                let mut st = HUB.lock().unwrap();
-                if !pending.is_empty() {
-                    st.buf.push_back(std::mem::take(&mut pending));
-                }
-                st.eof = true;
-                return;
+        let n = match stdin.read(&mut buf) {
+            Ok(n) => n,
+            // A interrupted syscall is retryable, not EOF and not a real
+            // error; everything else ends the stream as before.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => 0,
+        };
+        if n == 0 {
+            if !pending.is_empty() {
+                HUB.push(std::mem::take(&mut pending));
             }
-            Ok(n) => {
-                pending.extend_from_slice(&buf[..n]);
-                let ready_len = complete_utf8_len(&pending);
-                if ready_len == 0 {
-                    continue;
-                }
-                let rest = pending.split_off(ready_len);
-                let ready = std::mem::replace(&mut pending, rest);
-                HUB.lock().unwrap().buf.push_back(ready);
-            }
+            HUB.close();
+            return;
         }
+        pending.extend_from_slice(&buf[..n]);
+        let ready_len = complete_utf8_len(&pending);
+        if ready_len == 0 {
+            continue;
+        }
+        let rest = pending.split_off(ready_len);
+        let ready = std::mem::replace(&mut pending, rest);
+        HUB.push(ready);
     }
-}
-
-fn unsubscribe(id: u64) {
-    let mut st = HUB.lock().unwrap();
-    if let Some(pos) = st.subs.iter().position(|sid| *sid == id) {
-        st.subs.remove(pos);
-    }
-}
-
-fn subscribe() -> StdinSub {
-    let id = NEXT_SUB_ID.fetch_add(1, Ordering::Relaxed);
-    let mut st = HUB.lock().unwrap();
-    st.subs.push_back(id);
-    if !st.started {
-        st.started = true;
-        std::thread::Builder::new()
-            .name("v8vm-stdin".to_string())
-            .spawn(reader_loop)
-            .expect("spawn stdin reader");
-    }
-    StdinSub { id }
-}
-
-/// Pulls one event for `id`: `Some(Some(chunk))` is data, `Some(None)` is
-/// EOF (the subscription is retired with it), `None` means nothing to take
-/// right now - either the buffer is empty and stdin is not at EOF, or
-/// another run is ahead in the subscriber queue.
-fn take_event(id: u64) -> Option<Option<Vec<u8>>> {
-    let mut st = HUB.lock().unwrap();
-    if st.subs.front() != Some(&id) {
-        return None;
-    }
-    if let Some(chunk) = st.buf.pop_front() {
-        return Some(Some(chunk));
-    }
-    if st.eof {
-        st.subs.pop_front();
-        return Some(None);
-    }
-    None
 }
 
 guest_cb!(stdin_read, |_args, rv, scope| {
@@ -190,17 +292,26 @@ fn resolve_stdin_waiters(scope: &mut v8::HandleScope, chunk: Option<&[u8]>) {
     }
 }
 
+/// A subscription is held only while readers are pending; otherwise one
+/// long-lived reader would starve every later subscriber.
+fn release_idle_subscription(scope: &mut v8::HandleScope) {
+    world_mut(scope).stdin_sub = None; // Drop unsubscribes from the hub
+}
+
 /// Delivers one hub event (if any) to the waiting readers.
 pub(crate) fn poll_stdin(scope: &mut v8::HandleScope) -> Option<i32> {
     if world_mut(scope).stdin_waiters.is_empty() {
+        release_idle_subscription(scope);
         return None;
     }
     if world_mut(scope).stdin_eof {
         resolve_stdin_waiters(scope, None);
         return None;
     }
-    let sub_id = world_mut(scope).stdin_sub.as_ref().map(|sub| sub.id);
-    let event = sub_id.and_then(take_event);
+    let event = world_mut(scope)
+        .stdin_sub
+        .as_ref()
+        .and_then(|sub| sub.try_take());
     match event {
         Some(Some(bytes)) => resolve_stdin_waiters(scope, Some(&bytes)),
         Some(None) => {
@@ -208,6 +319,9 @@ pub(crate) fn poll_stdin(scope: &mut v8::HandleScope) -> Option<i32> {
             resolve_stdin_waiters(scope, None);
         }
         None => {}
+    }
+    if world_mut(scope).stdin_waiters.is_empty() {
+        release_idle_subscription(scope);
     }
     None
 }
@@ -241,5 +355,69 @@ mod tests {
         assert_eq!(complete_utf8_len(&[0xFF]), 1);
         assert_eq!(complete_utf8_len(&[b'a', 0x80, 0x80]), 3);
         assert_eq!(complete_utf8_len(&[0xC0]), 1);
+    }
+
+    #[test]
+    fn hub_eof_is_sticky_for_later_subscribers() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        h.push(b"x".to_vec());
+        h.close();
+        assert_eq!(h.try_take(a), Some(Some(b"x".to_vec())));
+        assert_eq!(h.try_take(a), Some(None));
+        let (b, _) = h.subscribe();
+        assert_eq!(h.try_take(b), Some(None));
+    }
+
+    #[test]
+    fn hub_drains_buffered_chunks_before_eof() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        h.push(b"one".to_vec());
+        h.push(b"two".to_vec());
+        h.close();
+        assert_eq!(h.try_take(a), Some(Some(b"one".to_vec())));
+        assert_eq!(h.try_take(a), Some(Some(b"two".to_vec())));
+        assert_eq!(h.try_take(a), Some(None));
+    }
+
+    #[test]
+    fn hub_keeps_buffered_chunks_across_unsubscribe() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        h.push(b"kept".to_vec());
+        h.unsubscribe(a);
+        let (b, _) = h.subscribe();
+        assert_eq!(h.try_take(b), Some(Some(b"kept".to_vec())));
+    }
+
+    #[test]
+    fn hub_unsubscribe_rotates_the_front_subscriber() {
+        let h = Hub::new();
+        let (a, _) = h.subscribe();
+        let (b, _) = h.subscribe();
+        h.push(b"m".to_vec());
+        assert_eq!(h.try_take(b), None, "a is ahead in the queue");
+        h.unsubscribe(a);
+        assert_eq!(h.try_take(b), Some(Some(b"m".to_vec())));
+    }
+
+    #[test]
+    fn hub_push_blocks_past_the_high_water_mark_until_a_pull() {
+        let h = std::sync::Arc::new(Hub::new());
+        let (a, _) = h.subscribe();
+        h.push(vec![b'x'; HIGH_WATER_MARK]);
+        let feeder = {
+            let h = h.clone();
+            std::thread::spawn(move || h.push(b"over".to_vec()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !feeder.is_finished(),
+            "push past the high-water mark must block"
+        );
+        assert_eq!(h.try_take(a), Some(Some(vec![b'x'; HIGH_WATER_MARK])));
+        feeder.join().unwrap();
+        assert_eq!(h.try_take(a), Some(Some(b"over".to_vec())));
     }
 }

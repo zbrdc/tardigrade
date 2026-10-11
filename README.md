@@ -43,11 +43,11 @@ in-process from Rust:
 
 Note: each run()/serve() call creates its own isolate and world; several
 guests can run concurrently in one process and do not see each other's
-state. vm.stdin is fed by one process-wide reader: input a run does not
-read is kept for the next run. serve() still reads commands from process
-stdin, which remains one shared stream per process. Isolation is per
-isolate within the process: a V8 out-of-memory abort or other V8 fatal
-error ends the whole process and every guest in it.
+state. Process stdin is served by one process-wide reader shared by vm.stdin
+and serve() commands: input a run does not read is kept for the next run,
+and when several consumers read at once the first one receives the chunks.
+Isolation is per isolate within the process: a V8 out-of-memory abort or
+other V8 fatal error ends the whole process and every guest in it.
 
 ## Event loop
 

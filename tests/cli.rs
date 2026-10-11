@@ -242,3 +242,26 @@ fn serve_settles_timers_between_commands() {
     let r = serve("serve-timers", "setTimeout(() => { state.n = 9 }, 5)\nstate.n\n");
     assert_eq!(r.stdout, "1\n9\n"); // first line is the timer id
 }
+
+#[test]
+fn serve_replies_reach_stdout_before_later_guest_output() {
+    // Rendezvous: reply N must be on stdout before anything the guest prints
+    // after reply N. A queued net message is delivered by the event loop's
+    // first phase with no timer floor, so a missing ack shows up as a
+    // misplaced line; the 0 ms timer covers the scheduled case. Loop to
+    // catch the race.
+    let path = script("serve-order", "globalThis.n = 0;");
+    // One expression per command: the comma operator schedules work and
+    // yields the reply value.
+    let commands = b"(vm.net.listen(1, () => console.log('n1')), vm.net.send(1, 1, 'x'), 'A')\n(vm.net.listen(2, () => console.log('n2')), vm.net.send(2, 2, 'x'), 'B')\nsetTimeout(() => console.log('t'), 0), 'C'\n";
+    let expected = "\"A\"\nn1\n\"B\"\nn2\n\"C\"\nt\n";
+    let mut violations = 0;
+    for _ in 0..50 {
+        let r = v8vm(&["--serve", path.to_str().unwrap()], commands);
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        if r.stdout != expected {
+            violations += 1;
+        }
+    }
+    assert_eq!(violations, 0, "reply ordering violated {} of 50 times", violations);
+}

@@ -15,3 +15,8 @@ debug = false
 
 [profile.dev]
 debug = 0
+
+[[test]]
+name = "stdin_hub"
+path = "tests/stdin_hub.rs"
+harness = false
