@@ -1,0 +1,19 @@
+[package]
+name = "v8vm"
+version = "0.1.0"
+edition = "2021"
+autobins = true
+autoexamples = false
+autotests = false
+benches = false
+
+[dependencies]
+v8 = "0.106.0"
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+debug = false
+
+[profile.dev]
+debug = 0
