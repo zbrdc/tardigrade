@@ -217,7 +217,7 @@ fn recover_command_timeout(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog
     wd.settle();
     scope.cancel_terminate_execution();
     let exit = world_mut(scope).exit_code();
-    if exit >= 0 {
+    if world_mut(scope).has_exit() {
         return Some(exit);
     }
     match world_mut(scope).term.reason() {
@@ -243,7 +243,7 @@ fn timeout_outcome(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Out
 /// (run timeout, heap cap) ends the session with its own code.
 fn terminated(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Outcome {
     let exit = world_mut(scope).exit_code();
-    if exit >= 0 {
+    if world_mut(scope).has_exit() {
         return Outcome::End(exit);
     }
     if world_mut(scope).term.reason() == Some(TermReason::CommandTimeout) {
@@ -262,7 +262,7 @@ fn command_exception(
     wd: &mut CommandWatchdog,
 ) -> Outcome {
     let exit = world_mut(scope).exit_code();
-    if exit >= 0 {
+    if world_mut(scope).has_exit() {
         return Outcome::End(exit);
     }
     if world_mut(scope).term.reason() == Some(TermReason::CommandTimeout) {
@@ -427,7 +427,7 @@ fn encode_line(s: String) -> String {
 /// virtual time - and the CPU - without bound between commands.
 fn settle_after_reply(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Option<i32> {
     let exit = world_mut(scope).exit_code();
-    if exit >= 0 {
+    if world_mut(scope).has_exit() {
         return Some(exit);
     }
     let code = if world_mut(scope).clock.is_virtual() {
@@ -505,7 +505,7 @@ fn run_command(scope: &mut v8::HandleScope, srv: &Serve, line: &str) -> Option<i
 /// reason flag, not V8's possibly swallowed state) still ends it.
 fn session_end(scope: &mut v8::HandleScope) -> i32 {
     let exit = world_mut(scope).exit_code();
-    if exit >= 0 {
+    if world_mut(scope).has_exit() {
         return exit;
     }
     stopped(scope).unwrap_or(0)

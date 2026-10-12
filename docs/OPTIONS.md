@@ -301,7 +301,7 @@ entry and an ordinary guest argument after it.
 | Code | Meaning |
 |---|---|
 | 0 | the program finished, or called `vm.exit(0)` |
-| *n* | the program called `vm.exit(n)`; the status is *n* modulo 256. Negative codes are currently ignored (see [KNOWN_BUGS.md](KNOWN_BUGS.md)) |
+| *n* | the program called `vm.exit(n)`; the status is *n* modulo 256, so `vm.exit(-1)` ends 255 |
 | 1 | uncaught exception, unhandled promise rejection (still unhandled when the microtask queue drains), or prelude failure |
 | 2 | usage error, entry file that cannot be read, preload failure, or `--sandbox` not available |
 | 70 | the guest thread could not be started |

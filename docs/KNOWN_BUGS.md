@@ -27,12 +27,6 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
   to 50 ms: 20 request-and-reply round trips take about 2 seconds.
 - **An entry that is not valid UTF-8 is mishandled.** From a file it is
   reported as "cannot open" (exit 2); from stdin tardigrade panics (exit 101).
-- **A negative `vm.exit` code does not exit.** For any negative code
-  (`vm.exit(-1)`, `vm.exit(-2)`, or a value such as 2147483648 that ToInt32
-  makes negative) the call is not recorded as an exit: code after it still
-  runs, and the run ends with status 0, so a guest that reports failure
-  this way looks successful. Under `--serve` it ends the session with exit
-  1. Use a code from 0 to 255.
 - **Guest arguments cannot start with `-`.** tardigrade parses its own options
   anywhere on the command line, also after the entry, and `--` does not end
   option parsing. See [OPTIONS.md](OPTIONS.md#description).

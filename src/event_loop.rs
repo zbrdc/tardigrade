@@ -211,7 +211,7 @@ pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) 
 /// missing a handler fails the run with 1. A guest exit code (vm.exit)
 /// outranks the decision, matching Node's process.exit.
 pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
-    if world_mut(scope).exit_code() >= 0 {
+    if world_mut(scope).has_exit() {
         return None;
     }
     let first = {
@@ -317,7 +317,7 @@ fn sweep(scope: &mut HandleScope) -> i32 {
         return c;
     }
     let code = world_mut(scope).exit_code();
-    if code >= 0 {
+    if world_mut(scope).has_exit() {
         code
     } else {
         0

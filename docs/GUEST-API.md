@@ -48,8 +48,9 @@ Symbol, or an object without a `toString`, makes the call throw
 no argument, `null`, and values that convert to `NaN`, ±Infinity or a
 multiple of 2^32 give 0. All host effects stop at once: output, filesystem
 writes and scheduling. The first exit wins. Pure JavaScript computation may
-run briefly until V8 observes the termination. A negative code is currently
-ignored; see [KNOWN_BUGS.md](KNOWN_BUGS.md).
+run briefly until V8 observes the termination. Any code, a negative one
+included, exits; the process status is the code modulo 256, so `vm.exit(-1)`
+ends with status 255.
 
 `vm.run(path)` evaluates the file's text with an indirect `eval`, so
 top-level `var` and function declarations become globals, while `let`,

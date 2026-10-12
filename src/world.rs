@@ -87,8 +87,8 @@ pub(crate) enum Wake {
 /// A serve command timeout surfaces through the i32 channels as this
 /// sentinel so serve_loop can tell it from every run-level outcome. It is
 /// consumed before the session code is decided and can never escape as a
-/// process exit code (negative vm.exit codes are invisible to the
-/// `>= 0` checks that would otherwise surface them).
+/// process exit code (a guest vm.exit(-2) can equal it, but every serve
+/// path checks a recorded guest exit first, so the guest code wins).
 pub(crate) const COMMAND_TIMEOUT_CODE: i32 = -2;
 
 impl Termination {
@@ -213,7 +213,10 @@ pub(crate) struct World {
     pub(crate) clock: RunClock,
     /// The timer whose callback is on the stack, if any.
     pub(crate) running_timer: RunningTimer,
+    /// The guest's vm.exit code; any i32, negatives included, is valid,
+    /// but only once `exit_set` is true.
     exit_code: AtomicI32,
+    exit_set: AtomicBool,
     /// Termination reason shared with the watchdog thread and the heap
     /// callbacks (they get no isolate reference, only this Arc).
     pub(crate) term: Arc<Termination>,
@@ -247,6 +250,7 @@ impl World {
             clock,
             running_timer: RunningTimer::new(),
             exit_code: AtomicI32::new(-1),
+            exit_set: AtomicBool::new(false),
             term: Arc::new(Termination::new()),
             heap_mb: 0,
             ab_budget: Arc::new(AllocState::new(usize::MAX)),
@@ -263,7 +267,7 @@ impl World {
     /// call visibly wrong (124) instead of double-printing the report.
     pub(crate) fn take_terminated_exit(&mut self) -> i32 {
         let code = self.exit_code();
-        if code >= 0 {
+        if self.has_exit() {
             return code;
         }
         match self.term.take_reason() {
@@ -279,7 +283,7 @@ impl World {
     /// True once the run has decided its outcome (a vm.exit code, or an
     /// outside termination) and guest callbacks must stop having effects.
     pub(crate) fn is_leaving(&self) -> bool {
-        self.exit_code() >= 0 || self.term.reason().is_some() || self.term.is_finished()
+        self.has_exit() || self.term.reason().is_some() || self.term.is_finished()
     }
 
     /// Concludes a run whose callback or script raised an uncaught
@@ -288,7 +292,7 @@ impl World {
     /// outcome. Callers report the exception only for the last case.
     pub(crate) fn exception_exit(&mut self) -> i32 {
         let code = self.exit_code();
-        if code >= 0 {
+        if self.has_exit() {
             return code;
         }
         if self.term.reason().is_some() {
@@ -301,20 +305,27 @@ impl World {
     /// a pending exception is what decides the run (and should be
     /// reported).
     pub(crate) fn exception_decides(&self) -> bool {
-        self.exit_code() < 0 && self.term.reason().is_none()
+        !self.has_exit() && self.term.reason().is_none()
     }
 
     pub(crate) fn exit_code(&self) -> i32 {
         self.exit_code.load(Ordering::SeqCst)
     }
 
+    /// True once vm.exit recorded a code. The code is checked through
+    /// this, never through its value: negative codes are exits too.
+    pub(crate) fn has_exit(&self) -> bool {
+        self.exit_set.load(Ordering::SeqCst)
+    }
+
     /// First exit wins: a later vm.exit during the termination window
     /// cannot change the code (its callback is blocked anyway, but be
     /// explicit about the contract).
     pub(crate) fn set_exit_code(&self, code: i32) {
-        let _ = self
-            .exit_code
-            .compare_exchange(-1, code, Ordering::SeqCst, Ordering::SeqCst);
+        if self.exit_set.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.exit_code.store(code, Ordering::SeqCst);
     }
 }
 /// Reaches this run's World through the isolate embedder slot. Works from
@@ -410,6 +421,18 @@ mod tests {
         w2.set_exit_code(0);
         w2.set_exit_code(9);
         assert_eq!(w2.exit_code(), 0, "an explicit 0 also wins");
+    }
+
+    #[test]
+    fn a_negative_exit_code_is_an_exit() {
+        let mut w = World::new(0, RunClock::Real(Instant::now()));
+        w.set_exit_code(-1);
+        assert!(w.has_exit());
+        assert!(w.is_leaving());
+        assert!(!w.exception_decides());
+        assert_eq!(w.take_terminated_exit(), -1);
+        w.set_exit_code(5);
+        assert_eq!(w.exit_code(), -1, "the first exit still wins");
     }
 
     #[test]

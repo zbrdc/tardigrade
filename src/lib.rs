@@ -295,7 +295,7 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
             // checkpoint decision (Node: process.exit beats a pending
             // rejection).
             let exit = world_mut(scope).exit_code();
-            if exit >= 0 {
+            if world_mut(scope).has_exit() {
                 return exit;
             }
             // End of the entry tick: V8 has drained the script's

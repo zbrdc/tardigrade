@@ -87,6 +87,14 @@ fn vm_exit_sets_the_exit_code() {
 }
 
 #[test]
+fn a_negative_vm_exit_code_still_exits() {
+    let r = run_js("exit-negative", "vm.exit(-1); console.log('AFTER')");
+    // process::exit truncates the status to 8 bits: -1 reaches the shell as 255.
+    assert_eq!(r.code, 255);
+    assert_eq!(r.stdout, "", "nothing may run after vm.exit");
+}
+
+#[test]
 fn uncaught_exception_exits_1() {
     let r = run_js("throw", "throw new Error('boom')");
     assert_eq!(r.code, 1);
@@ -1545,6 +1553,7 @@ fn dump_is_written_for_every_ending() {
         ending("vm.exit(0) in a timer", "vm.fs.write('/f','x'); setTimeout(() => vm.exit(0), 5);", 0),
         ending("vm.exit(0) in a microtask", "vm.fs.write('/f','x'); Promise.resolve().then(() => vm.exit(0));", 0),
         ending("vm.exit(3)", "vm.fs.write('/f','x'); vm.exit(3);", 3),
+        ending("vm.exit(-1)", "vm.fs.write('/f','x'); vm.exit(-1);", 255),
         ending("uncaught exception", "vm.fs.write('/f','x'); throw new Error('boom');", 1),
         ending("unhandled rejection", "vm.fs.write('/f','x'); Promise.reject(new Error('no'));", 1),
         Ending {
