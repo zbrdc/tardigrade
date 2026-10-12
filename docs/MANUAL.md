@@ -108,8 +108,8 @@ The one-day timer fired at once, and every run prints the same line.
     1700086400000 86400000 0.3898297483912715
 
 A guest that touches nothing outside the VM is byte-for-byte reproducible
-this way, with one exception: local-time `Date` methods follow the host's
-`TZ` (see [KNOWN_BUGS.md](KNOWN_BUGS.md)). The rules for stdin, `vm.net`
+this way; local-time `Date` methods use UTC on every host. The rules for
+stdin, `vm.net`
 and `--timeout` under the virtual clock are in
 [OPTIONS.md](OPTIONS.md#--clockvirtual).
 

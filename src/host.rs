@@ -8,6 +8,13 @@ use std::sync::LazyLock;
 use crate::serve::ReplySink;
 use crate::Config;
 
+// glibc caches the zone after the first localtime use; tzset() makes the
+// TZ=UTC below visible to V8's localtime-based paths right away.
+#[cfg(unix)]
+extern "C" {
+    fn tzset();
+}
+
 /// One guest run request. `replies` carries serve-mode output lines to the
 /// calling thread; `done` carries the exit code or the guest's panic
 /// payload.
@@ -44,6 +51,11 @@ pub(crate) fn engine_started() -> bool {
 }
 
 fn host_thread(rx: Receiver<Job>) {
+    // Determinism: every mode resolves local-time Date output in UTC, not
+    // the host's zone, so this comes before anything V8-shaped.
+    std::env::set_var("TZ", "UTC");
+    #[cfg(unix)]
+    unsafe { tzset() };
     // V8 must be initialized here, not on a caller's thread: the default
     // platform may protect JIT memory with pkeys, which requires all threads
     // that use V8 to descend from the thread that called V8::initialize.

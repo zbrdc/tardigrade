@@ -30,11 +30,6 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
 - **Guest arguments cannot start with `-`.** tardigrade parses its own options
   anywhere on the command line, also after the entry, and `--` does not end
   option parsing. See [OPTIONS.md](OPTIONS.md#description).
-- **The host time zone leaks into runs.** Local-time `Date` methods use the
-  host's `TZ`, also under `--clock=virtual`, so a guest can read the host's
-  time zone, and local-time output differs between hosts with different
-  time zones. Set `TZ=UTC` in the environment of tardigrade for runs that must
-  match across hosts.
 
 ## Console mode (--serve)
 

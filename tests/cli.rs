@@ -95,6 +95,18 @@ fn a_negative_vm_exit_code_still_exits() {
 }
 
 #[test]
+fn the_guest_time_zone_is_utc_even_with_a_host_zone() {
+    let path = script("tz-leak", "console.log(new Date(0).getTimezoneOffset())");
+    let out = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
+        .env("TZ", "America/New_York")
+        .arg(&path)
+        .output()
+        .expect("spawn tardigrade");
+    assert!(out.status.success(), "status: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n");
+}
+
+#[test]
 fn uncaught_exception_exits_1() {
     let r = run_js("throw", "throw new Error('boom')");
     assert_eq!(r.code, 1);

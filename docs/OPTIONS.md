@@ -333,9 +333,9 @@ example:
 `TARDIGRADE_DEBUG`, when set, makes tardigrade print its parsed entry, dump,
 preload and serve settings to stderr before the run.
 
-`TZ` sets the time zone that local-time `Date` methods use, also under
-`--clock=virtual`, so the guest can observe it. Set `TZ=UTC` for runs that
-must match across hosts. The guest cannot read any other environment
+Local-time `Date` methods always use UTC, also under `--clock=virtual`:
+tardigrade sets `TZ=UTC` for itself before initializing the engine, and a
+`TZ` in the environment is ignored. The guest cannot read any environment
 variable.
 
 `serve_bridge` reads `OUT` as the path of the tardigrade binary (default:
