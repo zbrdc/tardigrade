@@ -81,7 +81,11 @@ declare namespace vm {
       handler: (payload: string, from: number) => void,
     ): void;
 
-    /** Queue a message to a port; throws when nothing listens there. */
+    /**
+     * Queue a message to a port; throws when nothing listens there. Queued
+     * bytes count against --memory: a send that would cross the cap throws
+     * a catchable RangeError.
+     */
     function send(fromPort: number, toPort: number, payload: string): void;
 
     /** Stop listening on a port. */

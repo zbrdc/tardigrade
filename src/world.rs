@@ -30,11 +30,21 @@ pub(crate) struct Timer {
     pub(crate) cb: v8::Global<v8::Function>,
 }
 
-/// One queued in-memory network message.
+/// One queued in-memory network message. The payload bytes are host
+/// memory the guest never sees as an ArrayBuffer, so they are charged to
+/// the ArrayBuffer budget for as long as the message sits in the queue;
+/// dropping the message (delivery or run teardown) returns them.
 pub(crate) struct NetMsg {
     pub(crate) from: u64,
     pub(crate) to: u64,
     pub(crate) payload: String,
+    pub(crate) budget: Arc<AllocState>,
+}
+
+impl Drop for NetMsg {
+    fn drop(&mut self) {
+        self.budget.release(self.payload.len());
+    }
 }
 
 /// A rejection V8 reported without a handler, kept until the next microtask
@@ -223,8 +233,9 @@ pub(crate) struct World {
     /// The effective cap, for the OOM report.
     pub(crate) heap_mb: usize,
     /// The ArrayBuffer budget the counting allocator enforces; buffers the
-    /// host builds from Rust bytes draw on it too. Guest::new installs the
-    /// run's real one; this default never refuses.
+    /// host builds from Rust bytes draw on it too, as do queued vm.net
+    /// payloads (see [NetMsg]). Guest::new installs the run's real one;
+    /// this default never refuses.
     pub(crate) ab_budget: Arc<AllocState>,
     /// Rejections awaiting the next microtask checkpoint, bucketed by the
     /// rejecting promise's identity hash so a mass catch does not scan
@@ -409,6 +420,23 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
         assert!(term.reason().is_some() && term.is_finished());
+    }
+
+    #[test]
+    fn queued_messages_hold_their_budget_bytes_until_dropped() {
+        let budget = Arc::new(crate::heap::AllocState::new(10));
+        let msg = |len: usize| NetMsg {
+            from: 1,
+            to: 2,
+            payload: "x".repeat(len),
+            budget: budget.clone(),
+        };
+        // net_send's discipline: charge the payload before queueing it.
+        assert!(budget.try_charge(4) && budget.try_charge(4));
+        let queued = VecDeque::from([msg(4), msg(4)]);
+        assert!(!budget.try_charge(3), "8 of 10 bytes are held");
+        drop(queued);
+        assert!(budget.try_charge(10), "dropping the queue returned all 8");
     }
 
     #[test]

@@ -49,8 +49,6 @@ SIGTRAP, which shells report as exit 133; other crashes end in SIGSEGV
   `a.length = 2**32 - 1; a.fill(0, 0, 2e8)` at small caps.
 - In the current build, date formatting through `Intl` and iterating an
   `Intl.Segmenter`; see [KNOWN_BUGS.md](KNOWN_BUGS.md).
-- A `vm.net` flood, which exhausts host memory (SIGSEGV or SIGABRT); see
-  [KNOWN_BUGS.md](KNOWN_BUGS.md).
 
 ## Memory
 
@@ -87,6 +85,11 @@ draw on the same budget and throw `RangeError` when it refuses them; a
 Unreachable buffers are collected and the charge is retried before a
 refusal, so churn does not trip it.
 
+Queued `vm.net` message bytes are charged to the same budget: a send
+whose payload would cross the cap throws a catchable `RangeError` in the
+sender, and the charge ends when the message is delivered or the run
+ends. A send flood therefore cannot grow host memory past the cap.
+
 ### Memory that is not capped
 
 Resizable `ArrayBuffer`s, growable `SharedArrayBuffer`s and
@@ -103,8 +106,8 @@ a cgroup memory limit) around the process.
 
 Host-side state is not counted against `--memory` either: the RAM
 filesystem (bounded by `--fs-quota`, unbounded with `--fs-quota=0`), the
-`vm.net` queue (see [KNOWN_BUGS.md](KNOWN_BUGS.md)), the timer and listener
-tables, and the copies made for snapshots and dumps.
+timer and listener tables, and the copies made for snapshots and dumps.
+(Queued `vm.net` bytes are counted; see ArrayBuffers above.)
 
 ### Other limits
 

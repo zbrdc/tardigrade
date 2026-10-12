@@ -16,9 +16,6 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
   (SIGTRAP, exit 133), and iterating `new Intl.Segmenter().segment(...)`
   kills it with SIGSEGV (exit 139). Any guest can therefore crash the
   process. `Date.prototype.toString` prints an empty time zone name.
-- **A `vm.net` flood can crash the process.** Queued messages are not
-  counted against `--memory`: an endless `vm.net.send` loop grows the host
-  queue until the process dies with SIGSEGV, even under a small cap.
 - **Blocked stdout defeats `--timeout`.** The watchdog cannot interrupt a
   write that the operating system blocks. A guest that prints in a loop
   while nothing reads its stdout runs past `--timeout` for as long as the

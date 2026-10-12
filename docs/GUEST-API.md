@@ -66,6 +66,13 @@ has a listener replaces it. Messages are delivered one generation per loop
 turn, so a reply arrives no earlier than the next turn (see
 [Event loop](#event-loop)).
 
+Queued message bytes count against the same `--memory` budget as
+ArrayBuffer memory (see [OPTIONS.md](OPTIONS.md#--memorymb)). A send whose
+payload would cross the cap throws a catchable `RangeError` in the sender;
+once the queued messages are delivered or the run ends, their bytes are
+free again. A sender that keeps messages queued cannot grow host memory
+past `--memory`.
+
 `Intl` exists but does not work in the current build: ICU data is not
 loaded. `Number.prototype.toLocaleString` and `Intl.NumberFormat` throw
 `Internal error. Icu error.`; `Date.prototype.toLocale*String` and

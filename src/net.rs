@@ -2,6 +2,7 @@
 
 use crate::diag::{throw, to_rust_string};
 use crate::guest_cb;
+use crate::webapi::throw_range;
 use crate::world::{world_mut, NetMsg};
 
 guest_cb!(net_port, |_args, rv, scope| {
@@ -35,10 +36,23 @@ guest_cb!(net_send, |args, _rv, scope| {
         return;
     }
     let payload = to_rust_string(scope, &args.get(2));
-    world_mut(scope).net.push_back(NetMsg {
+    // Queued payload bytes are host memory, so they are charged to the
+    // same --memory budget the ArrayBuffer counting allocator enforces
+    // (the shared budget, not a separate queue cap, because that budget is
+    // already per-run state). Delivery or teardown drops the message and
+    // returns the bytes. A refusal is a catchable RangeError in the
+    // sender, like the allocator's own refusals.
+    let world = world_mut(scope);
+    if !world.ab_budget.try_charge(payload.len()) {
+        throw_range(scope, "message queue exceeds the memory budget");
+        return;
+    }
+    let budget = world.ab_budget.clone();
+    world.net.push_back(NetMsg {
         from,
         to: to_port,
         payload,
+        budget,
     });
 });
 

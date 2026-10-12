@@ -24,7 +24,10 @@
 //! (TextEncoder.encode, vm.fs.readBytes) are charged to the same budget
 //! through [uint8_array_from], so they cannot be retained past it either.
 //! Resizable ArrayBuffers and growable SharedArrayBuffers bypass the
-//! allocator entirely (see docs/KNOWN_RISKS.md).
+//! allocator entirely (see docs/KNOWN_RISKS.md). The bytes of vm.net
+//! messages waiting in the host-side queue are charged to the same budget
+//! (see [NetMsg] in world.rs), so a send flood cannot grow host memory
+//! past --memory either.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -182,13 +185,20 @@ impl AllocState {
     }
 
     /// Reserves `len` bytes atomically; false (nothing reserved) when they
-    /// do not fit.
-    fn try_charge(&self, len: usize) -> bool {
+    /// do not fit. Host-side structures charged this way (queued vm.net
+    /// payloads) return their bytes through [AllocState::release].
+    pub(crate) fn try_charge(&self, len: usize) -> bool {
         self.live
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| {
                 live.checked_add(len).filter(|&need| need <= self.cap_bytes)
             })
             .is_ok()
+    }
+
+    /// Returns `len` charged bytes to the budget, once the host-side
+    /// structure that held them is gone.
+    pub(crate) fn release(&self, len: usize) {
+        self.live.fetch_sub(len, Ordering::SeqCst);
     }
 }
 
@@ -386,6 +396,33 @@ mod tests {
         assert!(st.try_charge(40), "a refusal reserves nothing");
         assert!(!st.try_charge(1));
         assert!(!st.try_charge(usize::MAX), "overflow is refused");
+    }
+
+    #[test]
+    fn charging_exactly_to_the_cap_succeeds_and_one_more_byte_refuses() {
+        let st = AllocState::new(100);
+        assert!(st.try_charge(60));
+        assert!(st.try_charge(40), "60 + 40 is exactly the cap");
+        assert!(!st.try_charge(1), "one byte past the cap is refused");
+        assert!(st.try_charge(0), "zero extra bytes still fit at the cap");
+    }
+
+    #[test]
+    fn release_returns_bytes_so_a_refused_charge_fits_again() {
+        let st = AllocState::new(100);
+        assert!(st.try_charge(80));
+        assert!(!st.try_charge(30));
+        st.release(80);
+        assert!(st.try_charge(30), "the released bytes are free again");
+    }
+
+    #[test]
+    fn a_zero_budget_admits_only_a_zero_len_charge() {
+        let st = AllocState::new(0);
+        assert!(st.try_charge(0), "no bytes always fit");
+        assert!(!st.try_charge(1));
+        st.release(0); // a zero-len charge releases zero, not less
+        assert!(!st.try_charge(1), "still nothing fits");
     }
 
     #[test]

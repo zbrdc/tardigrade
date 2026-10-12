@@ -867,6 +867,77 @@ fn net_messages_arrive_one_generation_per_turn() {
 }
 
 #[test]
+fn a_net_queue_flood_hits_the_memory_budget_as_a_catchable_range_error() {
+    // The audit shape: a tight send loop to a listener that never runs
+    // (no loop turn delivers) used to grow the host queue without bound.
+    // The queued bytes are now charged to --memory, so the send that
+    // would cross the cap throws a RangeError the guest survives.
+    let r = run_js_with(
+        &["--memory=64"],
+        "net-flood-budget",
+        "const p = vm.net.port();
+         vm.net.listen(p, () => {});
+         const msg = 'x'.repeat(64 * 1024);
+         let n = 0;
+         try { for (;;) { vm.net.send(p, p, msg); n++; } }
+         catch (e) { console.log('caught', e.name, n > 0); }
+         console.log('survived', n);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "caught RangeError true\nsurvived 1024\n");
+    // 1024 sends x 64 KiB is exactly the 64 MiB cap: the queue stopped at
+    // the budget, not at gigabytes (speed is asserted in the next test).
+}
+
+#[test]
+fn net_queue_flood_stays_bounded_and_fast() {
+    // Same flood, bounded sends and a quick exit: the old shape took the
+    // process into a hard abort (or a timeout) instead.
+    let path = script(
+        "net-flood-bounded",
+        "const p = vm.net.port();
+         vm.net.listen(p, () => {});
+         const msg = 'x'.repeat(64 * 1024);
+         let n = 0;
+         try { for (;;) { vm.net.send(p, p, msg); n++; } } catch (e) {}
+         console.log('sends', n);",
+    );
+    let start = std::time::Instant::now();
+    let r = tardigrade(&["--memory=64", path.to_str().unwrap()], b"");
+    assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let sends: usize = r
+        .stdout
+        .strip_prefix("sends ")
+        .and_then(|n| n.trim().parse().ok())
+        .expect("send count");
+    assert!(sends <= 1100, "{} sends crossed the 64 MiB budget", sends);
+}
+
+#[test]
+fn delivered_net_messages_return_their_budget_bytes() {
+    // Delivery drops the queued Rust copy, so after the loop turns the
+    // budget must be free for a second wave of the same size.
+    let r = run_js_with(
+        &["--memory=64"],
+        "net-budget-return",
+        "const p = vm.net.port();
+         let got = 0;
+         vm.net.listen(p, (m) => { got++; });
+         const msg = 'x'.repeat(1024 * 1024);
+         let n = 0;
+         try { for (;;) { vm.net.send(p, p, msg); n++; } } catch (e) {}
+         setTimeout(() => {
+           console.log('delivered', got === n);
+           for (let i = 0; i < 10; i++) vm.net.send(p, p, msg);
+           console.log('budget returned');
+         }, 0);",
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "delivered true\nbudget returned\n");
+}
+
+#[test]
 fn ramfs_read_write_list_remove() {
     let r = run_js(
         "ramfs",

@@ -67,7 +67,9 @@ what it leaves running.
 Heap cap in megabytes (MiB, 2^20 bytes), minimum 8, default 256. It caps the
 JavaScript heap and, separately, ArrayBuffer memory, each at this size. A
 guest whose live heap V8 cannot collect below its limit is stopped with exit
-137; an ArrayBuffer allocation over the cap throws a catchable `RangeError`.
+137; an ArrayBuffer allocation over the cap throws a catchable `RangeError`,
+and queued `vm.net` message bytes count against it (a send that would cross
+it throws the same way).
 The CLI rejects values below 8 with exit 2; library callers have them raised
 to 8.
 
