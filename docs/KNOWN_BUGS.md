@@ -11,8 +11,9 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
   RelativeTimeFormat throw `Internal error. Icu error.`
   `Date.prototype.toLocaleString`, `toLocaleDateString` and
   `toLocaleTimeString`, `new Intl.DateTimeFormat().format()` and
-  `Intl.DateTimeFormat().resolvedOptions()` end the whole process with a V8
-  fatal error (exit 133), and iterating `new Intl.Segmenter().segment(...)`
+  `Intl.DateTimeFormat().resolvedOptions()` kill the process with the fatal error
+  `Fatal process out of memory: DateTimePatternGeneratorCache::CreateGenerator`
+  (SIGTRAP, exit 133), and iterating `new Intl.Segmenter().segment(...)`
   kills it with SIGSEGV (exit 139). Any guest can therefore crash the
   process. `Date.prototype.toString` prints an empty time zone name.
 - **A `vm.net` flood can crash the process.** Queued messages are not
