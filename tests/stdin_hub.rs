@@ -75,7 +75,11 @@ fn session(mode: &str) -> Session {
             let _ = tx.send(std::mem::take(&mut line));
         }
     });
-    Session { child, stdin, lines: rx }
+    Session {
+        child,
+        stdin,
+        lines: rx,
+    }
 }
 
 fn feed(stdin: &mut ChildStdin, data: &[u8]) {
@@ -105,7 +109,11 @@ fn two_runs_keep_unread_input() -> bool {
     let l2 = next_line(&lines, "second");
     let ok = l1 == "first:\"one\\n\"\n"
         && l2 == "second:\"two\\n\"\n"
-        && finish(Session { child: s.child, stdin, lines });
+        && finish(Session {
+            child: s.child,
+            stdin,
+            lines,
+        });
     if !ok {
         eprintln!("two_runs: got {:?} {:?}", l1, l2);
     }
@@ -121,7 +129,11 @@ fn run_then_serve_shares_the_hub() -> bool {
     let l2 = next_line(&lines, "serve reply");
     let ok = l1 == "first:\"one\\n\"\n"
         && l2 == "42\n"
-        && finish(Session { child: s.child, stdin, lines });
+        && finish(Session {
+            child: s.child,
+            stdin,
+            lines,
+        });
     if !ok {
         eprintln!("run_then_serve: got {:?} {:?}", l1, l2);
     }

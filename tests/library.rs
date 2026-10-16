@@ -14,11 +14,24 @@ use tardigrade::Config;
 
 #[test]
 fn run_returns_the_guest_exit_code_and_can_run_again() {
-    let cfg = tardigrade::Config { heap_mb: 32, ..tardigrade::Config::new() };
+    let cfg = tardigrade::Config {
+        heap_mb: 32,
+        ..tardigrade::Config::new()
+    };
     assert_eq!(tardigrade::run("vm.exit(3)", "a.js", &cfg), 3);
     assert_eq!(tardigrade::run("", "empty.js", &cfg), 0);
     assert_eq!(tardigrade::run("throw new Error('x')", "b.js", &cfg), 1);
-    assert_eq!(tardigrade::run("for (;;) {}", "spin.js", &tardigrade::Config { timeout_ms: 50, ..cfg }), 124);
+    assert_eq!(
+        tardigrade::run(
+            "for (;;) {}",
+            "spin.js",
+            &tardigrade::Config {
+                timeout_ms: 50,
+                ..cfg
+            }
+        ),
+        124
+    );
 }
 
 #[test]
@@ -147,8 +160,16 @@ fn overlap_round() {
         50,
         start.clone(),
     );
-    assert_eq!(join_bounded(a, 30), 7, "guest A: isolated fs, own exit code");
-    assert_eq!(join_bounded(b, 30), 124, "guest B: killed by its own watchdog");
+    assert_eq!(
+        join_bounded(a, 30),
+        7,
+        "guest A: isolated fs, own exit code"
+    );
+    assert_eq!(
+        join_bounded(b, 30),
+        124,
+        "guest B: killed by its own watchdog"
+    );
 }
 
 #[test]
@@ -182,8 +203,16 @@ fn early_vm_exit_stays_per_run_while_another_guest_is_pending() {
         0,
         start.clone(),
     );
-    assert_eq!(join_bounded(quick, 30), 31, "early exit code belongs to its own run");
-    assert_eq!(join_bounded(slow, 30), 0, "naturally-finished guest sees no leaked exit code");
+    assert_eq!(
+        join_bounded(quick, 30),
+        31,
+        "early exit code belongs to its own run"
+    );
+    assert_eq!(
+        join_bounded(slow, 30),
+        0,
+        "naturally-finished guest sees no leaked exit code"
+    );
 }
 
 #[test]
@@ -217,7 +246,10 @@ fn preload_data_takes_the_same_restore_path_as_a_preload_file() {
                     if (b.length !== 2 || b[0] !== 0 || b[1] !== 255) vm.exit(9);";
     assert_eq!(run_with(v2, check_v2), 0, "v2 snapshot with a binary file");
     let legacy = r#"{"rel/x.txt":"hi"}"#;
-    assert_eq!(run_with(legacy, "if (vm.fs.read('/rel/x.txt') !== 'hi') vm.exit(9);"), 0);
+    assert_eq!(
+        run_with(legacy, "if (vm.fs.read('/rel/x.txt') !== 'hi') vm.exit(9);"),
+        0
+    );
     // restore throws on an unknown version, which aborts the run with 2.
     assert_eq!(run_with(r#"{"version":3}"#, "vm.exit(0);"), 2);
 }

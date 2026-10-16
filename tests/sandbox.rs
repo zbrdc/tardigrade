@@ -66,7 +66,13 @@ mod run {
     // ---- test selection ----
 
     /// Flags that take a separate value in libtest; the value is not a filter.
-    const VALUE_FLAGS: [&str; 5] = ["--test-threads", "--format", "--color", "--logfile", "--shuffle-seed"];
+    const VALUE_FLAGS: [&str; 5] = [
+        "--test-threads",
+        "--format",
+        "--color",
+        "--logfile",
+        "--shuffle-seed",
+    ];
 
     #[derive(Default)]
     struct Options {
@@ -145,8 +151,9 @@ mod run {
         report("", &probe_all(&dump, &escape_dir));
         // Threads created after apply must inherit both layers.
         let owned = (dump.clone(), escape_dir.clone());
-        let in_thread =
-            std::thread::spawn(move || probe_all(&owned.0, &owned.1)).join().expect("probe thread");
+        let in_thread = std::thread::spawn(move || probe_all(&owned.0, &owned.1))
+            .join()
+            .expect("probe thread");
         report("thr-", &in_thread);
     }
 
@@ -176,12 +183,22 @@ mod run {
         // Argument rules carry the same errno in this filter.
         let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as libc::c_ulong;
         for (name, flags) in NAMESPACE_PROBE_FLAGS {
-            println!("PROBE|deny|clone-thread+{}|{}", name, probe_clone(thread | flags));
+            println!(
+                "PROBE|deny|clone-thread+{}|{}",
+                name,
+                probe_clone(thread | flags)
+            );
         }
-        println!("PROBE|deny|clone-vm-nothread|{}", probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong));
-        println!("PROBE|deny|ioctl-tioclinux|{}", on_pipe(|fd| raw(unsafe {
-            libc::ioctl(fd, libc::TIOCLINUX as libc::c_ulong, b'x' as *const u8)
-        })));
+        println!(
+            "PROBE|deny|clone-vm-nothread|{}",
+            probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong)
+        );
+        println!(
+            "PROBE|deny|ioctl-tioclinux|{}",
+            on_pipe(|fd| raw(unsafe {
+                libc::ioctl(fd, libc::TIOCLINUX as libc::c_ulong, b'x' as *const u8)
+            }))
+        );
         println!("PROBE|deny|checked|{}", count);
     }
 
@@ -190,143 +207,143 @@ mod run {
     /// the list the library exports, so the two cannot drift apart.
     fn denied_table() -> Vec<(libc::c_long, &'static str)> {
         const NAMES: &[&str] = &[
-        "socket",
-        "socketpair",
-        "connect",
-        "bind",
-        "listen",
-        "accept",
-        "accept4",
-        "sendto",
-        "recvfrom",
-        "sendmsg",
-        "recvmsg",
-        "sendmmsg",
-        "recvmmsg",
-        "shutdown",
-        "getsockname",
-        "getpeername",
-        "setsockopt",
-        "getsockopt",
-        "execve",
-        "execveat",
-        "fork",
-        "vfork",
-        "ptrace",
-        "process_vm_readv",
-        "process_vm_writev",
-        "kcmp",
-        "pidfd_open",
-        "pidfd_getfd",
-        "pidfd_send_signal",
-        "setuid",
-        "setgid",
-        "setreuid",
-        "setregid",
-        "setresuid",
-        "setresgid",
-        "setfsuid",
-        "setfsgid",
-        "setgroups",
-        "capset",
-        "unshare",
-        "setns",
-        "mount",
-        "umount2",
-        "pivot_root",
-        "chroot",
-        "fsopen",
-        "fsconfig",
-        "fsmount",
-        "move_mount",
-        "open_tree",
-        "mount_setattr",
-        "fspick",
-        "init_module",
-        "finit_module",
-        "delete_module",
-        "kexec_load",
-        "kexec_file_load",
-        "reboot",
-        "swapon",
-        "swapoff",
-        "acct",
-        "sethostname",
-        "setdomainname",
-        "syslog",
-        "bpf",
-        "perf_event_open",
-        "userfaultfd",
-        "io_uring_setup",
-        "io_uring_enter",
-        "io_uring_register",
-        "seccomp",
-        "memfd_create",
-        "memfd_secret",
-        "personality",
-        "modify_ldt",
-        "keyctl",
-        "add_key",
-        "request_key",
-        "open_by_handle_at",
-        "name_to_handle_at",
-        "clock_settime",
-        "clock_adjtime",
-        "adjtimex",
-        "settimeofday",
-        "shmget",
-        "shmat",
-        "shmctl",
-        "msgget",
-        "msgsnd",
-        "msgrcv",
-        "msgctl",
-        "semget",
-        "semop",
-        "semtimedop",
-        "semctl",
-        "mq_open",
-        "mq_unlink",
-        "mq_timedsend",
-        "mq_timedreceive",
-        "mq_notify",
-        "mq_getsetattr",
-        "chmod",
-        "fchmod",
-        "fchmodat",
-        "chown",
-        "fchown",
-        "lchown",
-        "fchownat",
-        "setxattr",
-        "lsetxattr",
-        "fsetxattr",
-        "getxattr",
-        "lgetxattr",
-        "fgetxattr",
-        "listxattr",
-        "llistxattr",
-        "flistxattr",
-        "removexattr",
-        "lremovexattr",
-        "fremovexattr",
-        "utime",
-        "utimes",
-        "futimesat",
-        "utimensat",
-        "inotify_init",
-        "inotify_init1",
-        "inotify_add_watch",
-        "fanotify_init",
-        "fanotify_mark",
-        "sendfile",
-        "splice",
-        "vmsplice",
-        "tee",
-        "copy_file_range",
-        "ioperm",
-        "iopl",
-        "uselib",
+            "socket",
+            "socketpair",
+            "connect",
+            "bind",
+            "listen",
+            "accept",
+            "accept4",
+            "sendto",
+            "recvfrom",
+            "sendmsg",
+            "recvmsg",
+            "sendmmsg",
+            "recvmmsg",
+            "shutdown",
+            "getsockname",
+            "getpeername",
+            "setsockopt",
+            "getsockopt",
+            "execve",
+            "execveat",
+            "fork",
+            "vfork",
+            "ptrace",
+            "process_vm_readv",
+            "process_vm_writev",
+            "kcmp",
+            "pidfd_open",
+            "pidfd_getfd",
+            "pidfd_send_signal",
+            "setuid",
+            "setgid",
+            "setreuid",
+            "setregid",
+            "setresuid",
+            "setresgid",
+            "setfsuid",
+            "setfsgid",
+            "setgroups",
+            "capset",
+            "unshare",
+            "setns",
+            "mount",
+            "umount2",
+            "pivot_root",
+            "chroot",
+            "fsopen",
+            "fsconfig",
+            "fsmount",
+            "move_mount",
+            "open_tree",
+            "mount_setattr",
+            "fspick",
+            "init_module",
+            "finit_module",
+            "delete_module",
+            "kexec_load",
+            "kexec_file_load",
+            "reboot",
+            "swapon",
+            "swapoff",
+            "acct",
+            "sethostname",
+            "setdomainname",
+            "syslog",
+            "bpf",
+            "perf_event_open",
+            "userfaultfd",
+            "io_uring_setup",
+            "io_uring_enter",
+            "io_uring_register",
+            "seccomp",
+            "memfd_create",
+            "memfd_secret",
+            "personality",
+            "modify_ldt",
+            "keyctl",
+            "add_key",
+            "request_key",
+            "open_by_handle_at",
+            "name_to_handle_at",
+            "clock_settime",
+            "clock_adjtime",
+            "adjtimex",
+            "settimeofday",
+            "shmget",
+            "shmat",
+            "shmctl",
+            "msgget",
+            "msgsnd",
+            "msgrcv",
+            "msgctl",
+            "semget",
+            "semop",
+            "semtimedop",
+            "semctl",
+            "mq_open",
+            "mq_unlink",
+            "mq_timedsend",
+            "mq_timedreceive",
+            "mq_notify",
+            "mq_getsetattr",
+            "chmod",
+            "fchmod",
+            "fchmodat",
+            "chown",
+            "fchown",
+            "lchown",
+            "fchownat",
+            "setxattr",
+            "lsetxattr",
+            "fsetxattr",
+            "getxattr",
+            "lgetxattr",
+            "fgetxattr",
+            "listxattr",
+            "llistxattr",
+            "flistxattr",
+            "removexattr",
+            "lremovexattr",
+            "fremovexattr",
+            "utime",
+            "utimes",
+            "futimesat",
+            "utimensat",
+            "inotify_init",
+            "inotify_init1",
+            "inotify_add_watch",
+            "fanotify_init",
+            "fanotify_mark",
+            "sendfile",
+            "splice",
+            "vmsplice",
+            "tee",
+            "copy_file_range",
+            "ioperm",
+            "iopl",
+            "uselib",
         ];
         // libc has no name-to-number lookup; the constants are matched by
         // the same tokens the deny list uses.
@@ -504,7 +521,8 @@ mod run {
     /// Only the x32 guard is under test, so the seccomp layer alone is
     /// enough and the mode does not depend on Landlock support.
     fn apply_seccomp_only(dump_name: &str) {
-        apply_layer(Layer::Seccomp, Some(&scratch(dump_name)), None).expect("apply before the foreign-abi call");
+        apply_layer(Layer::Seccomp, Some(&scratch(dump_name)), None)
+            .expect("apply before the foreign-abi call");
     }
 
     /// int 0x80 with eax=20 (i386 getpid). rbx cannot be an inline-asm
@@ -602,7 +620,9 @@ mod run {
     }
 
     fn probe_all(dump: &Path, escape_dir: &Path) -> Vec<Probe> {
-        let parent = std::env::var("PROBE_PARENT").ok().and_then(|p| p.parse().ok());
+        let parent = std::env::var("PROBE_PARENT")
+            .ok()
+            .and_then(|p| p.parse().ok());
         let own_pid = unsafe { libc::getpid() };
         let mut probes = fs_probes(dump, escape_dir);
         for (name, call) in SELF_PROBES {
@@ -616,7 +636,10 @@ mod run {
         for (name, call) in TARGET_PROBES {
             probes.push(probe(&format!("{}-self-0", name), call(0)));
             probes.push(probe(&format!("{}-self-pid", name), call(own_pid)));
-            probes.push(probe(&format!("{}-parent", name), with_parent(parent, *call)));
+            probes.push(probe(
+                &format!("{}-parent", name),
+                with_parent(parent, *call),
+            ));
         }
         probes.extend(clone_probes());
         probes
@@ -640,13 +663,85 @@ mod run {
         args[0..8].copy_from_slice(&1u64.to_ne_bytes());
         let file_attr = [0u8; 32]; // struct file_attr, all zero
         vec![
-            probe("fchmodat2", sys(NR_FCHMODAT2, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0o600 as _, 0, 0])),
-            probe("setxattrat", sys(NR_SETXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, addr(args.as_ptr())])),
-            probe("getxattrat", sys(NR_GETXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, addr(args.as_ptr())])),
-            probe("listxattrat", sys(NR_LISTXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, addr(args.as_ptr()), 0])),
-            probe("removexattrat", sys(NR_REMOVEXATTRAT, [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, 0])),
-            probe("file-getattr", sys(NR_FILE_GETATTR, [libc::AT_FDCWD as _, addr(path.as_ptr()), addr(file_attr.as_ptr()), file_attr.len() as _, 0])),
-            probe("file-setattr", sys(NR_FILE_SETATTR, [libc::AT_FDCWD as _, addr(path.as_ptr()), addr(file_attr.as_ptr()), file_attr.len() as _, 0])),
+            probe(
+                "fchmodat2",
+                sys(
+                    NR_FCHMODAT2,
+                    [libc::AT_FDCWD as _, addr(path.as_ptr()), 0o600 as _, 0, 0],
+                ),
+            ),
+            probe(
+                "setxattrat",
+                sys(
+                    NR_SETXATTRAT,
+                    [
+                        libc::AT_FDCWD as _,
+                        addr(path.as_ptr()),
+                        0,
+                        name,
+                        addr(args.as_ptr()),
+                    ],
+                ),
+            ),
+            probe(
+                "getxattrat",
+                sys(
+                    NR_GETXATTRAT,
+                    [
+                        libc::AT_FDCWD as _,
+                        addr(path.as_ptr()),
+                        0,
+                        name,
+                        addr(args.as_ptr()),
+                    ],
+                ),
+            ),
+            probe(
+                "listxattrat",
+                sys(
+                    NR_LISTXATTRAT,
+                    [
+                        libc::AT_FDCWD as _,
+                        addr(path.as_ptr()),
+                        0,
+                        addr(args.as_ptr()),
+                        0,
+                    ],
+                ),
+            ),
+            probe(
+                "removexattrat",
+                sys(
+                    NR_REMOVEXATTRAT,
+                    [libc::AT_FDCWD as _, addr(path.as_ptr()), 0, name, 0],
+                ),
+            ),
+            probe(
+                "file-getattr",
+                sys(
+                    NR_FILE_GETATTR,
+                    [
+                        libc::AT_FDCWD as _,
+                        addr(path.as_ptr()),
+                        addr(file_attr.as_ptr()),
+                        file_attr.len() as _,
+                        0,
+                    ],
+                ),
+            ),
+            probe(
+                "file-setattr",
+                sys(
+                    NR_FILE_SETATTR,
+                    [
+                        libc::AT_FDCWD as _,
+                        addr(path.as_ptr()),
+                        addr(file_attr.as_ptr()),
+                        file_attr.len() as _,
+                        0,
+                    ],
+                ),
+            ),
         ]
     }
 
@@ -681,10 +776,22 @@ mod run {
         let mut probes = new_syscall_probes(dump);
         probes.extend(below_floor_probes());
         probes.extend(vec![
-            probe("read-etc-passwd", io(std::fs::File::open("/etc/passwd").map(|_| ()))),
-            probe("read-urandom", io(std::fs::File::open("/dev/urandom").map(|_| ()))),
-            probe("write-existing", io(std::fs::write(escape_dir.join("escape.txt"), "x"))),
-            probe("write-new", io(std::fs::write(escape_dir.join("new.txt"), "x"))),
+            probe(
+                "read-etc-passwd",
+                io(std::fs::File::open("/etc/passwd").map(|_| ())),
+            ),
+            probe(
+                "read-urandom",
+                io(std::fs::File::open("/dev/urandom").map(|_| ())),
+            ),
+            probe(
+                "write-existing",
+                io(std::fs::write(escape_dir.join("escape.txt"), "x")),
+            ),
+            probe(
+                "write-new",
+                io(std::fs::write(escape_dir.join("new.txt"), "x")),
+            ),
             probe("write-dump", io(std::fs::write(dump, "{\"probe\":1}"))),
             probe("read-dump", io(std::fs::File::open(dump).map(|_| ()))),
         ]);
@@ -695,37 +802,89 @@ mod run {
     /// with arguments that name nothing real, so a missing rule shows up as
     /// a different errno (EBADF, ESRCH, ENOENT) rather than as damage.
     const SELF_PROBES: &[SelfProbe] = &[
-        ("socket", || raw(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) })),
+        ("socket", || {
+            raw(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) })
+        }),
         ("exec", probe_execve),
-        ("fork", || syscall_outcome(unsafe { libc::fork() as libc::c_long })),
+        ("fork", || {
+            syscall_outcome(unsafe { libc::fork() as libc::c_long })
+        }),
         ("sys-fork", || probe_raw_process(libc::SYS_fork)),
         ("sys-vfork", || probe_raw_process(libc::SYS_vfork)),
-        ("clone-newuser", || probe_clone((libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong)),
+        ("clone-newuser", || {
+            probe_clone((libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong)
+        }),
         ("clone3", probe_clone3),
         ("thread-spawn", probe_thread),
-        ("kill-self", || raw(unsafe { libc::kill(libc::getpid(), 0) })),
-        ("ioctl-tiocsti", || raw(unsafe { libc::ioctl(0, libc::TIOCSTI as libc::c_ulong, b'x' as *const u8) })),
+        ("kill-self", || {
+            raw(unsafe { libc::kill(libc::getpid(), 0) })
+        }),
+        ("ioctl-tiocsti", || {
+            raw(unsafe { libc::ioctl(0, libc::TIOCSTI as libc::c_ulong, b'x' as *const u8) })
+        }),
         // The kernel ignores the high 32 bits of an ioctl request, so the
         // deny must compare the low dword only.
         ("ioctl-tiocsti-hibit", || {
-            raw(unsafe { libc::ioctl(0, (libc::TIOCSTI as libc::c_ulong) | 1 << 32, b'x' as *const u8) })
+            raw(unsafe {
+                libc::ioctl(
+                    0,
+                    (libc::TIOCSTI as libc::c_ulong) | 1 << 32,
+                    b'x' as *const u8,
+                )
+            })
         }),
-        ("fcntl-setsig", || on_pipe(|fd| raw(unsafe { libc::fcntl(fd, F_SETSIG, libc::SIGUSR1) }))),
+        ("fcntl-setsig", || {
+            on_pipe(|fd| raw(unsafe { libc::fcntl(fd, F_SETSIG, libc::SIGUSR1) }))
+        }),
         ("inotify-init", || raw(unsafe { libc::inotify_init1(0) })),
-        ("inotify-watch", || raw(unsafe { libc::inotify_add_watch(-1, c"/home".as_ptr(), 0xfff) })),
-        ("fanotify-init", || sys(libc::SYS_fanotify_init, [(libc::FAN_CLASS_NOTIF | libc::FAN_REPORT_FID) as _, 0, 0, 0, 0])),
+        ("inotify-watch", || {
+            raw(unsafe { libc::inotify_add_watch(-1, c"/home".as_ptr(), 0xfff) })
+        }),
+        ("fanotify-init", || {
+            sys(
+                libc::SYS_fanotify_init,
+                [
+                    (libc::FAN_CLASS_NOTIF | libc::FAN_REPORT_FID) as _,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        }),
         ("fanotify-mark", || {
             let path = addr(c"/".as_ptr());
-            sys(libc::SYS_fanotify_mark, [-1, libc::FAN_MARK_ADD as _, 0, libc::AT_FDCWD as _, path])
+            sys(
+                libc::SYS_fanotify_mark,
+                [-1, libc::FAN_MARK_ADD as _, 0, libc::AT_FDCWD as _, path],
+            )
         }),
-        ("mq-open", || sys(libc::SYS_mq_open, [addr(c"/tardigrade-probe-none".as_ptr()), libc::O_RDONLY as _, 0, 0, 0])),
-        ("mq-timedsend", || sys(libc::SYS_mq_timedsend, [-1, addr(c"x".as_ptr()), 1, 0, 0])),
+        ("mq-open", || {
+            sys(
+                libc::SYS_mq_open,
+                [
+                    addr(c"/tardigrade-probe-none".as_ptr()),
+                    libc::O_RDONLY as _,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        }),
+        ("mq-timedsend", || {
+            sys(libc::SYS_mq_timedsend, [-1, addr(c"x".as_ptr()), 1, 0, 0])
+        }),
         ("mq-timedreceive", || {
             let mut buf = [0u8; 8192];
-            sys(libc::SYS_mq_timedreceive, [-1, addr(buf.as_mut_ptr()), buf.len() as _, 0, 0])
+            sys(
+                libc::SYS_mq_timedreceive,
+                [-1, addr(buf.as_mut_ptr()), buf.len() as _, 0, 0],
+            )
         }),
         ("mq-notify", || sys(libc::SYS_mq_notify, [-1, 0, 0, 0, 0])),
-        ("mq-getsetattr", || sys(libc::SYS_mq_getsetattr, [-1, 0, 0, 0, 0])),
+        ("mq-getsetattr", || {
+            sys(libc::SYS_mq_getsetattr, [-1, 0, 0, 0, 0])
+        }),
         // Group- and user-wide targets that match no process. The group
         // probes use the caller's own pid as the group id, which passes the
         // "who" check, so only the "which" check can deny them (and no
@@ -735,12 +894,20 @@ mod run {
             raw(unsafe { libc::setpriority(libc::PRIO_PGRP, pgid, current_nice()) })
         }),
         ("ioprio-set-pgrp", || {
-            sys(libc::SYS_ioprio_set, [IOPRIO_WHO_PGRP, unsafe { libc::getpid() } as _, 0, 0, 0])
+            sys(
+                libc::SYS_ioprio_set,
+                [IOPRIO_WHO_PGRP, unsafe { libc::getpid() } as _, 0, 0, 0],
+            )
         }),
         ("setpriority-user", || {
             raw(unsafe { libc::setpriority(libc::PRIO_USER, UNUSED_ID, current_nice()) })
         }),
-        ("ioprio-set-user", || sys(libc::SYS_ioprio_set, [IOPRIO_WHO_USER, UNUSED_ID as _, 0, 0, 0])),
+        ("ioprio-set-user", || {
+            sys(
+                libc::SYS_ioprio_set,
+                [IOPRIO_WHO_USER, UNUSED_ID as _, 0, 0, 0],
+            )
+        }),
     ];
 
     /// An id (pgid or uid) that no process has.
@@ -761,8 +928,12 @@ mod run {
     /// which the Landlock scopes refuse too (SCOPED_PARENT).
     const PARENT_PROBES: &[PidProbe] = &[
         ("kill-parent", |pid| raw(unsafe { libc::kill(pid, 0) })),
-        ("tgkill-parent", |pid| raw(unsafe { libc::tgkill(pid, pid, 0) })),
-        ("tkill-parent", |pid| sys(libc::SYS_tkill, [pid as _, 0, 0, 0, 0])),
+        ("tgkill-parent", |pid| {
+            raw(unsafe { libc::tgkill(pid, pid, 0) })
+        }),
+        ("tkill-parent", |pid| {
+            sys(libc::SYS_tkill, [pid as _, 0, 0, 0, 0])
+        }),
         // Seccomp denies on the pid argument before the kernel validates the
         // siginfo, so its content is moot.
         ("sigqueue-parent", |pid| {
@@ -771,28 +942,42 @@ mod run {
         }),
         ("rt-tgsigqueue-parent", |pid| {
             let info = queue_info();
-            sys(libc::SYS_rt_tgsigqueueinfo, [pid as _, pid as _, 0, addr(&info), 0])
+            sys(
+                libc::SYS_rt_tgsigqueueinfo,
+                [pid as _, pid as _, 0, addr(&info), 0],
+            )
         }),
-        ("fcntl-setown-parent", |pid| on_pipe(|fd| raw(unsafe { libc::fcntl(fd, libc::F_SETOWN, pid) }))),
+        ("fcntl-setown-parent", |pid| {
+            on_pipe(|fd| raw(unsafe { libc::fcntl(fd, libc::F_SETOWN, pid) }))
+        }),
         ("fcntl-setown-ex-parent", |pid| {
             let owner = [F_OWNER_PID, pid]; // struct f_owner_ex { int type; pid_t pid; }
             on_pipe(|fd| raw(unsafe { libc::fcntl(fd, F_SETOWN_EX, owner.as_ptr()) }))
         }),
-        ("ioctl-fiosetown-parent", |pid| on_pipe(|fd| raw(unsafe { libc::ioctl(fd, FIOSETOWN, &pid) }))),
-        ("ioctl-siocspgrp-parent", |pid| on_pipe(|fd| raw(unsafe { libc::ioctl(fd, SIOCSPGRP, &pid) }))),
+        ("ioctl-fiosetown-parent", |pid| {
+            on_pipe(|fd| raw(unsafe { libc::ioctl(fd, FIOSETOWN, &pid) }))
+        }),
+        ("ioctl-siocspgrp-parent", |pid| {
+            on_pipe(|fd| raw(unsafe { libc::ioctl(fd, SIOCSPGRP, &pid) }))
+        }),
         ("mq-unlink-parent", |pid| {
             // The raw syscall takes the name without its leading slash, and
             // glibc's mq_unlink would turn EPERM into EACCES.
             let name = CString::new(fixture_queue_name(pid)).expect("queue name");
-            sys(libc::SYS_mq_unlink, [addr(name.as_ptr().wrapping_add(1)), 0, 0, 0, 0])
+            sys(
+                libc::SYS_mq_unlink,
+                [addr(name.as_ptr().wrapping_add(1)), 0, 0, 0, 0],
+            )
         }),
         ("connect-abstract-parent", |pid| {
-            let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            let sock =
+                unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
             if sock < 0 {
                 return errno_last();
             }
             let (address, len) = abstract_addr(pid);
-            let rv = unsafe { libc::connect(sock, &address as *const _ as *const libc::sockaddr, len) };
+            let rv =
+                unsafe { libc::connect(sock, &address as *const _ as *const libc::sockaddr, len) };
             let outcome = raw(rv);
             unsafe { libc::close(sock) };
             outcome
@@ -810,7 +995,12 @@ mod run {
         ("setpriority", |pid| {
             raw(unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, current_nice()) })
         }),
-        ("ioprio-set", |pid| sys(libc::SYS_ioprio_set, [IOPRIO_WHO_PROCESS, pid as _, 0, 0, 0])),
+        ("ioprio-set", |pid| {
+            sys(
+                libc::SYS_ioprio_set,
+                [IOPRIO_WHO_PROCESS, pid as _, 0, 0, 0],
+            )
+        }),
     ];
 
     /// A raw syscall with up to five integer arguments (pointers as
@@ -838,12 +1028,24 @@ mod run {
 
     fn prlimit(pid: i32) -> String {
         let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-        sys(libc::SYS_prlimit64, [pid as _, libc::RLIMIT_NOFILE as _, 0, addr(std::ptr::addr_of_mut!(limit)), 0])
+        sys(
+            libc::SYS_prlimit64,
+            [
+                pid as _,
+                libc::RLIMIT_NOFILE as _,
+                0,
+                addr(std::ptr::addr_of_mut!(limit)),
+                0,
+            ],
+        )
     }
 
     fn sched_setscheduler(pid: i32) -> String {
         let param = libc::sched_param { sched_priority: 0 };
-        sys(libc::SYS_sched_setscheduler, [pid as _, libc::SCHED_OTHER as _, addr(&param), 0, 0])
+        sys(
+            libc::SYS_sched_setscheduler,
+            [pid as _, libc::SCHED_OTHER as _, addr(&param), 0, 0],
+        )
     }
 
     fn sched_setparam(pid: i32) -> String {
@@ -883,7 +1085,10 @@ mod run {
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::cpu_set_t>();
         unsafe { libc::sched_getaffinity(0, size, &mut set) };
-        sys(libc::SYS_sched_setaffinity, [pid as _, size as _, addr(&set), 0, 0])
+        sys(
+            libc::SYS_sched_setaffinity,
+            [pid as _, size as _, addr(&set), 0, 0],
+        )
     }
 
     /// Runs `aim` on a fresh pipe write end (fd 0 is not a pipe), then closes it.
@@ -930,16 +1135,29 @@ mod run {
     impl Fixtures {
         fn create() -> Fixtures {
             let owner = std::process::id() as i32;
-            let listener = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            let listener =
+                unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
             let (address, len) = abstract_addr(owner);
-            let bound = unsafe { libc::bind(listener, &address as *const _ as *const libc::sockaddr, len) };
+            let bound =
+                unsafe { libc::bind(listener, &address as *const _ as *const libc::sockaddr, len) };
             let listening = unsafe { libc::listen(listener, 4) };
-            assert!(listener >= 0 && bound == 0 && listening == 0, "abstract socket fixture: {}", errno_last());
+            assert!(
+                listener >= 0 && bound == 0 && listening == 0,
+                "abstract socket fixture: {}",
+                errno_last()
+            );
             let queue = CString::new(fixture_queue_name(owner)).expect("queue name");
             // Best effort: where queues cannot be created, mq_unlink still
             // differs observably (ENOENT instead of the sandbox's EPERM).
             let mode = 0o600 as libc::mode_t;
-            let mq = unsafe { libc::mq_open(queue.as_ptr(), libc::O_CREAT | libc::O_RDWR, mode, std::ptr::null::<libc::mq_attr>()) };
+            let mq = unsafe {
+                libc::mq_open(
+                    queue.as_ptr(),
+                    libc::O_CREAT | libc::O_RDWR,
+                    mode,
+                    std::ptr::null::<libc::mq_attr>(),
+                )
+            };
             if mq != -1 {
                 unsafe { libc::mq_close(mq) };
             }
@@ -976,17 +1194,27 @@ mod run {
         let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as libc::c_ulong;
         let mut probes: Vec<Probe> = NAMESPACE_PROBE_FLAGS
             .iter()
-            .map(|(name, flag)| probe(&format!("clone-thread+{}", name), probe_clone(thread | flag)))
+            .map(|(name, flag)| {
+                probe(
+                    &format!("clone-thread+{}", name),
+                    probe_clone(thread | flag),
+                )
+            })
             .collect();
         let vfork = (libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD) as libc::c_ulong;
         probes.push(probe("clone-vfork", probe_clone(vfork)));
-        probes.push(probe("clone-vm-nothread", probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong)));
+        probes.push(probe(
+            "clone-vm-nothread",
+            probe_clone((libc::CLONE_VM | libc::SIGCHLD) as libc::c_ulong),
+        ));
         probes
     }
 
     fn clone_probe_names() -> Vec<String> {
-        let mut names: Vec<String> =
-            NAMESPACE_PROBE_FLAGS.iter().map(|(name, _)| format!("clone-thread+{}", name)).collect();
+        let mut names: Vec<String> = NAMESPACE_PROBE_FLAGS
+            .iter()
+            .map(|(name, _)| format!("clone-thread+{}", name))
+            .collect();
         names.extend(["clone-vfork", "clone-vm-nothread"].map(String::from));
         names
     }
@@ -997,7 +1225,14 @@ mod run {
         let path = CString::new("/bin/true").unwrap();
         let argv = [path.as_ptr(), std::ptr::null()];
         let envp: [*const libc::c_char; 1] = [std::ptr::null()];
-        let rv = unsafe { libc::syscall(libc::SYS_execve, path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+        let rv = unsafe {
+            libc::syscall(
+                libc::SYS_execve,
+                path.as_ptr(),
+                argv.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
         // execve only returns when it fails; success would replace the child.
         assert_eq!(rv, -1, "execve unexpectedly returned {}", rv);
         errno_last()
@@ -1008,7 +1243,11 @@ mod run {
     /// frame on the child's new stack (garbage), so a child that is ever
     /// created exits through SYS_exit before any Rust runs. `nr` is clone
     /// (which uses `flags` and `stack`), fork or vfork (which ignore both).
-    fn raw_process_syscall(nr: libc::c_long, flags: libc::c_ulong, stack: *mut libc::c_void) -> String {
+    fn raw_process_syscall(
+        nr: libc::c_long,
+        flags: libc::c_ulong,
+        stack: *mut libc::c_void,
+    ) -> String {
         let rv: i64;
         unsafe {
             std::arch::asm!(
@@ -1121,11 +1360,16 @@ mod run {
     }
 
     fn errno_last() -> String {
-        format!("errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        format!(
+            "errno={}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        )
     }
 
     fn thread_count() -> usize {
-        std::fs::read_dir("/proc/self/task").map(|tasks| tasks.count()).unwrap_or(0)
+        std::fs::read_dir("/proc/self/task")
+            .map(|tasks| tasks.count())
+            .unwrap_or(0)
     }
 
     fn report(prefix: &str, probes: &[Probe]) {
@@ -1195,16 +1439,25 @@ mod run {
 
     /// Every probe that fails with EPERM once the seccomp layer is in.
     fn seccomp_denied() -> Vec<String> {
-        let mut names: Vec<String> = SECCOMP_ONLY.iter().chain(SCOPED_PARENT).map(|n| n.to_string()).collect();
-        names.extend(TARGET_PROBES.iter().map(|(name, _)| format!("{}-parent", name)));
+        let mut names: Vec<String> = SECCOMP_ONLY
+            .iter()
+            .chain(SCOPED_PARENT)
+            .map(|n| n.to_string())
+            .collect();
+        names.extend(
+            TARGET_PROBES
+                .iter()
+                .map(|(name, _)| format!("{}-parent", name)),
+        );
         names.extend(clone_probe_names());
         names
     }
 
     /// Calls that must keep working under every layer.
     fn always_ok() -> Vec<String> {
-        let mut names: Vec<String> =
-            ["read-urandom", "kill-self", "thread-spawn", "write-dump"].map(String::from).to_vec();
+        let mut names: Vec<String> = ["read-urandom", "kill-self", "thread-spawn", "write-dump"]
+            .map(String::from)
+            .to_vec();
         for (name, _) in TARGET_PROBES {
             names.push(format!("{}-self-0", name));
             names.push(format!("{}-self-pid", name));
@@ -1212,12 +1465,20 @@ mod run {
         names
     }
 
-    const FS_DENIED: [&str; 4] = ["read-etc-passwd", "write-existing", "write-new", "read-dump"];
+    const FS_DENIED: [&str; 4] = [
+        "read-etc-passwd",
+        "write-existing",
+        "write-new",
+        "read-dump",
+    ];
 
     type Expected = Vec<(String, String)>;
 
     fn expect(names: impl IntoIterator<Item = impl AsRef<str>>, outcome: &str) -> Expected {
-        names.into_iter().map(|n| (n.as_ref().to_string(), outcome.to_string())).collect()
+        names
+            .into_iter()
+            .map(|n| (n.as_ref().to_string(), outcome.to_string()))
+            .collect()
     }
 
     fn errno_str(errno: libc::c_int) -> String {
@@ -1228,7 +1489,10 @@ mod run {
     fn full_expectations() -> Expected {
         let mut all = expect(FS_DENIED, &errno_str(libc::EACCES));
         all.extend(expect(seccomp_denied(), &errno_str(libc::EPERM)));
-        all.extend(expect(["clone3"].into_iter().chain(NEW_SYSCALLS), &errno_str(libc::ENOSYS)));
+        all.extend(expect(
+            ["clone3"].into_iter().chain(NEW_SYSCALLS),
+            &errno_str(libc::ENOSYS),
+        ));
         all.extend(expect(always_ok(), "ok"));
         all
     }
@@ -1269,22 +1533,86 @@ mod run {
     }
 
     const CASES: &[Case] = &[
-        Case { name: "full_sandbox_denies_exec_network_process_and_signals", run: full_sandbox_denies, needs_kernel: true },
-        Case { name: "full_sandbox_writes_only_the_dump_file", run: full_sandbox_dump_only, needs_kernel: true },
-        Case { name: "sandbox_restrictions_reach_threads_spawned_after_apply", run: threads_inherit, needs_kernel: true },
-        Case { name: "seccomp_layer_alone_denies_exec_network_process_creation", run: seccomp_alone, needs_kernel: false },
-        Case { name: "landlock_layer_alone_denies_filesystem_and_scopes", run: landlock_alone, needs_kernel: true },
-        Case { name: "sandbox_refuses_when_other_threads_already_run", run: refuses_late_thread, needs_kernel: false },
-        Case { name: "sandbox_refuses_when_v8_is_already_initialized", run: refuses_late_v8, needs_kernel: false },
-        Case { name: "sandbox_refuses_when_landlock_is_missing", run: refuses_no_landlock, needs_kernel: false },
-        Case { name: "sandbox_refuses_when_seccomp_is_missing", run: refuses_no_seccomp, needs_kernel: false },
-        Case { name: "foreign_abi_x32_call_is_killed", run: x32_call_killed, needs_kernel: false },
-        Case { name: "foreign_abi_int80_call_is_killed", run: int80_call_killed, needs_kernel: false },
-        Case { name: "live_run_threads_all_restricted", run: live_threads_restricted, needs_kernel: true },
-        Case { name: "dump_not_truncated_before_the_snapshot", run: dump_not_truncated_early, needs_kernel: true },
-        Case { name: "every_denied_syscall_is_denied", run: denied_enumeration, needs_kernel: false },
-        Case { name: "harness_selection_flags_list_skip_and_exact", run: harness_selection, needs_kernel: false },
-        Case { name: "harness_skips_cases_on_a_kernel_without_landlock", run: harness_old_kernel, needs_kernel: false },
+        Case {
+            name: "full_sandbox_denies_exec_network_process_and_signals",
+            run: full_sandbox_denies,
+            needs_kernel: true,
+        },
+        Case {
+            name: "full_sandbox_writes_only_the_dump_file",
+            run: full_sandbox_dump_only,
+            needs_kernel: true,
+        },
+        Case {
+            name: "sandbox_restrictions_reach_threads_spawned_after_apply",
+            run: threads_inherit,
+            needs_kernel: true,
+        },
+        Case {
+            name: "seccomp_layer_alone_denies_exec_network_process_creation",
+            run: seccomp_alone,
+            needs_kernel: false,
+        },
+        Case {
+            name: "landlock_layer_alone_denies_filesystem_and_scopes",
+            run: landlock_alone,
+            needs_kernel: true,
+        },
+        Case {
+            name: "sandbox_refuses_when_other_threads_already_run",
+            run: refuses_late_thread,
+            needs_kernel: false,
+        },
+        Case {
+            name: "sandbox_refuses_when_v8_is_already_initialized",
+            run: refuses_late_v8,
+            needs_kernel: false,
+        },
+        Case {
+            name: "sandbox_refuses_when_landlock_is_missing",
+            run: refuses_no_landlock,
+            needs_kernel: false,
+        },
+        Case {
+            name: "sandbox_refuses_when_seccomp_is_missing",
+            run: refuses_no_seccomp,
+            needs_kernel: false,
+        },
+        Case {
+            name: "foreign_abi_x32_call_is_killed",
+            run: x32_call_killed,
+            needs_kernel: false,
+        },
+        Case {
+            name: "foreign_abi_int80_call_is_killed",
+            run: int80_call_killed,
+            needs_kernel: false,
+        },
+        Case {
+            name: "live_run_threads_all_restricted",
+            run: live_threads_restricted,
+            needs_kernel: true,
+        },
+        Case {
+            name: "dump_not_truncated_before_the_snapshot",
+            run: dump_not_truncated_early,
+            needs_kernel: true,
+        },
+        Case {
+            name: "every_denied_syscall_is_denied",
+            run: denied_enumeration,
+            needs_kernel: false,
+        },
+        Case {
+            name: "harness_selection_flags_list_skip_and_exact",
+            run: harness_selection,
+            needs_kernel: false,
+        },
+        Case {
+            name: "harness_skips_cases_on_a_kernel_without_landlock",
+            run: harness_old_kernel,
+            needs_kernel: false,
+        },
     ];
 
     enum Outcome {
@@ -1317,7 +1645,10 @@ mod run {
                 Outcome::Skipped => skipped += 1,
             }
         }
-        println!("sandbox test result: {} run; {} failed; {} skipped", ran, failed, skipped);
+        println!(
+            "sandbox test result: {} run; {} failed; {} skipped",
+            ran, failed, skipped
+        );
         // A filter that matches nothing is fine (see the module comment); an
         // unfiltered run that ran nothing must not look like a pass.
         if ran + skipped == 0 && opts.filters.is_empty() {
@@ -1346,7 +1677,11 @@ mod run {
             return Outcome::Skipped;
         }
         let passed = std::panic::catch_unwind(case.run).is_ok();
-        println!("test {} ... {}", case.name, if passed { "ok" } else { "FAILED" });
+        println!(
+            "test {} ... {}",
+            case.name,
+            if passed { "ok" } else { "FAILED" }
+        );
         if passed {
             Outcome::Passed
         } else {
@@ -1359,14 +1694,24 @@ mod run {
     /// by number), the ones only the table has, or a pure reordering.
     fn table_drift(table: &[(libc::c_long, &str)], list: &[libc::c_long]) -> String {
         let name = |nr: libc::c_long| {
-            table.iter().find(|(n, _)| *n == nr).map_or_else(|| nr.to_string(), |(_, name)| name.to_string())
+            table
+                .iter()
+                .find(|(n, _)| *n == nr)
+                .map_or_else(|| nr.to_string(), |(_, name)| name.to_string())
         };
-        let only_in_list: Vec<String> =
-            list.iter().filter(|nr| !table.iter().any(|(n, _)| n == *nr)).map(|nr| name(*nr)).collect();
-        let only_in_table: Vec<String> =
-            table.iter().filter(|(nr, _)| !list.contains(nr)).map(|(nr, _)| name(*nr)).collect();
+        let only_in_list: Vec<String> = list
+            .iter()
+            .filter(|nr| !table.iter().any(|(n, _)| n == *nr))
+            .map(|nr| name(*nr))
+            .collect();
+        let only_in_table: Vec<String> = table
+            .iter()
+            .filter(|(nr, _)| !list.contains(nr))
+            .map(|(nr, _)| name(*nr))
+            .collect();
         if only_in_list.is_empty() && only_in_table.is_empty() {
-            return "the test table and the deny list hold the same syscalls in a different order".to_string();
+            return "the test table and the deny list hold the same syscalls in a different order"
+                .to_string();
         }
         format!(
             "the test table and the deny list disagree: in the list but not the table: {:?}; in the table but not the list: {:?}",
@@ -1382,19 +1727,35 @@ mod run {
         let expected_nrs = denied_syscalls();
         let table = denied_table();
         let table_nrs: Vec<libc::c_long> = table.iter().map(|(nr, _)| *nr).collect();
-        assert!(table_nrs == expected_nrs, "{}", table_drift(&table, &expected_nrs));
+        assert!(
+            table_nrs == expected_nrs,
+            "{}",
+            table_drift(&table, &expected_nrs)
+        );
         let lines = run_probe("deny-enum", &[]);
         assert_eq!(result(&lines, "deny-enum"), "ok", "apply must succeed");
         let want = format!("errno={}", PROBE_DENY_ERRNO);
-        let mut keys: Vec<String> = table.iter().map(|(_, name)| format!("deny|{}", name)).collect();
-        keys.extend(NAMESPACE_PROBE_FLAGS.iter().map(|(name, _)| format!("deny|clone-thread+{}", name)));
+        let mut keys: Vec<String> = table
+            .iter()
+            .map(|(_, name)| format!("deny|{}", name))
+            .collect();
+        keys.extend(
+            NAMESPACE_PROBE_FLAGS
+                .iter()
+                .map(|(name, _)| format!("deny|clone-thread+{}", name)),
+        );
         keys.extend(["deny|clone-vm-nothread", "deny|ioctl-tioclinux"].map(String::from));
         let wrong: Vec<String> = keys
             .iter()
-            .filter_map(|key| match lines.iter().find_map(|l| l.strip_prefix(&format!("PROBE|{}|", key))) {
-                None => Some(format!("{}: no result", key)),
-                Some(o) if o != want => Some(format!("{}: {}", key, o)),
-                _ => None,
+            .filter_map(|key| {
+                match lines
+                    .iter()
+                    .find_map(|l| l.strip_prefix(&format!("PROBE|{}|", key)))
+                {
+                    None => Some(format!("{}: no result", key)),
+                    Some(o) if o != want => Some(format!("{}: {}", key, o)),
+                    _ => None,
+                }
             })
             .collect();
         assert!(wrong.is_empty(), "deny list mismatches: {:?}", wrong);
@@ -1413,39 +1774,74 @@ mod run {
             .collect();
 
         // libtest flags are ignored, not taken for filters.
-        let out = harness_run(&["--list", "--nocapture", "--test-threads=1", "--test-threads", "1"]);
+        let out = harness_run(&[
+            "--list",
+            "--nocapture",
+            "--test-threads=1",
+            "--test-threads",
+            "1",
+        ]);
         assert!(out.status.success(), "flags must not break --list");
         let listed = String::from_utf8_lossy(&out.stdout).into_owned();
         for name in &case_names {
-            assert!(listed.contains(&format!("{}: test", name)), "--list misses {}: {}", name, listed);
+            assert!(
+                listed.contains(&format!("{}: test", name)),
+                "--list misses {}: {}",
+                name,
+                listed
+            );
         }
 
         // Probe-mode names are plain filters now, not modes: `x32` lists the
         // case and must not run (or die in) the x32 probe.
         let out = harness_run(&["--list", "x32"]);
         assert!(out.status.success(), "x32 filter: {:?}", out.status);
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "foreign_abi_x32_call_is_killed: test");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "foreign_abi_x32_call_is_killed: test"
+        );
 
         // --skip removes cases, in both spellings.
         let out = harness_run(&["--list", "--skip", "refuses", "--skip=foreign_abi"]);
         let listed = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(!listed.contains("refuses") && !listed.contains("foreign_abi"), "skip ignored: {}", listed);
-        assert!(listed.contains("full_sandbox_denies"), "skip removed too much: {}", listed);
+        assert!(
+            !listed.contains("refuses") && !listed.contains("foreign_abi"),
+            "skip ignored: {}",
+            listed
+        );
+        assert!(
+            listed.contains("full_sandbox_denies"),
+            "skip removed too much: {}",
+            listed
+        );
 
         // --exact needs the whole name.
         let whole = "sandbox_refuses_when_other_threads_already_run";
-        assert!(String::from_utf8_lossy(&harness_run(&["--list", "--exact", "refuses_when_other"]).stdout).is_empty());
+        assert!(String::from_utf8_lossy(
+            &harness_run(&["--list", "--exact", "refuses_when_other"]).stdout
+        )
+        .is_empty());
         let out = harness_run(&["--list", "--exact", whole]);
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("{}: test", whole));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("{}: test", whole)
+        );
 
         // A filter that matches nothing passes with "0 run" (cargo passes
         // another target's test name to this one); an unfiltered run in
         // which nothing ran does not.
         let out = harness_run(&["no-such-test-name"]);
-        assert!(out.status.success(), "unmatched filter must pass: {:?}", out.status);
+        assert!(
+            out.status.success(),
+            "unmatched filter must pass: {:?}",
+            out.status
+        );
         assert!(String::from_utf8_lossy(&out.stdout).contains("0 run"));
         let out = harness_run(&["--skip", "_"]);
-        assert!(!out.status.success(), "an unfiltered run of nothing must fail");
+        assert!(
+            !out.status.success(),
+            "an unfiltered run of nothing must fail"
+        );
         assert!(String::from_utf8_lossy(&out.stderr).contains("no sandbox tests ran"));
     }
 
@@ -1466,18 +1862,31 @@ mod run {
         let needs_kernel = "full_sandbox_denies_exec_network_process_and_signals";
         let fail_closed = "sandbox_refuses_when_seccomp_is_missing";
         let mut cmd = harness_command();
-        cmd.arg(format!("{}old-kernel", PROBE_PREFIX)).args([needs_kernel, fail_closed]);
+        cmd.arg(format!("{}old-kernel", PROBE_PREFIX))
+            .args([needs_kernel, fail_closed]);
 
         let lenient = run_bounded(cmd.env_remove("TARDIGRADE_REQUIRE_SANDBOX"));
         let stdout = String::from_utf8_lossy(&lenient.stdout);
         let stderr = String::from_utf8_lossy(&lenient.stderr);
-        assert!(lenient.status.success(), "skip must pass: {} {}", stdout, stderr);
+        assert!(
+            lenient.status.success(),
+            "skip must pass: {} {}",
+            stdout,
+            stderr
+        );
         let notice = format!("SKIPPED (kernel lacks Landlock ABI 6): {}", needs_kernel);
         assert!(stderr.contains(&notice), "missing skip notice: {}", stderr);
-        assert!(stdout.contains("1 run; 0 failed; 1 skipped"), "fail-closed case must run: {}", stdout);
+        assert!(
+            stdout.contains("1 run; 0 failed; 1 skipped"),
+            "fail-closed case must run: {}",
+            stdout
+        );
 
         let strict = run_bounded(cmd.env("TARDIGRADE_REQUIRE_SANDBOX", "1"));
-        assert!(!strict.status.success(), "TARDIGRADE_REQUIRE_SANDBOX=1 must fail the skip");
+        assert!(
+            !strict.status.success(),
+            "TARDIGRADE_REQUIRE_SANDBOX=1 must fail the skip"
+        );
         assert!(String::from_utf8_lossy(&strict.stdout).contains("FAILED (kernel lacks Landlock"));
     }
 
@@ -1506,7 +1915,9 @@ mod run {
     /// instead of multiplying.
     fn run_bounded(cmd: &mut Command) -> Output {
         const LIMIT: Duration = Duration::from_secs(60);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn bounded child");
         let deadline = Instant::now() + LIMIT;
         while child.try_wait().expect("poll bounded child").is_none() {
@@ -1517,12 +1928,15 @@ mod run {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        child.wait_with_output().expect("collect bounded child output")
+        child
+            .wait_with_output()
+            .expect("collect bounded child output")
     }
 
     fn self_exec(mode: &str) -> Command {
         let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
-        cmd.arg(format!("{}{}", PROBE_PREFIX, mode)).env("PROBE_PARENT", std::process::id().to_string());
+        cmd.arg(format!("{}{}", PROBE_PREFIX, mode))
+            .env("PROBE_PARENT", std::process::id().to_string());
         cmd
     }
 
@@ -1563,15 +1977,30 @@ mod run {
 
     fn full_sandbox_denies() {
         let lines = layer_mode("probe", "deny");
-        assert_eq!(result(&lines, "threads"), "1", "apply starts from one thread");
+        assert_eq!(
+            result(&lines, "threads"),
+            "1",
+            "apply starts from one thread"
+        );
         check(&lines, "", &full_expectations());
         check_below_floor(&lines, "");
     }
 
     fn full_sandbox_dump_only() {
         let lines = layer_mode("probe", "dump-only");
-        assert_eq!(result(&lines, "write-dump"), "ok", "the dump write must pass");
-        check(&lines, "", &expect(["read-dump", "write-existing", "write-new"], &errno_str(libc::EACCES)));
+        assert_eq!(
+            result(&lines, "write-dump"),
+            "ok",
+            "the dump write must pass"
+        );
+        check(
+            &lines,
+            "",
+            &expect(
+                ["read-dump", "write-existing", "write-new"],
+                &errno_str(libc::EACCES),
+            ),
+        );
         let content = std::fs::read_to_string(scratch("dump-only-dump.json")).expect("dump file");
         assert_eq!(content, "{\"probe\":1}");
     }
@@ -1589,7 +2018,10 @@ mod run {
     fn seccomp_alone() {
         let lines = layer_mode("seccomp-only", "seccomp");
         let mut expected = expect(seccomp_denied(), &errno_str(libc::EPERM));
-        expected.extend(expect(["clone3"].into_iter().chain(NEW_SYSCALLS), &errno_str(libc::ENOSYS)));
+        expected.extend(expect(
+            ["clone3"].into_iter().chain(NEW_SYSCALLS),
+            &errno_str(libc::ENOSYS),
+        ));
         expected.extend(expect(always_ok(), "ok"));
         // Landlock is absent in this mode: these succeed, proving the layer
         // isolation works in the other direction too.
@@ -1615,8 +2047,17 @@ mod run {
     fn assert_refused(mode: &str, needle: &str) {
         let lines = run_probe(mode, &[]);
         let outcome = result(&lines, mode);
-        assert!(outcome.starts_with("refused:"), "apply must refuse: {:?}", lines);
-        assert!(outcome.contains(needle), "refusal must name {:?}: {:?}", needle, lines);
+        assert!(
+            outcome.starts_with("refused:"),
+            "apply must refuse: {:?}",
+            lines
+        );
+        assert!(
+            outcome.contains(needle),
+            "refusal must name {:?}: {:?}",
+            needle,
+            lines
+        );
     }
 
     fn refuses_late_thread() {
@@ -1662,9 +2103,24 @@ mod run {
     fn assert_killed_by(mode: &str, signal: i32) {
         let out = run_bounded(&mut self_exec(mode));
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(stdout.lines().any(|l| l == format!("PROBE|{}|armed", mode)), "armed marker missing: {}", stdout);
-        assert!(!stdout.contains("survived"), "foreign-abi call returned instead of dying: {}", stdout);
-        assert_eq!(out.status.signal(), Some(signal), "{} must die with signal {}: {:?}", mode, signal, out.status);
+        assert!(
+            stdout.lines().any(|l| l == format!("PROBE|{}|armed", mode)),
+            "armed marker missing: {}",
+            stdout
+        );
+        assert!(
+            !stdout.contains("survived"),
+            "foreign-abi call returned instead of dying: {}",
+            stdout
+        );
+        assert_eq!(
+            out.status.signal(),
+            Some(signal),
+            "{} must die with signal {}: {:?}",
+            mode,
+            signal,
+            out.status
+        );
     }
 
     /// The real binary under --sandbox: every thread it creates (V8's worker
@@ -1687,12 +2143,21 @@ mod run {
         assert!(statuses.len() > 1, "V8 worker threads must exist");
         assert!(statuses.len() >= 5, "expected the tardigrade main, host, guest and watchdog threads plus V8 workers, saw {}", statuses.len());
         for status in &statuses {
-            assert!(status.contains("Seccomp:\t2"), "no seccomp filter: {}", first_lines(status));
-            assert!(status.contains("NoNewPrivs:\t1"), "no no_new_privs: {}", first_lines(status));
+            assert!(
+                status.contains("Seccomp:\t2"),
+                "no seccomp filter: {}",
+                first_lines(status)
+            );
+            assert!(
+                status.contains("NoNewPrivs:\t1"),
+                "no no_new_privs: {}",
+                first_lines(status)
+            );
             // Three filters are installed: clone3 ENOSYS, the x32 guard and
             // the deny list. The field exists since Linux 6.8 and the
             // sandbox needs 6.12, so its absence is a failure.
-            let count = seccomp_filters(status).expect("Seccomp_filters field in /proc/<pid>/task/<tid>/status");
+            let count = seccomp_filters(status)
+                .expect("Seccomp_filters field in /proc/<pid>/task/<tid>/status");
             assert_eq!(count, 3, "filter count: {}", first_lines(status));
         }
         drop(child.stdin.take()); // release stdin so the guest can finish
@@ -1705,7 +2170,11 @@ mod run {
             std::thread::sleep(Duration::from_millis(20));
         }
         let out = child.wait_with_output().expect("collect tardigrade output");
-        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// The dump file is created without O_TRUNC: a run that dies before the
@@ -1724,11 +2193,19 @@ mod run {
             script.to_str().unwrap(),
         ]);
         assert_eq!(out.status.code(), Some(2));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "guest must not run");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "",
+            "guest must not run"
+        );
         assert_eq!(std::fs::read_to_string(&dump).unwrap(), "OLD");
 
         let ok = write_guest("early-ok", "vm.fs.write('/k', 'v');");
-        let out = tardigrade_output(&["--sandbox", &format!("--dump={}", dump.display()), ok.to_str().unwrap()]);
+        let out = tardigrade_output(&[
+            "--sandbox",
+            &format!("--dump={}", dump.display()),
+            ok.to_str().unwrap(),
+        ]);
         assert_eq!(out.status.code(), Some(0));
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&dump).unwrap()).expect("dump json");
