@@ -23,11 +23,11 @@ caps, including WebAssembly memory not counting against the heap cap, are in
 [docs/KNOWN_RISKS.md](docs/KNOWN_RISKS.md).
 
 tardigrade is a command-line tool and a Rust library, written on the `v8` crate
-(rusty_v8, V8 12.9).
+(rusty_v8 152, V8 15.2, built with pointer compression).
 
     $ tardigrade examples/hello.js
     hello from ram
-    engine: V8 12.9.202.13-rusty
+    engine: V8 15.2.124.1-rusty
 
 ## Documentation
 

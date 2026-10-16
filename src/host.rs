@@ -39,7 +39,9 @@ static HOST: LazyLock<Sender<Job>> = LazyLock::new(|| {
 });
 
 pub(crate) fn submit(job: Job) {
-    LazyLock::force(&HOST).send(job).expect("tardigrade host thread alive");
+    LazyLock::force(&HOST)
+        .send(job)
+        .expect("tardigrade host thread alive");
 }
 
 /// True once the host thread has been spawned (it initializes V8 as its
@@ -55,7 +57,9 @@ fn host_thread(rx: Receiver<Job>) {
     // the host's zone, so this comes before anything V8-shaped.
     std::env::set_var("TZ", "UTC");
     #[cfg(unix)]
-    unsafe { tzset() };
+    unsafe {
+        tzset()
+    };
     // V8 must be initialized here, not on a caller's thread: the default
     // platform may protect JIT memory with pkeys, which requires all threads
     // that use V8 to descend from the thread that called V8::initialize.
@@ -65,7 +69,13 @@ fn host_thread(rx: Receiver<Job>) {
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
     for job in rx {
-        let Job { source, entry, cfg, replies, done } = job;
+        let Job {
+            source,
+            entry,
+            cfg,
+            replies,
+            done,
+        } = job;
         // Clone so a failed spawn still leaves a channel to answer on. A
         // failed spawn must not take the host thread down with it: only this
         // job fails, with exit code 70 (EX_SOFTWARE).

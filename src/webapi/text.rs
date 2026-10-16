@@ -111,7 +111,10 @@ fn push_units(len: usize, unit: impl Fn(usize) -> u16, out: &mut Vec<u8>) -> Res
 /// from V8 (it counts an unpaired surrogate as its 3-byte replacement),
 /// and the buffer is reserved fallibly: an embedder short on memory gets
 /// Err, which becomes a guest RangeError.
-fn encode_to_vec(scope: &mut v8::HandleScope, s: v8::Local<v8::String>) -> Result<Vec<u8>, ()> {
+fn encode_to_vec(
+    scope: &mut v8::PinScope<'_, '_>,
+    s: v8::Local<v8::String>,
+) -> Result<Vec<u8>, ()> {
     let mut out = Vec::new();
     out.try_reserve_exact(s.utf8_length(scope))
         .map_err(|_| ())?;
@@ -167,13 +170,13 @@ fn encode_into_cells(len: usize, unit: impl Fn(usize) -> u16, out: &[Cell<u8>]) 
 }
 
 /// The typeof name of a value, for ERR_INVALID_ARG_TYPE-shaped messages.
-fn type_name(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> String {
+fn type_name(scope: &mut v8::PinScope<'_, '_>, v: &v8::Local<v8::Value>) -> String {
     let ty = v.type_of(scope);
     ty.to_rust_string_lossy(scope)
 }
 
 fn read_written_obj<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     read: usize,
     written: usize,
 ) -> v8::Local<'s, v8::Object> {
@@ -190,7 +193,7 @@ fn read_written_obj<'s>(
 /// capacity, so nothing is ever read or written). No allocation beyond
 /// the tiny result object.
 fn encode_into<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     src: v8::Local<'s, v8::String>,
     dest: v8::Local<'s, v8::ArrayBufferView>,
 ) -> v8::Local<'s, v8::Value> {
@@ -265,7 +268,7 @@ pub(crate) struct DecodeOpts {
 }
 
 impl DecodeOpts {
-    fn read(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> DecodeOpts {
+    fn read(scope: &mut v8::PinScope<'_, '_>, v: &v8::Local<v8::Value>) -> DecodeOpts {
         let defaults = DecodeOpts {
             fatal: false,
             ignore_bom: false,
@@ -284,7 +287,7 @@ impl DecodeOpts {
     }
 }
 
-fn opt_bool(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>, name: &str) -> bool {
+fn opt_bool(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<v8::Object>, name: &str) -> bool {
     let key = crate::webapi::v8_str(scope, name);
     obj.get(scope, key.into())
         .is_some_and(|v| v.boolean_value(scope))
@@ -415,7 +418,7 @@ fn decode_tail(
 }
 
 fn decode_result<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     text: Vec<u8>,
     state: &DecodeState,
 ) -> Option<v8::Local<'s, v8::Object>> {

@@ -74,9 +74,9 @@ impl RunClock {
     /// instead of panicking inside a V8 callback.
     pub(crate) fn date_ms(&self) -> u64 {
         match self {
-            RunClock::Virtual { epoch_ms, now_ms } => epoch_ms
-                .saturating_add(*now_ms)
-                .min(Clock::MAX_EPOCH_MS),
+            RunClock::Virtual { epoch_ms, now_ms } => {
+                epoch_ms.saturating_add(*now_ms).min(Clock::MAX_EPOCH_MS)
+            }
             RunClock::Real(_) => 0,
         }
     }
@@ -110,7 +110,10 @@ mod tests {
 
     #[test]
     fn the_virtual_clock_advances_only_through_advance_to() {
-        let mut c = RunClock::Virtual { epoch_ms: 5, now_ms: 0 };
+        let mut c = RunClock::Virtual {
+            epoch_ms: 5,
+            now_ms: 0,
+        };
         assert_eq!(c.now(), 0);
         assert_eq!(c.perf_ms(), 0.0);
         assert_eq!(c.date_ms(), 5, "the epoch is the Date zero point");
@@ -120,7 +123,10 @@ mod tests {
 
     #[test]
     fn advance_to_never_moves_the_clock_backwards() {
-        let mut c = RunClock::Virtual { epoch_ms: 0, now_ms: 100 };
+        let mut c = RunClock::Virtual {
+            epoch_ms: 0,
+            now_ms: 100,
+        };
         c.advance_to(40);
         assert_eq!(c.now(), 100, "a stale deadline must not rewind time");
     }
@@ -170,7 +176,10 @@ mod tests {
 
     #[test]
     fn virtual_deadlines_are_the_timeline_plus_the_delay() {
-        let mut c = RunClock::Virtual { epoch_ms: 0, now_ms: 40 };
+        let mut c = RunClock::Virtual {
+            epoch_ms: 0,
+            now_ms: 40,
+        };
         assert_eq!(c.deadline_after(60), 100);
         c.advance_to(100);
         assert_eq!(c.deadline_after(0), 100, "zero delay keeps the clock");
@@ -180,7 +189,10 @@ mod tests {
     fn a_real_clock_measures_elapsed_time() {
         let before = std::time::Instant::now();
         let c = RunClock::Real(before);
-        assert!(c.now() < 1_000_000, "a fresh real clock is under a millisecond in");
+        assert!(
+            c.now() < 1_000_000,
+            "a fresh real clock is under a millisecond in"
+        );
         assert!(!c.is_virtual());
         std::thread::sleep(std::time::Duration::from_millis(15));
         // Real ticks are nanoseconds; 10 ms past the sleep is 10 ms of ns.

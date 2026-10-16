@@ -135,8 +135,8 @@ mod run {
     fn mode_apply(layer: Option<Layer>, dump: PathBuf, escape_dir: PathBuf) {
         println!("PROBE|threads|{}", thread_count());
         let applied = match layer {
-            None => tardigrade::sandbox::apply(Some(&dump)),
-            Some(layer) => apply_layer(layer, Some(&dump)),
+            None => tardigrade::sandbox::apply(Some(&dump), None),
+            Some(layer) => apply_layer(layer, Some(&dump), None),
         };
         if let Err(e) = applied {
             println!("PROBE|apply|refused:{}", e);
@@ -504,7 +504,7 @@ mod run {
     /// Only the x32 guard is under test, so the seccomp layer alone is
     /// enough and the mode does not depend on Landlock support.
     fn apply_seccomp_only(dump_name: &str) {
-        apply_layer(Layer::Seccomp, Some(&scratch(dump_name))).expect("apply before the foreign-abi call");
+        apply_layer(Layer::Seccomp, Some(&scratch(dump_name)), None).expect("apply before the foreign-abi call");
     }
 
     /// int 0x80 with eax=20 (i386 getpid). rbx cannot be an inline-asm
@@ -534,14 +534,14 @@ mod run {
         let keeper = std::thread::spawn(move || {
             let _ = rx.recv();
         });
-        report_apply("late-thread", tardigrade::sandbox::apply(None));
+        report_apply("late-thread", tardigrade::sandbox::apply(None, None));
         drop(tx);
         let _ = keeper.join();
     }
 
     fn mode_late_v8() {
         let _ = tardigrade::run("", "noop.js", &tardigrade::Config::new());
-        report_apply("late-v8", tardigrade::sandbox::apply(None));
+        report_apply("late-v8", tardigrade::sandbox::apply(None, None));
     }
 
     /// Simulates a kernel without a layer: the layer's setup syscall fails
@@ -551,9 +551,9 @@ mod run {
         let applied = if name == "no-seccomp" && !common::kernel_supports_sandbox() {
             // A full apply would stop at Landlock first on this kernel and
             // hide the seccomp refusal under test.
-            apply_layer(Layer::Seccomp, None)
+            apply_layer(Layer::Seccomp, None, None)
         } else {
-            tardigrade::sandbox::apply(None)
+            tardigrade::sandbox::apply(None, None)
         };
         report_apply(name, applied);
     }

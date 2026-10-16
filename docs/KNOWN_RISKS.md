@@ -20,12 +20,26 @@ process:
   None of these is caused by the guest.
 - `vm.net` is a message switch inside the process, not sockets. Nothing
   sent on it can leave the run.
+- `vm.net.request` (only with `--allow-call`) is scoped egress, not a
+  general proxy: the guest names a capability and supplies a body, the
+  URL and headers are operator policy enforced again in the
+  `net-sidecar` subprocess, redirects are not followed, and the
+  sidecar's resolver returns only addresses it may connect to (private
+  ranges refused unless `--net-allow-private`), so DNS rebinding cannot
+  race the check. The sidecar runs under its own Landlock/seccomp
+  profile (`sandbox::apply_sidecar_profile`: resolver-only filesystem
+  view, no exec/ptrace/namespaces, sockets allowed) where the kernel
+  supports it, and logs a warning where it does not; it remains part of
+  the trusted computing base, and a granted endpoint must be treated as
+  reachable by design.
 - A V8 fatal error ends the whole process and every guest in it (see
   [Process aborts](#process-aborts)).
-- The V8 build has neither the V8 sandbox nor pointer compression
-  (`v8_enable_sandbox = false` in the `v8` crate's build configuration).
-  A memory-corruption bug in V8 therefore gives the guest the whole address
-  space of the process, not a bounded cage.
+- The V8 build uses pointer compression but not the V8 sandbox
+  (the rusty_v8 152 crate exposes `v8_enable_sandbox`, but its
+  prebuilt sandbox artifact is missing upstream, so enabling it means
+  building V8 from source). A memory-corruption bug in V8 therefore
+  gives the guest the whole address space of the process, not a
+  bounded cage.
 
 For hostile code, add `--sandbox` ([SANDBOX.md](SANDBOX.md)), which is the
 only kernel-enforced layer, run tardigrade itself under a container or an OS
@@ -47,8 +61,6 @@ SIGTRAP, which shells report as exit 133; other crashes end in SIGSEGV
   `'ab'.repeat(2e8).split('')`.
 - Long native builtins that ignore termination, such as
   `a.length = 2**32 - 1; a.fill(0, 0, 2e8)` at small caps.
-- In the current build, date formatting through `Intl` and iterating an
-  `Intl.Segmenter`; see [KNOWN_BUGS.md](KNOWN_BUGS.md).
 
 ## Memory
 
@@ -93,21 +105,39 @@ ends. A send flood therefore cannot grow host memory past the cap.
 ### Memory that is not capped
 
 Resizable `ArrayBuffer`s, growable `SharedArrayBuffer`s and
-`WebAssembly.Memory` are not counted against `--memory`: V8 reserves and
-commits their pages straight from its page allocator, not through the
-ArrayBuffer allocator, and V8 12.9 has no flag to turn resizable buffers
-off (`--no-harmony-rab-gsab` does not exist). A `WebAssembly.Memory` is
-bounded only by V8's own limit of 65536 pages (4 GiB) per memory, with no
-limit per run. A guest can exceed `--memory` with
-`new ArrayBuffer(n, { maxByteLength })` followed by `resize`, or with
-`new WebAssembly.Memory({ initial })`. Against untrusted code, treat
-`--memory` as advisory and set an OS limit (for example `prlimit --as`, or
-a cgroup memory limit) around the process.
+`WebAssembly.Memory` do not go through the host's ArrayBuffer allocator,
+so the prelude wraps their constructors: reservations (declared
+`maximum`/`maxByteLength`, plus memory grown past the declared maximum)
+charge a shared ledger bounded by `--memory` and refuse past it with a
+catchable `RangeError`, with charges released when objects are
+collected. That covers the guest-created shapes —
+`new WebAssembly.Memory({ initial })`, `grow`, and
+`new ArrayBuffer(n, { maxByteLength })` followed by `resize`. One path
+remains outside it: a memory a WebAssembly *module* defines internally
+is created by the engine, not by the JS constructor, and growing it
+through the module's own exports cannot be intercepted from the
+prelude; that path is what `--rss-cap=<mb>` exists for (the watchdog
+samples the process RSS and stops the run as a heap-cap hit past it).
+Against untrusted code, still treat the in-process caps as one layer
+and set an OS limit (for example `prlimit --as`, or a cgroup memory
+limit) around the process as well.
 
 Host-side state is not counted against `--memory` either: the RAM
-filesystem (bounded by `--fs-quota`, unbounded with `--fs-quota=0`), the
-timer and listener tables, and the copies made for snapshots and dumps.
+filesystem (bounded by `--fs-quota`, unbounded with `--fs-quota=0`) and
+the copies made for snapshots and dumps. The timer table (8192 live
+timers) and the `vm.net` listener table (1024 listeners) have their own
+hard per-run bounds, because each entry holds a persistent V8 handle.
 (Queued `vm.net` bytes are counted; see ArrayBuffers above.)
+
+For hostile code, run one guest per process under an OS bound, for
+example:
+
+    prlimit --as=$((2 * 1024 * 1024 * 1024)) --cpu=60 \
+      timeout -s KILL 65 tardigrade --sandbox --memory=64 --rss-cap=512 guest.js
+
+or the equivalent cgroup `memory.max`/`cpu.max`. The in-process caps
+above cannot substitute for this: they do not cover WebAssembly memory,
+resizable buffers, or the abort shapes under [Process aborts](#process-aborts).
 
 ### Other limits
 

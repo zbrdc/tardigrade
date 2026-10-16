@@ -10,5 +10,5 @@ guest_cb!(vm_exit, |args, _rv, scope| {
         0
     };
     world_mut(scope).set_exit_code(code);
-    scope.terminate_execution();
+    scope.as_mut().terminate_execution();
 });

@@ -24,7 +24,9 @@ mod fs;
 mod fs_api;
 mod heap;
 mod host;
+mod module;
 mod net;
+pub mod netcap;
 mod serve;
 mod snapshot;
 mod stdin;
@@ -35,7 +37,60 @@ mod world;
 
 pub mod sandbox;
 
+/// Fuzz entry points (cargo-fuzz targets in `fuzz/`). These only drive
+/// the same parsers a guest or operator can reach — snapshot restore,
+/// RAM-filesystem paths — with attacker-shaped bytes; they exist so the
+/// fuzz crate can name them, and are not a supported API.
+#[doc(hidden)]
+pub mod fuzz_hooks {
+    /// Parse and restore a snapshot, then re-encode what landed: the
+    /// restore path a `--preload` file or `vm.restore` call takes.
+    pub fn snapshot_restore(data: &[u8]) {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        let mut fs = crate::fs::RamFs::new(crate::DEFAULT_FS_QUOTA_BYTES);
+        let _ = fs.restore(text);
+        let _ = crate::snapshot::encode(&fs.files, &fs.dirs);
+    }
+
+    /// Drive the RAM filesystem with NUL-separated path-shaped chunks:
+    /// normalization, quota accounting and the mutating operations must
+    /// only ever return values or errors, never panic.
+    pub fn fs_paths(data: &[u8]) {
+        let mut fs = crate::fs::RamFs::new(crate::DEFAULT_FS_QUOTA_BYTES);
+        let chunks: Vec<String> = data
+            .split(|b| *b == 0)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect();
+        for (i, path) in chunks.iter().enumerate() {
+            match i % 5 {
+                0 => {
+                    let _ = fs.write(path, vec![b'x'; i % 64]);
+                }
+                1 => {
+                    let _ = fs.mkdir(path, true);
+                }
+                2 => {
+                    let _ = fs.read_string(path);
+                    let _ = fs.stat(path);
+                }
+                3 => {
+                    if let Some(next) = chunks.get(i + 1) {
+                        let _ = fs.rename(path, next);
+                    }
+                }
+                _ => {
+                    let _ = fs.remove(path, true);
+                }
+            }
+        }
+        let _ = fs.list("/");
+    }
+}
+
 pub use fs::DEFAULT_FS_QUOTA_BYTES;
+pub use netcap::{NetConfig, NetLimits, NetPlan, NetSession};
 
 use std::io::Write;
 use std::sync::{mpsc, Arc};
@@ -84,6 +139,21 @@ pub struct Config {
     /// V8 heap cap in MB. Values below 8 are clamped up to 8 (V8 cannot
     /// sustain a smaller heap). Default 256.
     pub heap_mb: usize,
+    /// Cap on total guest console output (stdout plus stderr) in bytes;
+    /// past it, console calls throw a catchable RangeError and write
+    /// nothing. 0 disables. Default 64 MiB.
+    pub max_output_bytes: u64,
+    /// Parse the entry as an ES module (import/export, top-level await;
+    /// specifiers resolve in the RAM filesystem) instead of a classic
+    /// script. Default false. The CLI also enables it for `.mjs` entries.
+    pub module: bool,
+    /// Process RSS cap in MB (Linux only): the watchdog samples
+    /// /proc/self/status and stops the run as a heap-cap hit (exit 137)
+    /// past it. It bounds memory no in-process allocator can see —
+    /// module-internal WebAssembly memories — but counts the *whole
+    /// process*, so it fits one-guest-per-process use (the CLI), not
+    /// concurrent guests in one embedder. 0 disables. Default 0.
+    pub rss_cap_mb: usize,
     /// Arguments exposed to the guest as vm.args.
     pub args: Vec<String>,
     /// Seed vm.fs from a snapshot() JSON file before the guest runs.
@@ -117,6 +187,10 @@ pub struct Config {
     /// Virtual makes Date, performance.now and the timer timeline virtual
     /// so runs are reproducible and timer-heavy guests finish instantly.
     pub clock: Clock,
+    /// Scoped network capabilities (vm.net.request); None (the default)
+    /// keeps the guest fully offline. See netcap and
+    /// docs/NETWORK_CAPABILITIES.md.
+    pub net: Option<netcap::NetConfig>,
 }
 
 impl Default for Config {
@@ -124,6 +198,9 @@ impl Default for Config {
         Config {
             timeout_ms: 60000,
             heap_mb: 256,
+            max_output_bytes: 64 * 1024 * 1024,
+            module: false,
+            rss_cap_mb: 0,
             args: Vec::new(),
             preload: None,
             dump: None,
@@ -133,6 +210,7 @@ impl Default for Config {
             seed: None,
             command_timeout_ms: 0,
             clock: Clock::Real,
+            net: None,
         }
     }
 }
@@ -150,9 +228,14 @@ impl Config {
 /// across other uses of the scope the way the old process global could.
 macro_rules! guest_cb {
     ($name:ident, |$args:ident, $rv:ident, $scope:ident| $body:block) => {
-        pub(crate) extern "C" fn $name(info: *const v8::FunctionCallbackInfo) {
+        pub(crate) unsafe extern "C" fn $name(info: *const v8::FunctionCallbackInfo) {
             let info = unsafe { &*info };
-            let $scope = unsafe { &mut v8::CallbackScope::new(info) };
+            // Same bootstrap rusty_v8's own callback trampoline uses: the
+            // storage is pinned on the stack, init() hands back the pinned
+            // HandleScope every V8 API call now takes (v8::PinScope).
+            let storage = std::pin::pin!(unsafe { v8::CallbackScope::new(info) });
+            let mut $scope = storage.init();
+            let $scope = &mut $scope;
             // Once the run is leaving (vm.exit, timeout, heap cap), guest
             // callbacks return without side effects: the outcome is decided
             // and nothing after that may print, write, or schedule. V8 only
@@ -160,7 +243,7 @@ macro_rules! guest_cb {
             // callbacks also re-request it - otherwise the guest keeps
             // running JS on undefined results until it throws.
             if crate::world::world_mut($scope).is_leaving() {
-                $scope.terminate_execution();
+                $scope.as_mut().terminate_execution();
                 return;
             }
             let $args = v8::FunctionCallbackArguments::from_function_callback_info(info);
@@ -175,7 +258,7 @@ pub(crate) use guest_cb;
 const PRELUDE: &str = include_str!("prelude.js");
 
 pub(crate) fn eval_src<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     src: &str,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
@@ -209,10 +292,10 @@ struct RunSpec<'a> {
     cfg: &'a Config,
 }
 
-fn eval_prelude(scope: &mut v8::HandleScope) -> bool {
-    let mut tc = v8::TryCatch::new(scope);
-    if eval_src(&mut tc, PRELUDE, "prelude").is_none() {
-        report(&mut tc);
+fn eval_prelude(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    v8::tc_scope!(let tc, scope);
+    if eval_src(tc, PRELUDE, "prelude").is_none() {
+        report(tc);
         return false;
     }
     true
@@ -246,7 +329,7 @@ fn preload_text(cfg: &Config) -> Result<Option<(String, String)>, i32> {
 }
 
 /// Seeds vm.fs from a snapshot dump; Some(code) aborts the run.
-fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
+fn apply_preload(scope: &mut v8::PinScope<'_, '_>, cfg: &Config) -> Option<i32> {
     let (state, name) = match preload_text(cfg) {
         Ok(Some(found)) => found,
         Ok(None) => return None,
@@ -263,57 +346,65 @@ fn apply_preload(scope: &mut v8::HandleScope, cfg: &Config) -> Option<i32> {
     };
     let global = scope.get_current_context().global(scope);
     global.set(scope, key.into(), val.into());
-    let mut tc = v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     if eval_src(
-        &mut tc,
+        tc,
         "vm.restore(__PRELOAD__); globalThis.__PRELOAD__ = undefined;",
         "preload",
     )
     .is_none()
     {
-        report(&mut tc);
+        report(tc);
         return Some(2);
     }
     None
 }
 
-fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
+fn eval_entry(scope: &mut v8::PinScope<'_, '_>, spec: &RunSpec) -> i32 {
     if spec.source.is_empty() {
         return 0;
     }
-    let mut tc = v8::TryCatch::new(scope);
-    let result = eval_src(&mut tc, spec.source, spec.entry);
-    if tc.is_execution_terminating() {
-        tc.cancel_terminate_execution();
-        return world_mut(&mut tc).take_terminated_exit();
+    if spec.cfg.module {
+        return module::eval_entry_module(scope, spec.source, spec.entry);
     }
-    match result {
-        Some(_) => {
-            drop(tc);
-            // A vm.exit inside the script can be swallowed along with its
-            // termination; the guest's exit code still wins over the
-            // checkpoint decision (Node: process.exit beats a pending
-            // rejection).
-            let exit = world_mut(scope).exit_code();
-            if world_mut(scope).has_exit() {
-                return exit;
-            }
-            // End of the entry tick: V8 has drained the script's
-            // microtasks, so the checkpoint decision applies now, before
-            // any timer or network turn can rescue a rejection.
-            stopped(scope)
-                .or_else(|| event_loop::check_unhandled(scope))
-                .unwrap_or(0)
+    // The TryCatch borrows the scope, so it lives in its own block: the
+    // success path below reuses the outer scope once the block ends.
+    let exception_code = {
+        v8::tc_scope!(let tc, scope);
+        let result = eval_src(tc, spec.source, spec.entry);
+        if tc.as_mut().is_execution_terminating() {
+            tc.as_mut().cancel_terminate_execution();
+            return world_mut(tc).take_terminated_exit();
         }
-        None => {
-            let decides = world_mut(&mut tc).exception_decides();
-            let code = world_mut(&mut tc).exception_exit();
-            if decides {
-                report(&mut tc);
+        match result {
+            Some(_) => None,
+            None => {
+                let decides = world_mut(tc).exception_decides();
+                let code = world_mut(tc).exception_exit();
+                if decides {
+                    report(tc);
+                }
+                Some(code)
             }
-            code
         }
+    };
+    if let Some(code) = exception_code {
+        return code;
     }
+    // A vm.exit inside the script can be swallowed along with its
+    // termination; the guest's exit code still wins over the
+    // checkpoint decision (Node: process.exit beats a pending
+    // rejection).
+    let exit = world_mut(scope).exit_code();
+    if world_mut(scope).has_exit() {
+        return exit;
+    }
+    // End of the entry tick: V8 has drained the script's
+    // microtasks, so the checkpoint decision applies now, before
+    // any timer or network turn can rescue a rejection.
+    stopped(scope)
+        .or_else(|| event_loop::check_unhandled(scope))
+        .unwrap_or(0)
 }
 
 /// Writes the dump straight from the run's RamFs: serialization is pure
@@ -321,7 +412,7 @@ fn eval_entry(scope: &mut v8::HandleScope, spec: &RunSpec) -> i32 {
 /// could depend on how the run ended (normal exit, vm.exit, uncaught
 /// exception, timeout). False means the dump could not be produced
 /// (serialize failure or the file could not be written).
-fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
+fn write_dump(scope: &mut v8::PinScope<'_, '_>, dump: &std::path::Path) -> bool {
     let fs = &world_mut(scope).fs;
     let json = match snapshot::encode(&fs.files, &fs.dirs) {
         Ok(json) => json,
@@ -342,7 +433,7 @@ fn write_dump(scope: &mut v8::HandleScope, dump: &std::path::Path) -> bool {
 /// Shared body of run() and serve(): returns the guest exit code. Early
 /// returns are safe here; the caller owns teardown ordering.
 fn execute_inner(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     handle: &v8::IsolateHandle,
     spec: &RunSpec,
     replies: Option<&serve::ReplySink>,
@@ -355,18 +446,25 @@ fn execute_inner(
         return code;
     }
 
-    let watchdog = Watchdog::new(
+    let watchdog = match Watchdog::new(
         handle.clone(),
         spec.cfg.timeout_ms,
         world_mut(scope).term.clone(),
-    );
+        (spec.cfg.rss_cap_mb as u64).saturating_mul(1024 * 1024),
+    ) {
+        Ok(watchdog) => watchdog,
+        Err(_) => {
+            eprintln!("tardigrade: cannot start run watchdog");
+            return 70;
+        }
+    };
 
     let mut code = eval_entry(scope, spec);
-    if code == 0 {
+    // vm.exit(0) returns 0 from eval_entry, which is also "keep going": only
+    // enter the loop when the guest has not already decided to exit.
+    if code == 0 && !world_mut(scope).has_exit() {
         code = match replies {
-            Some(replies) => {
-                serve::serve_loop(scope, handle, replies, spec.cfg.command_timeout_ms)
-            }
+            Some(replies) => serve::serve_loop(scope, handle, replies, spec.cfg.command_timeout_ms),
             None => event_loop(scope),
         };
     }
@@ -413,7 +511,12 @@ impl Guest {
 
         let mut isolate = v8::Isolate::new(params);
         let handle = isolate.thread_safe_handle();
-        let mut guard = Box::new(heap::HeapGuard::new(handle.clone(), term.clone(), &plan));
+        let mut guard = Box::new(heap::HeapGuard::new(
+            handle.clone(),
+            term.clone(),
+            &plan,
+            world.ab_budget.clone(),
+        ));
         guard.register(&mut isolate);
         // The isolate owns the world through its embedder slot. On isolate
         // teardown the annex nulls its isolate pointer before the slots
@@ -422,30 +525,59 @@ impl Guest {
         // clearing needed.
         isolate.set_slot(world);
         isolate.set_promise_reject_callback(promise_reject_callback);
-        (Guest { isolate, _guard: guard }, handle)
+        isolate.set_host_import_module_dynamically_callback(module::import_dynamically);
+        (
+            Guest {
+                isolate,
+                _guard: guard,
+            },
+            handle,
+        )
     }
 }
 
 fn execute(source: &str, entry: &str, cfg: &Config, replies: Option<&serve::ReplySink>) -> i32 {
     let clock = match cfg.clock {
         Clock::Real => RunClock::Real(std::time::Instant::now()),
-        Clock::Virtual { epoch_ms } => RunClock::Virtual { epoch_ms, now_ms: 0 },
+        Clock::Virtual { epoch_ms } => RunClock::Virtual {
+            epoch_ms,
+            now_ms: 0,
+        },
     };
     let mut world = World::new(cfg.fs_quota_bytes, clock);
     // serve mode: stdin is the command channel, so guest stdin is at EOF.
     world.stdin_eof = cfg.stdin_consumed || replies.is_some();
+    world.serve_mode = replies.is_some();
+    world.output_cap = if cfg.max_output_bytes == 0 {
+        u64::MAX
+    } else {
+        cfg.max_output_bytes
+    };
     // Seeded runs keep the PRNG counter in the World, so concurrent runs
     // with different seeds stay independent.
     world.random_state = cfg.seed;
+    if let Some(net) = &cfg.net {
+        world.net_limits = crate::netcap::NetLimits {
+            max_response_bytes: net.max_response_bytes,
+            total_bytes: net.total_bytes,
+            timeout_ms: net.timeout_ms,
+            allow_private: net.allow_private,
+        };
+        world.net_names = net.names.clone();
+        world.net_max_response = net.max_response_bytes;
+        world.net_total_bytes = net.total_bytes;
+        world.net_fd = Some(net.wire_fd);
+        world.net_wire = crate::netcap::wire().ok();
+    }
     let term = world.term.clone();
 
     let spec = RunSpec { source, entry, cfg };
     let (mut guest, handle) = Guest::new(cfg, world);
     let code = {
-        let mut hs = v8::HandleScope::new(&mut guest.isolate);
-        let context = v8::Context::new(&mut hs, Default::default());
-        let mut scope = v8::ContextScope::new(&mut hs, context);
-        execute_inner(&mut scope, &handle, &spec, replies)
+        v8::scope!(let hs, &mut guest.isolate);
+        let context = v8::Context::new(hs, Default::default());
+        let scope = &mut v8::ContextScope::new(hs, context);
+        execute_inner(scope, &handle, &spec, replies)
     };
     // Normally Watchdog::drop already finished the run; the early returns
     // (prelude or preload failure) get here without one. Either way heap
@@ -499,4 +631,35 @@ pub fn serve<W: Write>(mut output: W, source: &str, entry: &str, cfg: &Config) -
         let _ = ack.send(());
     }
     finish(rx.recv().expect("tardigrade guest finished"))
+}
+
+#[cfg(test)]
+mod watchdog_failure_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn run_watchdog_spawn_failure_fails_before_entry_evaluation() {
+        let _lock = RUNTIME_TEST_LOCK.lock().unwrap();
+        watchdog::fail_next_run_spawn_for_test();
+        let cfg = Config::default();
+        assert_eq!(run("vm.exit(42);", "watchdog-failure.js", &cfg), 70);
+    }
+
+    #[test]
+    fn command_watchdog_spawn_failure_fails_before_command_evaluation() {
+        let _lock = RUNTIME_TEST_LOCK.lock().unwrap();
+        watchdog::fail_next_command_spawn_for_test();
+        stdin::push_front(b"vm.exit(42)\n".to_vec());
+        let cfg = Config {
+            command_timeout_ms: 1_000,
+            ..Config::default()
+        };
+
+        let mut output = Vec::new();
+        assert_eq!(serve(&mut output, "", "watchdog-failure.js", &cfg), 70);
+        assert!(output.is_empty(), "failed command must not get a reply");
+    }
 }

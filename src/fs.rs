@@ -607,7 +607,10 @@ impl RamFs {
             .filter(|k| k.starts_with(&prefix));
         for k in keys {
             if k.len() as i64 + growth > MAX_PATH_BYTES as i64 {
-                return Err(format!("path too long after rename (max {})", MAX_PATH_BYTES));
+                return Err(format!(
+                    "path too long after rename (max {})",
+                    MAX_PATH_BYTES
+                ));
             }
             count += 1;
         }
@@ -638,7 +641,8 @@ impl RamFs {
     /// full-quota filesystem always fits under the gate, while a hostile
     /// payload still cannot make the host allocate unboundedly.
     pub(crate) fn restore(&mut self, json: &str) -> FsResult<()> {
-        if self.quota != 0 && json.len() as u64 > self.quota.saturating_mul(6).saturating_add(1 << 20)
+        if self.quota != 0
+            && json.len() as u64 > self.quota.saturating_mul(6).saturating_add(1 << 20)
         {
             return Err(format!(
                 "snapshot too large for the quota ({} bytes)",
@@ -739,7 +743,9 @@ mod tests {
         assert_eq!(normalize("/../a").unwrap_err(), "path escapes root: /../a");
         assert_eq!(normalize("a/b").unwrap_err(), "path must be absolute: a/b");
         assert_eq!(normalize("///").unwrap(), "/");
-        assert!(normalize("/a/\0").unwrap_err().starts_with("path contains NUL"));
+        assert!(normalize("/a/\0")
+            .unwrap_err()
+            .starts_with("path contains NUL"));
         assert_eq!(normalize("/a/\u{fffd}").unwrap(), "/a/\u{fffd}");
     }
 
@@ -756,7 +762,10 @@ mod tests {
     fn write_rejects_directory_and_file_conflicts() {
         let mut f = fs();
         f.mkdir("/d", false).unwrap();
-        assert_eq!(f.write("/d", b"x".to_vec()).unwrap_err(), "is a directory: /d");
+        assert_eq!(
+            f.write("/d", b"x".to_vec()).unwrap_err(),
+            "is a directory: /d"
+        );
         f.write("/f", b"x".to_vec()).unwrap();
         assert_eq!(f.mkdir("/f", false).unwrap_err(), "already exists: /f");
         assert_eq!(f.mkdir("/f/x", false).unwrap_err(), "not a directory: /f");
@@ -801,10 +810,7 @@ mod tests {
             vec!["/d/a.txt".to_string(), "/d/e/b.txt".to_string()]
         );
         assert_eq!(f.list("/d/empty").unwrap(), Vec::<String>::new());
-        assert_eq!(
-            f.list("/d/a.txt").unwrap_err(),
-            "not a directory: /d/a.txt"
-        );
+        assert_eq!(f.list("/d/a.txt").unwrap_err(), "not a directory: /d/a.txt");
     }
 
     #[test]
@@ -891,7 +897,10 @@ mod tests {
             "cannot rename a directory into itself: /d/sub"
         );
         f.write("/deep/x", b"1".to_vec()).unwrap();
-        assert_eq!(f.rename("/deep", "/nope/x").unwrap_err(), "no such file: /nope");
+        assert_eq!(
+            f.rename("/deep", "/nope/x").unwrap_err(),
+            "no such file: /nope"
+        );
         // onto a non-empty directory
         f.mkdir("/full", false).unwrap();
         f.write("/full/kid", b"k".to_vec()).unwrap();
@@ -912,9 +921,12 @@ mod tests {
         f.write(&deep, b"1".to_vec()).unwrap();
         // Renaming /a to /cccccc would push the child past the cap.
         let err = f.rename("/a", "/cccccc").unwrap_err();
-        assert_eq!(err, format!("path too long after rename (max {})", MAX_PATH_BYTES));
+        assert_eq!(
+            err,
+            format!("path too long after rename (max {})", MAX_PATH_BYTES)
+        );
         assert!(f.exists(&deep)); // nothing moved
-        // A same-length destination re-keys within the cap.
+                                  // A same-length destination re-keys within the cap.
         f.rename("/a", "/z").unwrap();
         let moved = format!("/z/{}/x", "b".repeat(MAX_PATH_BYTES - 5));
         assert!(f.exists(&moved));
@@ -934,7 +946,10 @@ mod tests {
         f.write("/empty", Vec::new()).unwrap();
         assert_eq!(f.read_string("/empty").unwrap(), "");
         assert_eq!(f.stat("/empty").unwrap().size, 0);
-        assert_eq!(f.read_bytes("/missing").unwrap_err(), "no such file: /missing");
+        assert_eq!(
+            f.read_bytes("/missing").unwrap_err(),
+            "no such file: /missing"
+        );
     }
 
     #[test]
@@ -951,7 +966,10 @@ mod tests {
         // "/f" is 2 bytes of key: 64 overhead + 2 key + 10 content = 76.
         let mut f = RamFs::new(76);
         f.write("/f", vec![0u8; 10]).unwrap(); // fills the quota exactly
-        assert_eq!(f.write("/f", vec![0u8; 11]).unwrap_err(), "fs quota exceeded");
+        assert_eq!(
+            f.write("/f", vec![0u8; 11]).unwrap_err(),
+            "fs quota exceeded"
+        );
         assert_eq!(f.read_bytes("/f").unwrap().len(), 10); // unchanged after failure
         assert_eq!(f.write("/g", vec![0]).unwrap_err(), "fs quota exceeded");
         assert!(!f.exists("/g"));
@@ -974,7 +992,10 @@ mod tests {
         // these; charging keys must cut that to a few dozen.
         let mut roomy = RamFs::new(100_000);
         let mut wrote = 0u64;
-        while roomy.write(&format!("{}{}", base, wrote), Vec::new()).is_ok() {
+        while roomy
+            .write(&format!("{}{}", base, wrote), Vec::new())
+            .is_ok()
+        {
             wrote += 1;
         }
         assert!(
@@ -1015,22 +1036,20 @@ mod tests {
     fn path_and_entry_caps_have_clear_errors() {
         let mut f = fs();
         let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
-        assert!(
-            f.write(&long, Vec::new())
-                .unwrap_err()
-                .starts_with("path too long")
-        );
+        assert!(f
+            .write(&long, Vec::new())
+            .unwrap_err()
+            .starts_with("path too long"));
         let exact = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
         f.write(&exact, Vec::new()).unwrap(); // at the cap is fine
         let mut full = fs();
         for i in 0..MAX_ENTRIES {
             full.mkdir(&format!("/d{}", i), false).unwrap();
         }
-        assert!(
-            full.mkdir("/over", false)
-                .unwrap_err()
-                .contains("fs entry limit exceeded")
-        );
+        assert!(full
+            .mkdir("/over", false)
+            .unwrap_err()
+            .contains("fs entry limit exceeded"));
     }
 
     #[test]
@@ -1071,11 +1090,18 @@ mod tests {
             "A".repeat(6 * 1024 + (1 << 20) + 8)
         );
         let err = f.restore(&big).unwrap_err();
-        assert!(err.starts_with("snapshot too large for the quota"), "{}", err);
+        assert!(
+            err.starts_with("snapshot too large for the quota"),
+            "{}",
+            err
+        );
         assert!(f.list("/").unwrap().is_empty());
         // just under the wire parses, then fails on the content quota
         let edge = "A".repeat(6 * 1024 + (1 << 20) - 128);
-        let snap = format!("{{\"version\":2,\"files\":{{\"/x\":{{\"b64\":\"{}\"}}}}}}", edge);
+        let snap = format!(
+            "{{\"version\":2,\"files\":{{\"/x\":{{\"b64\":\"{}\"}}}}}}",
+            edge
+        );
         assert_eq!(f.restore(&snap).unwrap_err(), "fs quota exceeded");
     }
 
@@ -1101,7 +1127,10 @@ mod tests {
         f.write("/a", vec![0u8; 900]).unwrap();
         // Two spellings of one path must not double-charge or shrink /a.
         let dup = r#"{"version":2,"files":{"/a":{"text":"y"},"//a":{"text":"z"}}}"#;
-        assert_eq!(f.restore(dup).unwrap_err(), "duplicate path in snapshot: /a");
+        assert_eq!(
+            f.restore(dup).unwrap_err(),
+            "duplicate path in snapshot: /a"
+        );
         assert_eq!(f.read_bytes("/a").unwrap().len(), 900); // unchanged
         assert_eq!(f.used, usage(&f.files, &f.dirs));
         // legacy duplicates collide after relative prefixing, too
@@ -1140,7 +1169,8 @@ mod tests {
         // --fs-quota accepts values whose byte counts do not fit i64;
         // casting the quota would wrap negative and reject everything.
         let mut f = RamFs::new(1 << 63);
-        f.restore(r#"{"version":2,"files":{"/a":{"text":"x"}}}"#).unwrap();
+        f.restore(r#"{"version":2,"files":{"/a":{"text":"x"}}}"#)
+            .unwrap();
         assert_eq!(f.read_string("/a").unwrap(), "x");
         f.write("/b", b"y".to_vec()).unwrap();
         assert_eq!(f.read_string("/b").unwrap(), "y");

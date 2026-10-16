@@ -57,10 +57,17 @@ impl std::fmt::Display for SandboxError {
         match self {
             SandboxError::Unsupported => write!(f, "--sandbox is only supported on Linux x86_64"),
             SandboxError::EngineStarted => {
-                write!(f, "V8 is already initialized; apply the sandbox before the first run()/serve()")
+                write!(
+                    f,
+                    "V8 is already initialized; apply the sandbox before the first run()/serve()"
+                )
             }
             SandboxError::ThreadsActive(n) => {
-                write!(f, "{} threads already exist; apply the sandbox before any thread", n)
+                write!(
+                    f,
+                    "{} threads already exist; apply the sandbox before any thread",
+                    n
+                )
             }
             SandboxError::Dump(path, e) => write!(f, "cannot prepare dump {:?}: {}", path, e),
             SandboxError::DumpNotRegular(path) => {
@@ -93,8 +100,25 @@ pub fn supported() -> bool {
 /// This also closes every file descriptor >= 3 in the whole process
 /// (`close_range`): descriptors inherited from the caller's environment
 /// (a socket, a log file) would be a channel out of the sandbox.
-pub fn apply(dump: Option<&Path>) -> Result<(), SandboxError> {
-    imp::apply(dump)
+///
+/// One exception: keep_fd, when set, is preserved - it is the network
+/// sidecars wire, opened by this process before apply (see netcap), not
+/// inherited from the callers environment.
+pub fn apply(dump: Option<&Path>, keep_fd: Option<std::os::fd::RawFd>) -> Result<(), SandboxError> {
+    imp::apply(dump, keep_fd)
+}
+
+/// The net-sidecar's own, weaker profile: it must resolve DNS and open
+/// TCP connections, so unlike the guest profile it allows socket calls,
+/// but it still gets `NO_NEW_PRIVS`, a Landlock filesystem view limited
+/// to the resolver configuration and system libraries, and the guest's
+/// seccomp deny list minus the network syscalls (no exec, no ptrace, no
+/// namespaces, self-only signals). Call once at sidecar startup, before
+/// any other thread exists. On platforms without the layers this
+/// returns [SandboxError::Unsupported] and the caller decides whether
+/// running unprofiled is acceptable.
+pub fn apply_sidecar_profile() -> Result<(), SandboxError> {
+    imp::apply_sidecar()
 }
 
 /// Which kernel layer [`apply_layer`] installs.
@@ -116,8 +140,12 @@ pub enum Layer {
 /// Apply a single sandbox layer. Test-only; see [`Layer`].
 #[cfg(feature = "test-layers")]
 #[doc(hidden)]
-pub fn apply_layer(layer: Layer, dump: Option<&Path>) -> Result<(), SandboxError> {
-    imp::apply_layer(layer, dump)
+pub fn apply_layer(
+    layer: Layer,
+    dump: Option<&Path>,
+    keep_fd: Option<std::os::fd::RawFd>,
+) -> Result<(), SandboxError> {
+    imp::apply_layer(layer, dump, keep_fd)
 }
 
 /// Test-only (`test-layers`): the errno the enumeration's deny filter
@@ -150,7 +178,10 @@ mod imp {
     use super::SandboxError;
     use std::path::Path;
 
-    pub fn apply(_dump: Option<&Path>) -> Result<(), SandboxError> {
+    pub fn apply(
+        _dump: Option<&Path>,
+        _keep_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::Unsupported)
     }
 
@@ -158,8 +189,16 @@ mod imp {
         false
     }
 
+    pub fn apply_sidecar() -> Result<(), SandboxError> {
+        Err(SandboxError::Unsupported)
+    }
+
     #[cfg(feature = "test-layers")]
-    pub fn apply_layer(_layer: super::Layer, _dump: Option<&Path>) -> Result<(), SandboxError> {
+    pub fn apply_layer(
+        _layer: super::Layer,
+        _dump: Option<&Path>,
+        keep_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<(), SandboxError> {
         Err(SandboxError::Unsupported)
     }
 
@@ -169,9 +208,12 @@ mod imp {
 
         #[test]
         fn apply_refuses_with_the_platform_message() {
-            let err = apply(None).expect_err("no layer is available here");
+            let err = apply(None, None).expect_err("no layer is available here");
             assert!(matches!(err, SandboxError::Unsupported));
-            assert_eq!(err.to_string(), "--sandbox is only supported on Linux x86_64");
+            assert_eq!(
+                err.to_string(),
+                "--sandbox is only supported on Linux x86_64"
+            );
         }
     }
 }
@@ -213,20 +255,129 @@ mod imp {
 
     /// Both layers, filesystem first and seccomp last: seccomp is the most
     /// irreversible, and its deny list refuses the seccomp syscall itself.
-    pub fn apply(dump: Option<&Path>) -> Result<(), SandboxError> {
-        let anchor = prepare(dump)?;
+    pub fn apply(
+        dump: Option<&Path>,
+        keep_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<(), SandboxError> {
+        let anchor = prepare(dump, keep_fd)?;
         landlock_restrict(anchor.as_ref())?;
         seccomp_restrict()
     }
 
     /// One layer alone, sharing every precondition with [`apply`].
     #[cfg(feature = "test-layers")]
-    pub fn apply_layer(layer: super::Layer, dump: Option<&Path>) -> Result<(), SandboxError> {
-        let anchor = prepare(dump)?;
+    pub fn apply_layer(
+        layer: super::Layer,
+        dump: Option<&Path>,
+        keep_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<(), SandboxError> {
+        let anchor = prepare(dump, keep_fd)?;
         match layer {
             super::Layer::Landlock => landlock_restrict(anchor.as_ref()),
             super::Layer::Seccomp => seccomp_restrict(),
         }
+    }
+
+    /// The sidecar profile: no_new_privs, a resolver-only Landlock view,
+    /// and the guest deny list with the network syscalls removed.
+    pub fn apply_sidecar() -> Result<(), SandboxError> {
+        if crate::host::engine_started() {
+            return Err(SandboxError::EngineStarted);
+        }
+        let threads = thread_count()?;
+        if threads != 1 {
+            return Err(SandboxError::ThreadsActive(threads));
+        }
+        set_no_new_privs()?;
+        landlock_sidecar()?;
+        seccomp_sidecar()
+    }
+
+    fn landlock_sidecar() -> Result<(), SandboxError> {
+        use landlock::{
+            Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
+        };
+        let mut ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(ABI::V5))
+            .map_err(land)?
+            .create()
+            .map_err(land)?;
+        // What a resolver legitimately opens: its configuration, the
+        // loader cache, the NSS modules it may still need to dlopen, and
+        // randomness. Read/execute only; nothing is writable.
+        const READ_FILES: &[&str] = &[
+            "/dev/urandom",
+            "/etc/ld.so.cache",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/host.conf",
+            "/etc/nsswitch.conf",
+            "/etc/gai.conf",
+            "/etc/services",
+        ];
+        for path in READ_FILES {
+            if let Ok(fd) = PathFd::new(path) {
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(fd, AccessFs::ReadFile))
+                    .map_err(land)?;
+            }
+        }
+        const LIB_DIRS: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib",
+            "/lib",
+        ];
+        for dir in LIB_DIRS {
+            if let Ok(fd) = PathFd::new(dir) {
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(
+                        fd,
+                        landlock::make_bitflags!(AccessFs::{ReadFile | Execute | ReadDir}),
+                    ))
+                    .map_err(land)?;
+            }
+        }
+        let status = ruleset.restrict_self().map_err(land)?;
+        match status.ruleset {
+            landlock::RulesetStatus::FullyEnforced => Ok(()),
+            _ => Err(land("sidecar ruleset not fully enforced")),
+        }
+    }
+
+    /// Network syscalls the sidecar keeps (DNS + TCP); every other guest
+    /// denial, including the argument-filtered clone/signal rules, stays.
+    const SIDECAR_NETWORK: &[libc::c_long] = &[
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvmmsg,
+        libc::SYS_shutdown,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockopt,
+    ];
+
+    fn seccomp_sidecar() -> Result<(), SandboxError> {
+        let nosys = compile(single(libc::SYS_clone3), libc::ENOSYS)?;
+        apply_filter_all_threads(&nosys).map_err(comp)?;
+        install_x32_guard()?;
+        let mut rules = filter_rules();
+        for nr in SIDECAR_NETWORK {
+            rules.remove(nr);
+        }
+        let deny = compile(rules, libc::EPERM)?;
+        apply_filter_all_threads(&deny).map_err(comp)
     }
 
     /// The deny list as numbers, for the test-only enumeration.
@@ -240,14 +391,17 @@ mod imp {
     /// can colour the result.
     #[cfg(feature = "test-layers")]
     pub fn apply_probe(deny_errno: libc::c_int) -> Result<(), SandboxError> {
-        prepare(None)?;
+        prepare(None, None)?;
         seccomp_restrict_with(deny_errno)
     }
 
     /// Everything that must hold before any restriction is installed:
     /// refuse late application, then ready the descriptors. Returns the dump
     /// anchor for the Landlock rule.
-    fn prepare(dump: Option<&Path>) -> Result<Option<landlock::PathFd>, SandboxError> {
+    fn prepare(
+        dump: Option<&Path>,
+        keep_fd: Option<std::os::fd::RawFd>,
+    ) -> Result<Option<landlock::PathFd>, SandboxError> {
         if crate::host::engine_started() {
             return Err(SandboxError::EngineStarted);
         }
@@ -257,7 +411,7 @@ mod imp {
         }
         // Close inherited descriptors before opening the dump anchor, or
         // close_range would close it again.
-        close_inherited_fds()?;
+        close_inherited_fds(keep_fd)?;
         let dump_file = prepare_dump(dump)?;
         set_no_new_privs()?;
         Ok(dump_file)
@@ -312,10 +466,29 @@ mod imp {
 
     /// Anything the caller's environment passed in (a socket, a log file) is
     /// a channel out of the sandbox; the run needs only stdio.
-    fn close_inherited_fds() -> Result<(), SandboxError> {
-        let rc = unsafe { libc::close_range(3, u32::MAX, 0) };
+    fn close_inherited_fds(keep_fd: Option<std::os::fd::RawFd>) -> Result<(), SandboxError> {
+        // The one survivor, when set, is the network sidecars wire fd: it is
+        // opened by this parent before apply (not inherited from the callers
+        // environment), so it is not a channel out of the sandbox.
+        let keep = keep_fd.map(|fd| fd.max(3) as u32);
+        match keep {
+            None => close_range(3, u32::MAX)?,
+            Some(first) if first > 3 => {
+                close_range(3, first - 1)?;
+                close_range(first + 1, u32::MAX)?;
+            }
+            Some(_) => close_range(4, u32::MAX)?,
+        }
+        Ok(())
+    }
+
+    fn close_range(from: u32, to: u32) -> Result<(), SandboxError> {
+        let rc = unsafe { libc::close_range(from, to, 0) };
         if rc != 0 {
-            return Err(kernel(format!("close_range: {}", std::io::Error::last_os_error())));
+            return Err(kernel(format!(
+                "close_range: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         Ok(())
     }
@@ -379,7 +552,9 @@ mod imp {
             .map_err(land)?;
         if let Some(anchor) = dump {
             let access = make_bitflags!(AccessFs::{WriteFile | Truncate});
-            ruleset = ruleset.add_rule(PathBeneath::new(anchor, access)).map_err(land)?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(anchor, access))
+                .map_err(land)?;
         }
         let status = ruleset.restrict_self().map_err(land)?;
         // Before enforce_status: a partly enforced ruleset still restricts
@@ -438,7 +613,9 @@ mod imp {
             SeccompAction::Errno(errno as u32),
             // The module is x86_64-only; the arch token type is not exported
             // from the crate root, so it is inferred here.
-            std::env::consts::ARCH.try_into().map_err(|_| comp("unsupported architecture"))?,
+            std::env::consts::ARCH
+                .try_into()
+                .map_err(|_| comp("unsupported architecture"))?,
         )
         .map_err(comp)?
         .try_into()
@@ -482,8 +659,14 @@ mod imp {
         ] {
             rules.insert(nr, vec![foreign(0, pid)]);
         }
-        rules.insert(libc::SYS_setpriority, priority_rules(libc::PRIO_PROCESS as u64, pid));
-        rules.insert(libc::SYS_ioprio_set, priority_rules(IOPRIO_WHO_PROCESS, pid));
+        rules.insert(
+            libc::SYS_setpriority,
+            priority_rules(libc::PRIO_PROCESS as u64, pid),
+        );
+        rules.insert(
+            libc::SYS_ioprio_set,
+            priority_rules(IOPRIO_WHO_PROCESS, pid),
+        );
         rules
     }
 
@@ -501,7 +684,10 @@ mod imp {
     /// process-scoped `which` value, and only for the caller (0) or this
     /// process; a user- or group-wide target is denied.
     fn priority_rules(which_process: u64, pid: u64) -> Vec<SeccompRule> {
-        vec![condition(0, SeccompCmpOp::Ne, which_process), foreign(1, pid)]
+        vec![
+            condition(0, SeccompCmpOp::Ne, which_process),
+            foreign(1, pid),
+        ]
     }
 
     /// fcntl: aiming async-signal delivery at another process (F_SETOWN,
@@ -528,7 +714,12 @@ mod imp {
 
     /// Matches when `(flags & mask) == value` on clone's first argument.
     fn masked(mask: u64, value: u64) -> SeccompRule {
-        rule(0, SeccompCmpArgLen::Qword, SeccompCmpOp::MaskedEq(mask), value)
+        rule(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(mask),
+            value,
+        )
     }
 
     /// ioctl is denied only for the terminal input injection requests and
@@ -549,8 +740,10 @@ mod imp {
 
     fn rule(arg: u8, len: SeccompCmpArgLen, op: SeccompCmpOp, value: u64) -> SeccompRule {
         // Constructors only reject an argument index above 5.
-        SeccompRule::new(vec![SeccompCondition::new(arg, len, op, value).expect("valid condition")])
-            .expect("valid rule")
+        SeccompRule::new(vec![
+            SeccompCondition::new(arg, len, op, value).expect("valid condition")
+        ])
+        .expect("valid rule")
     }
 
     /// Namespace-creating clone flags (see clone(2)); each gets its own rule.
@@ -594,14 +787,54 @@ mod imp {
         // relative to the following instruction; [6] returns ENOSYS and [7]
         // is the KILL return.
         vec![
-            libc::sock_filter { code: LD_W, jt: 0, jf: 0, k: 4 },
-            libc::sock_filter { code: JEQ, jt: 0, jf: 5, k: AUDIT_ARCH_X86_64 },
-            libc::sock_filter { code: LD_W, jt: 0, jf: 0, k: 0 },
-            libc::sock_filter { code: JGE, jt: 3, jf: 0, k: X32_BIT },
-            libc::sock_filter { code: JGE, jt: 1, jf: 0, k: NEW_SYSCALL_FLOOR },
-            libc::sock_filter { code: RET, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
-            libc::sock_filter { code: RET, jt: 0, jf: 0, k: NOSYS },
-            libc::sock_filter { code: RET, jt: 0, jf: 0, k: libc::SECCOMP_RET_KILL_PROCESS },
+            libc::sock_filter {
+                code: LD_W,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            libc::sock_filter {
+                code: JEQ,
+                jt: 0,
+                jf: 5,
+                k: AUDIT_ARCH_X86_64,
+            },
+            libc::sock_filter {
+                code: LD_W,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: JGE,
+                jt: 3,
+                jf: 0,
+                k: X32_BIT,
+            },
+            libc::sock_filter {
+                code: JGE,
+                jt: 1,
+                jf: 0,
+                k: NEW_SYSCALL_FLOOR,
+            },
+            libc::sock_filter {
+                code: RET,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+            libc::sock_filter {
+                code: RET,
+                jt: 0,
+                jf: 0,
+                k: NOSYS,
+            },
+            libc::sock_filter {
+                code: RET,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_KILL_PROCESS,
+            },
         ]
     }
 
@@ -620,7 +853,10 @@ mod imp {
             )
         };
         if rc != 0 {
-            return Err(comp(format!("x32 guard: {}", std::io::Error::last_os_error())));
+            return Err(comp(format!(
+                "x32 guard: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         Ok(())
     }
@@ -804,11 +1040,17 @@ mod imp {
             let nosys = p.len() - 2;
             assert_eq!(p.len(), 8);
             // loads arch (seccomp_data offset 4), kills when it differs
-            assert_eq!((p[0].code, p[0].k), ((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4));
+            assert_eq!(
+                (p[0].code, p[0].k),
+                ((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4)
+            );
             assert_eq!((p[1].jf, p[1].k), (5, AUDIT_ARCH_X86_64));
             assert_eq!(2 + p[1].jf as usize, kill);
             // loads nr (offset 0): the x32 range kills, newer numbers ENOSYS
-            assert_eq!((p[2].code, p[2].k), ((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0));
+            assert_eq!(
+                (p[2].code, p[2].k),
+                ((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0)
+            );
             assert_eq!((p[3].jt, p[3].k), (3, X32_BIT));
             assert_eq!(4 + p[3].jt as usize, kill);
             assert_eq!((p[4].jt, p[4].k), (1, NEW_SYSCALL_FLOOR));

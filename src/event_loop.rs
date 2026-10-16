@@ -4,9 +4,10 @@
 use std::time::Duration;
 
 use crate::diag::{rejection_text, report};
+use crate::netcap;
 use crate::stdin;
 use crate::world::{world_mut, NetMsg, World};
-use v8::HandleScope;
+use v8::PinScope;
 
 enum Outcome {
     Ok,
@@ -29,35 +30,37 @@ fn stop_code(world: &mut World, oc: Outcome) -> Option<i32> {
 /// because V8's own flag can be swallowed inside microtask checkpoints and
 /// GC callbacks, and may not be delivered at all while the loop is parked
 /// outside V8. Cancels V8's flag and consumes the run's conclusion.
-pub(crate) fn stopped(scope: &mut HandleScope) -> Option<i32> {
+pub(crate) fn stopped(scope: &mut PinScope<'_, '_>) -> Option<i32> {
     let pending = world_mut(scope).term.reason().is_some();
-    if !pending && !scope.is_execution_terminating() {
+    if !pending && !scope.as_mut().is_execution_terminating() {
         return None;
     }
-    if scope.is_execution_terminating() {
-        scope.cancel_terminate_execution();
+    if scope.as_mut().is_execution_terminating() {
+        scope.as_mut().cancel_terminate_execution();
     }
     Some(world_mut(scope).take_terminated_exit())
 }
 
-fn call_fn(scope: &mut HandleScope, g: &v8::Global<v8::Function>) -> Outcome {
-    let mut tc = v8::TryCatch::new(scope);
-    let this = v8::undefined(&mut tc).into();
-    let result = g.open(&mut tc).call(&mut tc, this, &[]);
+fn call_fn(scope: &mut PinScope<'_, '_>, g: &v8::Global<v8::Function>) -> Outcome {
+    v8::tc_scope!(let tc, scope);
+    let this = v8::undefined(tc).into();
+    // SAFETY: the global was rooted in this run's isolate; opening it in
+    // the current scope is the documented use of the unsafe Global::open.
+    let result = unsafe { g.open(tc) }.call(tc, this, &[]);
     if result.is_some() {
         return Outcome::Ok;
     }
-    if tc.is_execution_terminating() {
-        tc.cancel_terminate_execution();
+    if tc.as_mut().is_execution_terminating() {
+        tc.as_mut().cancel_terminate_execution();
         return Outcome::Terminated;
     }
-    if world_mut(&mut tc).exception_decides() {
-        report(&mut tc);
+    if world_mut(tc).exception_decides() {
+        report(tc);
     }
     Outcome::Exception
 }
 
-fn run_net(scope: &mut HandleScope) -> Option<i32> {
+fn run_net(scope: &mut PinScope<'_, '_>) -> Option<i32> {
     if world_mut(scope).net.is_empty() {
         return None;
     }
@@ -76,22 +79,24 @@ fn run_net(scope: &mut HandleScope) -> Option<i32> {
             v8::String::new_from_utf8(scope, m.payload.as_bytes(), v8::NewStringType::Normal)
                 .unwrap();
         let from = v8::Number::new(scope, m.from as f64);
-        let mut tc = v8::TryCatch::new(scope);
-        let this = v8::undefined(&mut tc).into();
-        let argv = [payload.into(), from.into()];
-        let result = listener.open(&mut tc).call(&mut tc, this, &argv);
-        let oc = if result.is_some() {
-            Outcome::Ok
-        } else if tc.is_execution_terminating() {
-            tc.cancel_terminate_execution();
-            Outcome::Terminated
-        } else {
-            if world_mut(&mut tc).exception_decides() {
-                report(&mut tc);
+        let oc = {
+            v8::tc_scope!(let tc, scope);
+            let this = v8::undefined(tc).into();
+            let argv = [payload.into(), from.into()];
+            // SAFETY: the listener global belongs to this isolate.
+            let result = unsafe { listener.open(tc) }.call(tc, this, &argv);
+            if result.is_some() {
+                Outcome::Ok
+            } else if tc.as_mut().is_execution_terminating() {
+                tc.as_mut().cancel_terminate_execution();
+                Outcome::Terminated
+            } else {
+                if world_mut(tc).exception_decides() {
+                    report(tc);
+                }
+                Outcome::Exception
             }
-            Outcome::Exception
         };
-        drop(tc);
         // V8 drains microtasks after each callback; the checkpoint decision
         // is made right here (Node timing), not once per loop turn.
         if let Some(code) = stopped(scope) {
@@ -107,7 +112,7 @@ fn run_net(scope: &mut HandleScope) -> Option<i32> {
     None
 }
 
-fn run_timers(scope: &mut HandleScope) -> Option<i32> {
+fn run_timers(scope: &mut PinScope<'_, '_>) -> Option<i32> {
     loop {
         let now = world_mut(scope).clock.now();
         let idx = {
@@ -151,7 +156,7 @@ fn run_timers(scope: &mut HandleScope) -> Option<i32> {
     }
 }
 
-fn drain_microtasks(scope: &mut HandleScope) -> Option<i32> {
+fn drain_microtasks(scope: &mut PinScope<'_, '_>) -> Option<i32> {
     scope.perform_microtask_checkpoint();
     stopped(scope).or_else(|| check_unhandled(scope))
 }
@@ -170,7 +175,8 @@ pub(crate) fn forget_rejection_of(scope: &mut v8::Isolate, promise: &v8::Promise
         Some(b) => b,
         None => return,
     };
-    bucket.retain(|e| e.promise.open(scope) != promise);
+    // SAFETY: the remembered globals belong to this isolate.
+    bucket.retain(|e| unsafe { e.promise.open(scope) } != promise);
     let world = world_mut(scope);
     if !bucket.is_empty() {
         world.pending_rejections.insert(hash, bucket);
@@ -179,7 +185,7 @@ pub(crate) fn forget_rejection_of(scope: &mut v8::Isolate, promise: &v8::Promise
 
 /// Removes the remembered rejection for `msg`'s promise, if any: a handler
 /// attached before the next checkpoint un-fails the run.
-fn forget_rejection(scope: &mut v8::CallbackScope, msg: &v8::PromiseRejectMessage) {
+fn forget_rejection(scope: &mut v8::PinScope<'_, '_>, msg: &v8::PromiseRejectMessage) {
     forget_rejection_of(scope, &msg.get_promise());
 }
 
@@ -187,7 +193,9 @@ pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) 
     use v8::PromiseRejectEvent::*;
     // The callback runs inside V8's own scope; opening a second HandleScope
     // on the isolate would panic ("active scope can't be dropped") and abort.
-    let scope = &mut unsafe { v8::CallbackScope::new(&msg) };
+    let storage = std::pin::pin!(unsafe { v8::CallbackScope::new(&msg) });
+    let mut scope = storage.init();
+    let scope = &mut scope;
     match msg.get_event() {
         PromiseRejectWithNoHandler => {
             let promise = v8::Global::new(scope, msg.get_promise());
@@ -196,11 +204,13 @@ pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) 
             let world = world_mut(scope);
             let seq = world.next_rejection_seq;
             world.next_rejection_seq += 1;
-            world
-                .pending_rejections
-                .entry(hash)
-                .or_default()
-                .push(crate::world::PendingRejection { seq, promise, value });
+            world.pending_rejections.entry(hash).or_default().push(
+                crate::world::PendingRejection {
+                    seq,
+                    promise,
+                    value,
+                },
+            );
         }
         PromiseHandlerAddedAfterReject => forget_rejection(scope, &msg),
         _ => {}
@@ -210,7 +220,7 @@ pub(crate) extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) 
 /// After a microtask checkpoint: the first (lowest seq) rejection still
 /// missing a handler fails the run with 1. A guest exit code (vm.exit)
 /// outranks the decision, matching Node's process.exit.
-pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
+pub(crate) fn check_unhandled(scope: &mut PinScope<'_, '_>) -> Option<i32> {
     if world_mut(scope).has_exit() {
         return None;
     }
@@ -233,7 +243,8 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
     };
     let text = match &first.value {
         Some(v) => {
-            let val = v.open(scope);
+            // SAFETY: the rejection value global belongs to this isolate.
+            let val = unsafe { v.open(scope) };
             rejection_text(scope, val)
         }
         None => "unknown".to_string(),
@@ -242,7 +253,7 @@ pub(crate) fn check_unhandled(scope: &mut HandleScope) -> Option<i32> {
     Some(1)
 }
 
-pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
+pub(crate) fn event_loop(scope: &mut PinScope<'_, '_>) -> i32 {
     event_loop_until(scope, &mut |_| false)
 }
 
@@ -252,10 +263,16 @@ pub(crate) fn event_loop(scope: &mut HandleScope) -> i32 {
 /// pending job. Leftover work stays scheduled for the next caller,
 /// exactly as an idle return would leave it.
 pub(crate) fn event_loop_until(
-    scope: &mut HandleScope,
-    done: &mut dyn FnMut(&mut HandleScope) -> bool,
+    scope: &mut PinScope<'_, '_>,
+    done: &mut dyn FnMut(&mut PinScope<'_, '_>) -> bool,
 ) -> i32 {
     loop {
+        // Snapshot the wake generation before the turn: work signalled
+        // from another thread (stdin chunk, network completion) while
+        // this turn runs then makes the park below return at once
+        // instead of sleeping through its timeout.
+        let wake = world_mut(scope).loop_wake.clone();
+        let seen = wake.generation();
         // The turn first, and the park only when the loop continues: a
         // tuple match would evaluate park_between_turns even for a
         // finished loop, and under --clock=virtual that jumps the clock
@@ -268,7 +285,7 @@ pub(crate) fn event_loop_until(
         match park_between_turns(scope) {
             Park::Done => break,
             Park::Spin => continue,
-            Park::Sleep(wait) => std::thread::sleep(wait),
+            Park::Sleep(wait) => wake.wait(seen, wait),
         }
     }
     sweep(scope)
@@ -277,7 +294,10 @@ pub(crate) fn event_loop_until(
 /// One loop turn: due network messages, due timers, microtasks, stdin.
 /// Some(code) ends the loop (a stop condition met, an exit decided);
 /// None means the turn ran and the caller decides whether to park.
-fn turn(scope: &mut HandleScope, done: &mut dyn FnMut(&mut HandleScope) -> bool) -> Option<i32> {
+fn turn(
+    scope: &mut PinScope<'_, '_>,
+    done: &mut dyn FnMut(&mut PinScope<'_, '_>) -> bool,
+) -> Option<i32> {
     if done(scope) {
         return Some(0);
     }
@@ -303,6 +323,13 @@ fn turn(scope: &mut HandleScope, done: &mut dyn FnMut(&mut HandleScope) -> bool)
             return Some(c);
         }
     }
+    if netcap::poll_net(scope) {
+        // A settled request runs the same continuations-and-checkpoints
+        // dance as a stdin delivery.
+        if let Some(c) = drain_microtasks(scope) {
+            return Some(c);
+        }
+    }
     None
 }
 
@@ -311,7 +338,7 @@ fn turn(scope: &mut HandleScope, done: &mut dyn FnMut(&mut HandleScope) -> bool)
 /// loop wound down (idle runs notice the watchdog only through the reason
 /// flag) ends the run, and an unhandled rejection or a decided exit code
 /// conclude it.
-fn sweep(scope: &mut HandleScope) -> i32 {
+fn sweep(scope: &mut PinScope<'_, '_>) -> i32 {
     scope.perform_microtask_checkpoint();
     if let Some(c) = stopped(scope).or_else(|| check_unhandled(scope)) {
         return c;
@@ -330,8 +357,10 @@ fn sweep(scope: &mut HandleScope) -> i32 {
 /// timer stays queued instead of being jumped to - a serve command's
 /// post-reply settling uses this, where jumping to a leftover repeating
 /// timer would spin virtual time (and the CPU) without bound.
-pub(crate) fn settle_due(scope: &mut HandleScope) -> i32 {
+pub(crate) fn settle_due(scope: &mut PinScope<'_, '_>) -> i32 {
     loop {
+        let wake = world_mut(scope).loop_wake.clone();
+        let seen = wake.generation();
         if let Some(c) = turn(scope, &mut |_| false) {
             return c;
         }
@@ -347,7 +376,14 @@ pub(crate) fn settle_due(scope: &mut HandleScope) -> i32 {
             world.timers.iter().any(|t| t.when <= now) || !world.net.is_empty()
         };
         if !due {
-            break;
+            if world_mut(scope).net_pending.is_empty() {
+                break;
+            }
+            // An in-flight network request completes on a real thread
+            // and signals the loop wake; wait for that (50 ms cap keeps
+            // deadline checks in the caller responsive).
+            wake.wait(seen, Duration::from_millis(50));
+            continue;
         }
     }
     sweep(scope)
@@ -374,21 +410,32 @@ enum Park {
 /// stdin read waits, in real time: chunks arrive on the real clock, the
 /// read stays pending until one does, and the clock has no deadline to
 /// jump to anyway.
-fn park_between_turns(scope: &mut HandleScope) -> Park {
-    let (has_timers, has_net, has_stdin) = {
+fn park_between_turns(scope: &mut PinScope<'_, '_>) -> Park {
+    let (has_timers, has_net, has_stdin, has_netreq) = {
         let world = world_mut(scope);
         (
             !world.timers.is_empty(),
             !world.net.is_empty(),
             !world.stdin_waiters.is_empty(),
+            !world.net_pending.is_empty(),
         )
     };
-    if !has_timers && !has_net && !has_stdin {
+    if !has_timers && !has_net && !has_stdin && !has_netreq {
         return Park::Done;
     }
+    // Queued vm.net messages are already in this process and are
+    // delivered by the next turn: sleeping here would add up to 50 ms
+    // of pure latency per hop (the old poll). Spin instead — a
+    // self-sustaining ping-pong then runs at full speed (and full CPU,
+    // bounded by --timeout), exactly as under the virtual clock.
+    if has_net {
+        return Park::Spin;
+    }
     if world_mut(scope).clock.is_virtual() {
-        if has_net {
-            return Park::Spin;
+        if has_netreq {
+            // The request rides a real worker thread and signals the
+            // loop wake; virtual time stands still while it is in flight.
+            return Park::Sleep(Duration::from_millis(50));
         }
         if has_timers {
             let world = world_mut(scope);
@@ -397,18 +444,19 @@ fn park_between_turns(scope: &mut HandleScope) -> Park {
             }
             return Park::Spin;
         }
-        return Park::Sleep(Duration::from_millis(2));
+        return Park::Sleep(Duration::from_millis(50));
     }
-    Park::Sleep(wake_deadline(scope, has_timers, has_stdin))
+    Park::Sleep(wake_deadline(scope, has_timers))
 }
 
-/// When to wake for the next loop turn: poll stdin at 2 ms while a reader
-/// waits, else at most 50 ms, never past the earliest timer. The 50 ms
-/// ceiling keeps an otherwise idle run responsive to the watchdog: a far
-/// timer must not park the loop past the wall-clock timeout.
-fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> Duration {
-    let cap = if has_stdin { 2 } else { 50 };
-    let mut wake = Duration::from_millis(cap);
+/// How long the loop may wait before the next turn: until the earliest
+/// timer, at most 50 ms. Cross-thread work (stdin chunks, network
+/// completions) wakes the wait early through the loop wake, so this is
+/// only a ceiling — it also keeps an otherwise idle run responsive to
+/// the watchdog: a far timer must not park the loop past the wall-clock
+/// timeout.
+fn wake_deadline(scope: &mut PinScope<'_, '_>, has_timers: bool) -> Duration {
+    let mut wake = Duration::from_millis(50);
     if has_timers {
         let world = world_mut(scope);
         let now = world.clock.now();
@@ -431,4 +479,3 @@ fn wake_deadline(scope: &mut HandleScope, has_timers: bool, has_stdin: bool) -> 
     }
     wake
 }
-

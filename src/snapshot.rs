@@ -71,12 +71,17 @@ fn b64_len(n: usize) -> usize {
 pub(crate) fn parse(json: &str) -> FsResult<Snapshot> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("invalid snapshot: {}", e))?;
-    let obj = v.as_object().ok_or("invalid snapshot: expected an object")?;
+    let obj = v
+        .as_object()
+        .ok_or("invalid snapshot: expected an object")?;
     match obj.get("version") {
         Some(v) if v.as_i64() == Some(2) => parse_v2(obj),
         // The version is guest-controlled JSON of any size and type; cap it
         // like every other echoed value.
-        Some(v) => Err(format!("unsupported snapshot version {}", shown(&v.to_string()))),
+        Some(v) => Err(format!(
+            "unsupported snapshot version {}",
+            shown(&v.to_string())
+        )),
         None => parse_legacy(obj),
     }
 }
@@ -172,8 +177,7 @@ fn parse_legacy(obj: &serde_json::Map<String, serde_json::Value>) -> FsResult<Sn
 /// chunk, and non-canonical trailing bits are rejected. In-tree so the
 /// snapshot format needs no extra crate.
 mod b64 {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub(super) fn encode(data: &[u8]) -> String {
         let digit = |v: u32| ALPHABET[(v & 63) as usize] as char;
@@ -239,7 +243,12 @@ mod tests {
         let all: Vec<u8> = (0..=255u8).collect();
         for len in [0, 1, 2, 3, 4, 5, 63, 64, 255, 256] {
             let data = &all[..len];
-            assert_eq!(b64::decode(&b64::encode(data)).unwrap(), data, "len {}", len);
+            assert_eq!(
+                b64::decode(&b64::encode(data)).unwrap(),
+                data,
+                "len {}",
+                len
+            );
         }
         assert_eq!(b64::encode(b"f"), "Zg==");
         assert_eq!(b64::encode(b"fo"), "Zm8=");
@@ -292,7 +301,11 @@ mod tests {
     fn unsupported_version_error_truncates_a_huge_value() {
         let huge = "x".repeat(100_000);
         let err = parse(&format!(r#"{{"version":"{}"}}"#, huge)).unwrap_err();
-        assert!(err.starts_with("unsupported snapshot version \"xxx"), "{}", err);
+        assert!(
+            err.starts_with("unsupported snapshot version \"xxx"),
+            "{}",
+            err
+        );
         assert!(err.ends_with("..."), "{}", err);
         assert!(err.len() < 300, "message is {} bytes", err.len());
         // An array value is echoed truncated too, not whole.
@@ -312,7 +325,9 @@ mod tests {
         );
         assert!(parse("{not json").unwrap_err().contains("invalid snapshot"));
         assert!(parse("[]").unwrap_err().contains("invalid snapshot"));
-        assert!(parse(r#"{"version":2}"#).unwrap_err().contains("files must be an object"));
+        assert!(parse(r#"{"version":2}"#)
+            .unwrap_err()
+            .contains("files must be an object"));
         assert!(parse(r#"{"version":2,"files":{},"dirs":"x"}"#)
             .unwrap_err()
             .contains("dirs must be an array"));
@@ -321,12 +336,12 @@ mod tests {
                 .unwrap_err()
                 .contains("file entry must be")
         );
-        assert!(
-            parse(r#"{"version":2,"files":{"/x":{"b64":"!!"}}}"#)
-                .unwrap_err()
-                .contains("bad base64")
-        );
-        assert!(parse(r#"{"n":1}"#).unwrap_err().contains("old-format values"));
+        assert!(parse(r#"{"version":2,"files":{"/x":{"b64":"!!"}}}"#)
+            .unwrap_err()
+            .contains("bad base64"));
+        assert!(parse(r#"{"n":1}"#)
+            .unwrap_err()
+            .contains("old-format values"));
     }
 
     #[test]

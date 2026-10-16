@@ -7,13 +7,14 @@ use crate::fs_api::{
     fs_restore, fs_snapshot, fs_stat, fs_write,
 };
 use crate::net::{net_close, net_listen, net_port, net_send};
+use crate::netcap::net_request;
 use crate::stdin::stdin_read;
 use crate::timers::{clear_timer, set_interval, set_timeout};
 use crate::webapi;
 use crate::Config;
 
 fn make_fn<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     cb: v8::FunctionCallback,
 ) -> Option<v8::Local<'s, v8::Function>> {
     v8::Function::new_raw(scope, cb)
@@ -21,7 +22,7 @@ fn make_fn<'s>(
 
 pub(crate) fn set(
     obj: v8::Local<v8::Object>,
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     name: &str,
     value: v8::Local<v8::Value>,
 ) {
@@ -31,7 +32,7 @@ pub(crate) fn set(
 
 pub(crate) fn put_fn(
     obj: v8::Local<v8::Object>,
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     name: &str,
     cb: v8::FunctionCallback,
 ) {
@@ -39,7 +40,7 @@ pub(crate) fn put_fn(
     set(obj, scope, name, f.into());
 }
 
-pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
+pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, cfg: &Config) {
     let global = scope.get_current_context().global(scope);
 
     // The context snapshot bundled with V8 already provides a native console
@@ -81,6 +82,9 @@ pub(crate) fn install(scope: &mut v8::HandleScope, cfg: &Config) {
     put_fn(net, scope, "listen", net_listen);
     put_fn(net, scope, "send", net_send);
     put_fn(net, scope, "close", net_close);
+    if cfg.net.is_some() {
+        put_fn(net, scope, "request", net_request);
+    }
     set(vm, scope, "net", net.into());
 
     let stdin_obj = v8::Object::new(scope);

@@ -210,3 +210,147 @@ if (typeof globalThis.__virtualDateMs === "function") {
   HostDate.prototype.constructor = VDate;
   globalThis.Date = VDate;
 }
+
+// ICU data is not loaded in this V8 build. Several Intl/locale entry points
+// abort or segfault the whole process instead of throwing (see
+// docs/KNOWN_BUGS.md history), so replace every locale-sensitive surface with
+// a catchable throw before any guest code can reach the native paths. The
+// original Intl object is dropped from the global: no instance of a crashing
+// formatter or segmenter can be created once this has run.
+{
+  const unavailable = function () {
+    throw new Error("Intl is not available in this build (no ICU data)");
+  };
+  const stubCtor = function () {
+    throw new Error("Intl is not available in this build (no ICU data)");
+  };
+  for (const proto of [Date.prototype, Number.prototype, String.prototype, BigInt.prototype, Array.prototype]) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (name.startsWith("toLocale") || name === "localeCompare") {
+        try { proto[name] = unavailable; } catch (_) { /* non-writable: leave it */ }
+      }
+    }
+  }
+  const intlStub = {};
+  for (const name of [
+    "Collator", "DateTimeFormat", "DisplayNames", "ListFormat", "Locale",
+    "NumberFormat", "PluralRules", "RelativeTimeFormat", "Segmenter",
+  ]) {
+    intlStub[name] = stubCtor;
+  }
+  intlStub.getCanonicalLocales = unavailable;
+  intlStub.supportedValuesOf = unavailable;
+  globalThis.Intl = Object.freeze(intlStub);
+}
+
+// Counted bound for the memory V8 does not route through the host's
+// ArrayBuffer allocator: WebAssembly.Memory pages, resizable ArrayBuffer
+// growth headroom, and growable SharedArrayBuffer headroom. The host
+// installs __memoryCapBytes (the effective --memory cap); capture and
+// delete it, then wrap the constructors so reservations charge a shared
+// ledger and refuse past the cap with a catchable RangeError. Charges
+// are released by a FinalizationRegistry when an object is collected.
+// Residual (docs/KNOWN_RISKS.md): a memory a WebAssembly module defines
+// internally is created by the engine, not by these constructors, and
+// growing it through the module's own exports cannot be intercepted
+// here — the OS limit stays the backstop for that path.
+if (typeof globalThis.__memoryCapBytes === "number") {
+  const capBytes = globalThis.__memoryCapBytes;
+  delete globalThis.__memoryCapBytes;
+  const PAGE = 65536;
+  const RErr = RangeError;
+  const TErr = TypeError;
+  let reserved = 0;
+  const release = (n) => { reserved = Math.max(0, reserved - n); };
+  const registry = typeof FinalizationRegistry === "function"
+    ? new FinalizationRegistry(release) : null;
+  const charge = (obj, n) => {
+    if (n > capBytes - reserved) {
+      throw new RErr("memory cap exceeded (WebAssembly/resizable memory is bounded by --memory)");
+    }
+    reserved += n;
+    if (registry && obj) registry.register(obj, n);
+  };
+
+  // --- WebAssembly.Memory ---
+  const OrigMemory = WebAssembly.Memory;
+  const memState = new WeakMap(); // instance -> {chargedPages, currentPages}
+  const WasmMemory = function Memory(descriptor) {
+    if (!new.target) throw new TErr("WebAssembly.Memory must be constructed with new");
+    const d = descriptor == null ? {} : Object(descriptor);
+    const initial = Number(d.initial) || 0;
+    const hasMax = d.maximum !== undefined;
+    const maximum = hasMax ? Number(d.maximum) : initial;
+    let mem;
+    charge(null, maximum * PAGE);
+    try {
+      mem = Reflect.construct(OrigMemory, [descriptor], new.target);
+    } catch (e) { release(maximum * PAGE); throw e; }
+    if (registry) registry.register(mem, maximum * PAGE);
+    memState.set(mem, { chargedPages: maximum, currentPages: initial });
+    return mem;
+  };
+  WasmMemory.prototype = OrigMemory.prototype;
+  try {
+    Object.defineProperty(OrigMemory.prototype, "constructor", { value: WasmMemory, writable: true, configurable: true });
+    const origGrow = OrigMemory.prototype.grow;
+    OrigMemory.prototype.grow = function (delta) {
+      const st = memState.get(this);
+      const d = Number(delta) || 0;
+      if (st && d > 0) {
+        const target = st.currentPages + d;
+        if (target > st.chargedPages) {
+          charge(this, (target - st.chargedPages) * PAGE);
+          st.chargedPages = target;
+        }
+        const r = origGrow.call(this, delta);
+        st.currentPages = target;
+        return r;
+      }
+      return origGrow.call(this, delta);
+    };
+  } catch (_) { /* prototype locked: construction cap still applies */ }
+  WebAssembly.Memory = WasmMemory;
+
+  // --- Resizable ArrayBuffer / growable SharedArrayBuffer ---
+  const wrapResizable = (Orig, name) => {
+    if (typeof Orig !== "function") return Orig;
+    const chargedMax = new WeakMap(); // instance -> charged maxByteLength
+    const Wrapped = function (length, options) {
+      if (!new.target) throw new TErr(name + " must be constructed with new");
+      const max = options != null && options.maxByteLength !== undefined
+        ? Number(options.maxByteLength) : undefined;
+      const initial = Number(length) || 0;
+      let buf;
+      if (max !== undefined && max > initial) charge(null, max - initial);
+      try {
+        buf = Reflect.construct(Orig, max !== undefined ? [length, options] : [length], new.target);
+      } catch (e) {
+        if (max !== undefined && max > initial) release(max - initial);
+        throw e;
+      }
+      if (max !== undefined) {
+        if (max > initial && registry) registry.register(buf, max - initial);
+        chargedMax.set(buf, max);
+      }
+      return buf;
+    };
+    Wrapped.prototype = Orig.prototype;
+    // Growing into already-charged headroom needs no new charge; the
+    // prototype methods stay the originals, bounded by maxByteLength,
+    // which was charged at construction.
+    try {
+      Object.defineProperty(Orig.prototype, "constructor", { value: Wrapped, writable: true, configurable: true });
+    } catch (_) { /* construction cap still applies */ }
+    for (const key of Object.getOwnPropertyNames(Orig)) {
+      if (key !== "prototype" && key !== "length" && key !== "name") {
+        try { Wrapped[key] = Orig[key]; } catch (_) { /* read-only static */ }
+      }
+    }
+    return Wrapped;
+  };
+  globalThis.ArrayBuffer = wrapResizable(globalThis.ArrayBuffer, "ArrayBuffer");
+  if (typeof globalThis.SharedArrayBuffer === "function") {
+    globalThis.SharedArrayBuffer = wrapResizable(globalThis.SharedArrayBuffer, "SharedArrayBuffer");
+  }
+}

@@ -14,7 +14,7 @@ real JavaScript engine through Deno's rusty_v8 bindings.
 
     $ tardigrade examples/hello.js
     hello from ram
-    engine: V8 12.9.202.13-rusty
+    engine: V8 15.2.124.1-rusty
 
 tardigrade runs the file in a fresh V8 isolate and exits when the program has
 nothing left to do. The exit code is the program's: 0 when it finishes,

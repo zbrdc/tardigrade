@@ -30,6 +30,7 @@ calling thread before the guest continues.
 | `timeout_ms: u64` | 60000 | wall-clock limit; 0 disables it |
 | `command_timeout_ms: u64` | 0 | per-command wall-clock limit in console mode; 0 disables it |
 | `heap_mb: usize` | 256 | heap cap in MB; values below 8 are raised to 8 |
+| `max_output_bytes: u64` | 64 MiB | cap on total guest console output; past it console calls throw `RangeError`; 0 disables |
 | `args: Vec<String>` | empty | the guest's `vm.args` |
 | `preload: Option<PathBuf>` | `None` | snapshot file to load into `vm.fs` before the run |
 | `preload_data: Option<String>` | `None` | snapshot JSON to load instead of reading `preload`; works without `preload` |
@@ -38,6 +39,9 @@ calling thread before the guest continues.
 | `fs_quota_bytes: u64` | 64 MiB (`tardigrade::DEFAULT_FS_QUOTA_BYTES`) | filesystem quota; 0 disables it |
 | `seed: Option<u64>` | `None` | deterministic `Math.random` seed |
 | `clock: Clock` | `Clock::Real` | `Clock::Virtual { epoch_ms }` gives the guest a virtual clock |
+| `rss_cap_mb: usize` | 0 | whole-process RSS cap in MB (Linux only); a run past it stops as a heap-cap hit (137). Counts the embedding process, so it fits one guest per process |
+| `module: bool` | `false` | parse the entry as an ES module; specifiers resolve in the RAM filesystem |
+| `net: Option<NetConfig>` | `None` | scoped network capabilities (`vm.net.request`); `None` keeps the guest offline. Build the plan with `NetPlan`/`parse_call` and spawn the sidecar with `spawn_sidecar` before applying the sandbox |
 
 `serve()` applies `timeout_ms` to the whole session and
 `command_timeout_ms` to each command (the limit that answers a slow
@@ -82,10 +86,12 @@ payload.
 `tardigrade::sandbox::supported()` reports whether this platform and kernel can
 sandbox (x86_64 Linux with Landlock ABI 6). It installs nothing.
 
-`tardigrade::sandbox::apply(dump: Option<&Path>)` applies the kernel layers
+`tardigrade::sandbox::apply(dump: Option<&Path>, keep_fd: Option<RawFd>)` applies the kernel layers
 of `--sandbox` described in [SANDBOX.md](SANDBOX.md). Call it once, before
 the first `run` or `serve`, while the calling thread is the only thread in
-the process; it refuses otherwise. `dump` is the only file the process may
+the process; it refuses otherwise. `keep_fd` preserves one extra
+descriptor across the fd closing — the network sidecar's wire fd from
+`spawn_sidecar`, and nothing else should use it. `dump` is the only file the process may
 write afterwards. It returns a `SandboxError` when it refuses or fails:
 `Unsupported` (not Linux x86_64), `EngineStarted` (a run already started
 V8), `ThreadsActive` (other threads exist), `Dump` (the dump file cannot be

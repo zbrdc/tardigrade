@@ -1,13 +1,18 @@
 # Guest API
 
 This is the JavaScript environment a tardigrade program runs in: the language as
-V8 12.9 implements it (ES2023 plus parts of later editions, such as
+V8 15.2 implements it (ES2024 plus parts of later editions, such as
 `Object.groupBy`, `Promise.withResolvers` and the `Set` methods), including
 WebAssembly, `SharedArrayBuffer` and `Atomics`, plus the globals below.
 
-The entry file is compiled as a classic script, not a module: `import`,
-`export` and top-level `await` are syntax errors. Wrap asynchronous code in
-an async function. Load more code from the RAM filesystem with `vm.run`.
+The entry file is compiled as a classic script by default. With
+`--module` (or an entry whose name ends in `.mjs`) it is an ES module:
+`import`/`export` and top-level `await` work, and specifiers resolve
+inside the RAM filesystem — absolute (`/lib.mjs`) or relative to the
+importing module (`./lib.mjs`) — so a module graph ships through
+`--preload` snapshots. Bare specifiers (`import "pkg"`) are refused, and
+dynamic `import()` resolves the same way. Load more classic-script code
+from the RAM filesystem with `vm.run`.
 
 Not provided: `require`, `process`, `Buffer`, `fetch`, `URL`, `crypto`,
 `setImmediate`, `AbortController`, and every other Node or browser API not
@@ -17,7 +22,7 @@ listed on this page.
 
 | API | Description |
 |---|---|
-| `console.log`, `console.info` | write a line to stdout |
+| `console.log`, `console.info` | write a line to stdout (stderr in `--serve`, where stdout is the reply channel) |
 | `console.warn`, `console.error` | write a line to stderr |
 | `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval` | timers with the usual id semantics |
 | `queueMicrotask(fn)` | queue a microtask |
@@ -30,6 +35,7 @@ listed on this page.
 | `vm.net.send(fromPort, toPort, payload)` | queue a message; throws if nothing listens on `toPort` |
 | `vm.net.close(port)` | stop listening on a port |
 | `vm.stdin.read()` | a promise of the next stdin chunk as a string; `""` at end of file |
+| `vm.net.request(name, body)` | only with `--allow-call`: a promise of `{status, text}` from the named endpoint (below) |
 | `vm.fs.*`, `vm.snapshot()`, `vm.restore(json)` | the RAM filesystem, [below](#vmfs) |
 | `new TextEncoder()` | `encode(string)`, `encodeInto(string, uint8array)`; UTF-8 only |
 | `new TextDecoder([label][, options])` | `decode([bytes][, {stream}])`; UTF-8 only |
@@ -66,6 +72,16 @@ has a listener replaces it. Messages are delivered one generation per loop
 turn, so a reply arrives no earlier than the next turn (see
 [Event loop](#event-loop)).
 
+`vm.net.request(name, body)` exists only when the operator granted a
+capability with `--allow-call`. It returns a promise of
+`{status: number, text: string}`; non-2xx statuses resolve (the guest
+inspects `status`), while unknown names, budget overruns, private-address
+refusals, timeouts and sidecar failures reject with a catchable error
+whose text never contains the URL. At most 8 requests may be in flight;
+request and response bytes count against the per-run network budget
+(`--net-total-bytes`, default 8 MiB). See
+[NETWORK_CAPABILITIES.md](NETWORK_CAPABILITIES.md).
+
 Queued message bytes count against the same `--memory` budget as
 ArrayBuffer memory (see [OPTIONS.md](OPTIONS.md#--memorymb)). A send whose
 payload would cross the cap throws a catchable `RangeError` in the sender;
@@ -73,12 +89,10 @@ once the queued messages are delivered or the run ends, their bytes are
 free again. A sender that keeps messages queued cannot grow host memory
 past `--memory`.
 
-`Intl` exists but does not work in the current build: ICU data is not
-loaded. `Number.prototype.toLocaleString` and `Intl.NumberFormat` throw
-`Internal error. Icu error.`; `Date.prototype.toLocale*String` and
-`Intl.DateTimeFormat` abort the whole process (exit 133), and iterating an
-`Intl.Segmenter` crashes it with SIGSEGV (exit 139). Do not call them. See
-[KNOWN_BUGS.md](KNOWN_BUGS.md).
+`Intl` does not work in the current build: ICU data is not loaded. The
+prelude replaces `Intl` and every `toLocale*`/`localeCompare` method with
+stubs that throw a catchable `Error("Intl is not available in this build
+(no ICU data)")`, so locale calls can never abort the process.
 
 ## Event loop
 
@@ -88,10 +102,13 @@ network messages, runs due timers, drains microtasks and polls stdin. When
 nothing is pending the run ends, so a program that schedules nothing exits
 as soon as its top level finishes.
 
-In real time the loop sleeps between turns: up to 50 ms, or 2 ms while a
-`vm.stdin.read()` is pending, and never past the next due timer. Queued
-`vm.net` messages wait for the next turn, so each message hop can take up
-to 50 ms; a request and its reply take about 100 ms.
+In real time the loop parks between turns until the next due timer, at
+most 50 ms. A stdin chunk or a `vm.net.request()` completion wakes the
+parked loop at once, so a pending read costs no polling cadence. Queued
+`vm.net` messages are the exception: they are already in the process, so
+the loop takes the next turn immediately and a message hop costs a turn,
+not a sleep. A self-sustaining `vm.net` ping-pong therefore runs at full
+CPU until `--timeout`, as it does under the virtual clock.
 
 Under `--clock=virtual` the loop never sleeps to wait for a timer: with no
 runnable work it jumps the virtual clock to the next due timer. See

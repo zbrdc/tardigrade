@@ -82,7 +82,9 @@ fn sync_parent(dump: &Path) {
 /// A fresh suffix for a temp name: the clock keeps separate processes
 /// apart, the counter keeps this process's calls apart.
 fn next_suffix() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     format!("{}-{}", nanos, TEMP_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -94,7 +96,10 @@ fn create_temp(dump: &Path) -> io::Result<(PathBuf, File)> {
 /// attempt. create_new refuses to reuse a name, and a name that is taken
 /// belongs to someone else: it is skipped, never opened or deleted. The
 /// pid keeps concurrent runs that dump into one directory apart as well.
-fn create_temp_from(dump: &Path, suffixes: impl Iterator<Item = String>) -> io::Result<(PathBuf, File)> {
+fn create_temp_from(
+    dump: &Path,
+    suffixes: impl Iterator<Item = String>,
+) -> io::Result<(PathBuf, File)> {
     for suffix in suffixes {
         let path = temp_sibling(dump, &suffix);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -103,14 +108,22 @@ fn create_temp_from(dump: &Path, suffixes: impl Iterator<Item = String>) -> io::
             Err(e) => return Err(e),
         }
     }
-    Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free temporary file name for the dump"))
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary file name for the dump",
+    ))
 }
 
 /// A hidden name next to the target, so the rename stays on one filesystem.
 fn temp_sibling(dump: &Path, suffix: &str) -> PathBuf {
     let name = dump.file_name().unwrap_or_default().to_string_lossy();
     let name = truncate_at_char(&name, TEMP_NAME_PART_MAX);
-    dump.with_file_name(format!(".{}.tardigrade-{}-{}.tmp", name, std::process::id(), suffix))
+    dump.with_file_name(format!(
+        ".{}.tardigrade-{}-{}.tmp",
+        name,
+        std::process::id(),
+        suffix
+    ))
 }
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a
@@ -132,7 +145,11 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Scratch {
-            let dir = std::env::temp_dir().join(format!("tardigrade-dump-{}-{}", name, std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "tardigrade-dump-{}-{}",
+                name,
+                std::process::id()
+            ));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("create scratch dir");
             Scratch(dir)

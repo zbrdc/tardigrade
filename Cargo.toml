@@ -9,8 +9,10 @@ autobins = true
 autoexamples = false
 
 [dependencies]
-v8 = "0.106.0"
+v8 = { version = "152", features = ["v8_enable_pointer_compression"] }
 serde_json = "1"
+ring = "=0.17.14"
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 # Sandbox layers. x86_64-Linux only (the deny list and the x32 guard are
 # verified on that ABI) and pinned exactly: the syscall constants and crate

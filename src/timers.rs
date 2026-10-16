@@ -15,7 +15,10 @@ pub(crate) struct RunningTimer {
 
 impl RunningTimer {
     pub(crate) fn new() -> Self {
-        RunningTimer { id: None, cleared: false }
+        RunningTimer {
+            id: None,
+            cleared: false,
+        }
     }
 
     /// Timer `id` starts its callback run, initially not self-cleared.
@@ -45,10 +48,15 @@ impl RunningTimer {
     }
 }
 
+/// Maximum live timers per run. Each timer holds a persistent V8 handle in
+/// host memory that the JS heap cap cannot see, so an explicit table bound
+/// is the only thing between a guest and unbounded host allocation here.
+pub(crate) const MAX_TIMERS: usize = 8192;
+
 fn set_timer_common(
     args: &v8::FunctionCallbackArguments,
     rv: &mut v8::ReturnValue,
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     repeat: bool,
 ) {
     if args.length() == 0 || !args.get(0).is_function() {
@@ -63,6 +71,10 @@ fn set_timer_common(
     let interval_ms = delay as u64;
     // Extra arguments are captured guest-side by the prelude wrapper, so the
     // host only ever stores the callback itself.
+    if world_mut(scope).timers.len() >= MAX_TIMERS {
+        throw(scope, "too many live timers");
+        return;
+    }
     let f: v8::Local<v8::Function> = args.get(0).try_into().unwrap();
     let cb = v8::Global::new(scope, f);
     let id = {
@@ -143,7 +155,10 @@ mod tests {
         rt.clear(8.0);
         rt.exit();
         rt.clear(7.0);
-        assert!(!rt.self_cleared(), "no timer is on the stack between callbacks");
+        assert!(
+            !rt.self_cleared(),
+            "no timer is on the stack between callbacks"
+        );
     }
 
     #[test]
@@ -162,6 +177,9 @@ mod tests {
         rt.enter(7);
         rt.clear(7.0);
         rt.exit();
-        assert!(rt.self_cleared(), "run_timers reads the decision after exit");
+        assert!(
+            rt.self_cleared(),
+            "run_timers reads the decision after exit"
+        );
     }
 }

@@ -18,11 +18,11 @@
 //! the subscriber queue receives the chunks until it unsubscribes; the
 //! others' read() promises stay pending.
 
-use std::collections::VecDeque;
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use crate::guest_cb;
-use crate::world::world_mut;
+use crate::world::{world_mut, LoopWake};
 
 /// Past this many buffered bytes the reader thread blocks until a consumer
 /// pulls chunks (backpressure for e.g. `yes | tardigrade guest.js`).
@@ -71,6 +71,9 @@ struct HubState {
     /// Subscriber queue; the front id is the consumer currently entitled to
     /// chunks.
     subs: VecDeque<u64>,
+    /// Event-loop wakes by subscriber id, signalled when the front
+    /// subscriber gains data (push, EOF, or becoming front).
+    wakers: HashMap<u64, Arc<LoopWake>>,
     next_id: u64,
     started: bool,
 }
@@ -82,6 +85,7 @@ impl HubState {
             bytes: 0,
             eof: false,
             subs: VecDeque::new(),
+            wakers: HashMap::new(),
             next_id: 1,
             started: false,
         }
@@ -151,6 +155,11 @@ impl Hub {
         }
     }
 
+    /// The front subscriber's loop wake, if it registered one.
+    fn front_wake(st: &HubState) -> Option<Arc<LoopWake>> {
+        st.subs.front().and_then(|id| st.wakers.get(id)).cloned()
+    }
+
     /// Parks a chunk, blocking the reader while the buffer is at the
     /// high-water mark.
     fn push(&self, chunk: Vec<u8>) {
@@ -159,13 +168,25 @@ impl Hub {
             st = self.wake.wait(st).unwrap();
         }
         st.push_chunk(chunk);
+        let front = Self::front_wake(&st);
+        drop(st);
         self.wake.notify_all();
+        if let Some(w) = front {
+            w.signal();
+        }
     }
 
     /// Marks process stdin at EOF (sticky).
     fn close(&self) {
-        self.state.lock().unwrap().eof = true;
+        let front = {
+            let mut st = self.state.lock().unwrap();
+            st.eof = true;
+            Self::front_wake(&st)
+        };
         self.wake.notify_all();
+        if let Some(w) = front {
+            w.signal();
+        }
     }
 
     /// Returns leftover bytes to the front of the buffer, for a session
@@ -174,8 +195,12 @@ impl Hub {
     fn push_front(&self, chunk: Vec<u8>) {
         let mut st = self.state.lock().unwrap();
         st.push_front(chunk);
+        let front = Self::front_wake(&st);
         drop(st);
         self.wake.notify_all();
+        if let Some(w) = front {
+            w.signal();
+        }
     }
 
     /// Lets a later subscribe retry the reader: called only when the spawn
@@ -187,11 +212,19 @@ impl Hub {
 
     /// Enqueues a subscriber; the bool says whether the reader thread still
     /// needs starting (decided under the lock, so it happens once).
+    #[cfg(test)]
     fn subscribe(&self) -> (u64, bool) {
+        self.subscribe_wake(None)
+    }
+
+    fn subscribe_wake(&self, wake: Option<Arc<LoopWake>>) -> (u64, bool) {
         let mut st = self.state.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
         st.subs.push_back(id);
+        if let Some(w) = wake {
+            st.wakers.insert(id, w);
+        }
         let start = !st.started;
         st.started = true;
         drop(st);
@@ -204,8 +237,14 @@ impl Hub {
         if let Some(pos) = st.subs.iter().position(|sid| *sid == id) {
             st.subs.remove(pos);
         }
+        st.wakers.remove(&id);
+        // A new front may now have buffered chunks waiting for it.
+        let front = Self::front_wake(&st);
         drop(st);
         self.wake.notify_all();
+        if let Some(w) = front {
+            w.signal();
+        }
     }
 
     fn try_take(&self, id: u64) -> Option<Option<Vec<u8>>> {
@@ -234,7 +273,18 @@ static HUB: LazyLock<Hub> = LazyLock::new(Hub::new);
 /// aborts the process): that subscription reports EOF and the next
 /// subscribe retries the spawn.
 pub(crate) fn subscribe() -> StdinSub {
-    let (id, start_reader) = HUB.subscribe();
+    subscribe_inner(None)
+}
+
+/// Like [subscribe], but the hub signals `wake` when this subscription
+/// (as front of the queue) gains a chunk, EOF, or the front itself —
+/// how a run's event loop learns to stop parking.
+pub(crate) fn subscribe_with_wake(wake: Arc<LoopWake>) -> StdinSub {
+    subscribe_inner(Some(wake))
+}
+
+fn subscribe_inner(wake: Option<Arc<LoopWake>>) -> StdinSub {
+    let (id, start_reader) = HUB.subscribe_wake(wake);
     if start_reader {
         let spawned = std::thread::Builder::new()
             .name("tardigrade-stdin".to_string())
@@ -313,7 +363,8 @@ guest_cb!(stdin_read, |_args, rv, scope| {
     {
         let world = world_mut(scope);
         if !world.stdin_eof && world.stdin_sub.is_none() {
-            world.stdin_sub = Some(subscribe());
+            let wake = world.loop_wake.clone();
+            world.stdin_sub = Some(subscribe_with_wake(wake));
         }
     }
     if world_mut(scope).stdin_eof {
@@ -328,11 +379,12 @@ guest_cb!(stdin_read, |_args, rv, scope| {
 
 /// Hands one chunk to exactly one waiting reader, or resolves everyone with
 /// "" at EOF.
-fn resolve_stdin_waiters(scope: &mut v8::HandleScope, chunk: Option<&[u8]>) {
+fn resolve_stdin_waiters(scope: &mut v8::PinScope<'_, '_>, chunk: Option<&[u8]>) {
     if let Some(bytes) = chunk {
         let resolver = world_mut(scope).stdin_waiters.pop();
         if let Some(resolver) = resolver {
-            let r = resolver.open(scope);
+            // SAFETY: the resolver global belongs to this isolate.
+            let r = unsafe { resolver.open(scope) };
             let s = v8::String::new_from_utf8(scope, bytes, v8::NewStringType::Normal).unwrap();
             r.resolve(scope, s.into());
         }
@@ -342,20 +394,21 @@ fn resolve_stdin_waiters(scope: &mut v8::HandleScope, chunk: Option<&[u8]>) {
         std::mem::take(&mut world_mut(scope).stdin_waiters);
     let empty = v8::String::new(scope, "").unwrap();
     for w in waiters {
-        w.open(scope).resolve(scope, empty.into());
+        // SAFETY: the waiter global belongs to this isolate.
+        unsafe { w.open(scope) }.resolve(scope, empty.into());
     }
 }
 
 /// A subscription is held only while readers are pending; otherwise one
 /// long-lived reader would starve every later subscriber.
-fn release_idle_subscription(scope: &mut v8::HandleScope) {
+fn release_idle_subscription(scope: &mut v8::PinScope<'_, '_>) {
     world_mut(scope).stdin_sub = None; // Drop unsubscribes from the hub
 }
 
 /// Delivers one hub event (if any) to the waiting readers. True when a
 /// waiter was resolved: its continuations have run or are still queued,
 /// and owe the event loop a checkpoint check.
-pub(crate) fn poll_stdin(scope: &mut v8::HandleScope) -> bool {
+pub(crate) fn poll_stdin(scope: &mut v8::PinScope<'_, '_>) -> bool {
     if world_mut(scope).stdin_waiters.is_empty() {
         release_idle_subscription(scope);
         return false;
@@ -408,7 +461,16 @@ mod tests {
         assert_eq!(complete_utf8_len(&three[..2]), 0);
         let four = "😀".as_bytes();
         for cut in 1..4 {
-            assert_eq!(complete_utf8_len(&b"xy".iter().chain(&four[..cut]).copied().collect::<Vec<_>>()), 2);
+            assert_eq!(
+                complete_utf8_len(
+                    &b"xy"
+                        .iter()
+                        .chain(&four[..cut])
+                        .copied()
+                        .collect::<Vec<_>>()
+                ),
+                2
+            );
         }
     }
 
@@ -437,7 +499,11 @@ mod tests {
         let (a, _) = h.subscribe();
         h.close();
         assert_eq!(h.try_take(a), Some(None));
-        assert_eq!(h.try_take(a), Some(None), "a second pull must not look blocked");
+        assert_eq!(
+            h.try_take(a),
+            Some(None),
+            "a second pull must not look blocked"
+        );
     }
 
     /// Runs `f` on a thread and fails instead of hanging if it takes over 5 s.
@@ -459,9 +525,7 @@ mod tests {
         h.push(b"1+1".to_vec());
         h.close();
         let h2 = h.clone();
-        let events = finishes_soon(move || {
-            (h2.wait_take(a), h2.wait_take(a), h2.wait_take(a))
-        });
+        let events = finishes_soon(move || (h2.wait_take(a), h2.wait_take(a), h2.wait_take(a)));
         assert_eq!(events, (Some(b"1+1".to_vec()), None, None));
     }
 
@@ -570,12 +634,18 @@ mod tests {
         assert!(start);
         h.spawn_failed();
         let (_, start_again) = h.subscribe();
-        assert!(start_again, "started must reflect a live reader, not an attempt");
+        assert!(
+            start_again,
+            "started must reflect a live reader, not an attempt"
+        );
     }
 
     #[test]
     fn a_dead_subscription_reports_eof_and_never_blocks() {
-        let sub = StdinSub { id: 4242, dead: true };
+        let sub = StdinSub {
+            id: 4242,
+            dead: true,
+        };
         assert_eq!(sub.try_take(), Some(None));
         assert_eq!(sub.wait_take(), None);
     }

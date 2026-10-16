@@ -15,11 +15,23 @@ guest_cb!(net_port, |_args, rv, scope| {
     rv.set(v8::Number::new(scope, port as f64).into());
 });
 
+/// Maximum vm.net listeners per run; each holds a persistent V8 handle in
+/// host memory outside the JS heap cap.
+pub(crate) const MAX_LISTENERS: usize = 1024;
+
 guest_cb!(net_listen, |args, _rv, scope| {
     let port = args.get(0).number_value(scope).unwrap_or(-1.0);
     if port < 0.0 || !args.get(1).is_function() {
         throw(scope, "net.listen(port, handler) requires a function");
         return;
+    }
+    {
+        let world = world_mut(scope);
+        let replacing = world.listeners.contains_key(&(port as u64));
+        if !replacing && world.listeners.len() >= MAX_LISTENERS {
+            throw(scope, "too many net listeners");
+            return;
+        }
     }
     let cb: v8::Local<v8::Function> = args.get(1).try_into().unwrap();
     let listener = v8::Global::new(scope, cb);

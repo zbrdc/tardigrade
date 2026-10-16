@@ -13,10 +13,55 @@ use std::time::{Duration, Instant};
 
 use crate::world::{TermReason, Termination, Wake};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+static FAIL_NEXT_RUN_SPAWN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FAIL_NEXT_COMMAND_SPAWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_run_spawn_for_test() {
+    FAIL_NEXT_RUN_SPAWN.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_command_spawn_for_test() {
+    FAIL_NEXT_COMMAND_SPAWN.store(true, Ordering::SeqCst);
+}
+
 /// How often a deliverer re-requests a marked termination once one
 /// exists. Only runs after a reason is set, so an idle guest's thread
 /// sleeps until its deadline untouched.
 const DELIVER_SLICE: Duration = Duration::from_millis(2);
+
+/// How often the run watchdog samples process RSS when an RSS cap is set.
+const RSS_SAMPLE: Duration = Duration::from_millis(25);
+
+/// Parses the `VmRSS:` line of /proc/self/status into bytes.
+fn parse_vmrss(status: &str) -> Option<u64> {
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
+}
+
+/// Current resident set size in bytes (Linux only; the RSS cap is a
+/// no-op elsewhere, like the other kernel-bound layers).
+fn current_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_vmrss(&std::fs::read_to_string("/proc/self/status").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn rss_exceeded(cap_bytes: u64) -> bool {
+    cap_bytes > 0 && current_rss_bytes().is_some_and(|rss| rss > cap_bytes)
+}
 
 pub(crate) struct Watchdog {
     term: Arc<Termination>,
@@ -31,9 +76,20 @@ impl Watchdog {
     /// termination (a request raised inside a V8 callback can be deferred
     /// and lost, so an outside-the-isolate re-request is the reliable
     /// delivery).
-    pub(crate) fn new(iso: v8::IsolateHandle, timeout_ms: u64, term: Arc<Termination>) -> Self {
+    pub(crate) fn new(
+        iso: v8::IsolateHandle,
+        timeout_ms: u64,
+        term: Arc<Termination>,
+        rss_cap_bytes: u64,
+    ) -> std::io::Result<Self> {
         let term2 = term.clone();
-        let spawned = std::thread::Builder::new()
+        #[cfg(test)]
+        if FAIL_NEXT_RUN_SPAWN.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other(
+                "injected watchdog thread spawn failure",
+            ));
+        }
+        let thread = std::thread::Builder::new()
             .name("tardigrade-runw".to_string())
             .spawn(move || {
                 let deadline = if timeout_ms == 0 {
@@ -42,9 +98,31 @@ impl Watchdog {
                     Some(Instant::now() + Duration::from_millis(timeout_ms))
                 };
                 loop {
-                    match term2.wait_for(deadline) {
+                    // With an RSS cap the wait must wake on the sample
+                    // cadence, not only at the wall-clock deadline: RSS
+                    // is the backstop for memory no in-process allocator
+                    // can see (module-internal WebAssembly memories).
+                    let wait_until = if rss_cap_bytes > 0 {
+                        let sample = Instant::now() + RSS_SAMPLE;
+                        Some(deadline.map_or(sample, |d| d.min(sample)))
+                    } else {
+                        deadline
+                    };
+                    match term2.wait_for(wait_until) {
                         Wake::Finished => return,
                         Wake::Deadline => {
+                            if rss_exceeded(rss_cap_bytes)
+                                && term2.mark(TermReason::Oom) {
+                                    while !term2.is_finished() {
+                                        iso.terminate_execution();
+                                        std::thread::sleep(DELIVER_SLICE);
+                                    }
+                                    return;
+                                }
+                            if deadline.is_none_or(|d| Instant::now() < d) {
+                                // A sample wake, not the deadline.
+                                continue;
+                            }
                             if term2.mark(TermReason::Timeout) {
                                 iso.terminate_execution();
                                 return;
@@ -85,15 +163,11 @@ impl Watchdog {
                         }
                     }
                 }
-            });
-        let thread = match spawned {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("tardigrade: cannot spawn run watchdog: {}", e);
-                None
-            }
-        };
-        Watchdog { term, thread }
+            })?;
+        Ok(Watchdog {
+            term,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -102,8 +176,8 @@ impl Drop for Watchdog {
         // Concluding the run also wakes (and ends) the waiter; the thread
         // exits its delivery loop on the same flag.
         self.term.finish();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -123,10 +197,8 @@ struct Guard {
     /// Ends the thread: set once the command is over (normally or by
     /// recovery); the thread exits its park or its re-request loop on it.
     stop: Arc<(Mutex<bool>, Condvar)>,
-    /// The spawned thread, when the spawn worked; None leaves the command
-    /// without a deadline (a spawn failure must not panic here - it is the
-    /// same failure it would be guarding).
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// The spawned thread, joined before V8's termination is cancelled.
+    thread: std::thread::JoinHandle<()>,
 }
 
 impl CommandWatchdog {
@@ -135,10 +207,19 @@ impl CommandWatchdog {
         iso: v8::IsolateHandle,
         term: Arc<Termination>,
         deadline: Option<Instant>,
-    ) -> Self {
-        CommandWatchdog {
-            guard: deadline.map(|d| spawn_guard(iso, term, d)),
-        }
+    ) -> std::io::Result<Self> {
+        Self::start_with(deadline, |d| spawn_guard(iso, term, d))
+    }
+
+    fn start_with(
+        deadline: Option<Instant>,
+        spawn: impl FnOnce(Instant) -> std::io::Result<Guard>,
+    ) -> std::io::Result<Self> {
+        let guard = match deadline {
+            Some(d) => Some(spawn(d)?),
+            None => None,
+        };
+        Ok(CommandWatchdog { guard })
     }
 
     /// Ends the thread and waits for it: after settle() returns, no
@@ -150,9 +231,7 @@ impl CommandWatchdog {
         if let Some(g) = self.guard.take() {
             *g.stop.0.lock().unwrap() = true;
             g.stop.1.notify_all();
-            if let Some(t) = g.thread {
-                let _ = t.join();
-            }
+            let _ = g.thread.join();
         }
     }
 }
@@ -163,24 +242,25 @@ impl Drop for CommandWatchdog {
     }
 }
 
-/// A spawn failure only disables the deadline for one command (like
-/// a run without --command-timeout); the session itself is unaffected.
-fn spawn_guard(iso: v8::IsolateHandle, term: Arc<Termination>, deadline: Instant) -> Guard {
+/// Spawns the enforcing guard; a failure is propagated so serve can stop
+/// rather than evaluate a command without its configured deadline.
+fn spawn_guard(
+    iso: v8::IsolateHandle,
+    term: Arc<Termination>,
+    deadline: Instant,
+) -> std::io::Result<Guard> {
     let stop = Arc::new((Mutex::new(false), Condvar::new()));
     let parked = stop.clone();
+    #[cfg(test)]
+    if FAIL_NEXT_COMMAND_SPAWN.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other(
+            "injected watchdog thread spawn failure",
+        ));
+    }
     let thread = std::thread::Builder::new()
         .name("tardigrade-command-watchdog".to_string())
-        .spawn(move || command_thread(iso, term, parked, deadline));
-    match thread {
-        Ok(t) => Guard {
-            stop,
-            thread: Some(t),
-        },
-        Err(e) => {
-            eprintln!("tardigrade: cannot spawn command watchdog: {}", e);
-            Guard { stop, thread: None }
-        }
-    }
+        .spawn(move || command_thread(iso, term, parked, deadline))?;
+    Ok(Guard { stop, thread })
 }
 
 /// Parks until `deadline` (false) or a stop (true). Pure condvar state,
@@ -248,10 +328,21 @@ mod tests {
         });
         let bound = Instant::now() + Duration::from_secs(5);
         while !done.load(Ordering::SeqCst) {
-            assert!(Instant::now() < bound, "watchdog call blocked instead of returning");
+            assert!(
+                Instant::now() < bound,
+                "watchdog call blocked instead of returning"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         rx.recv().expect("result after done")
+    }
+
+    #[test]
+    fn parse_vmrss_reads_kibibytes_as_bytes() {
+        let status = "Name:\ttardigrade\nVmRSS:\t  12345 kB\nVmSize:\t 999999 kB\n";
+        assert_eq!(super::parse_vmrss(status), Some(12345 * 1024));
+        assert_eq!(super::parse_vmrss("no rss here"), None);
+        assert_eq!(super::parse_vmrss("VmRSS:\t??? kB"), None);
     }
 
     #[test]
@@ -281,5 +372,14 @@ mod tests {
     fn park_until_returns_false_at_a_past_deadline() {
         let stop = (Mutex::new(false), Condvar::new());
         assert!(!park_until(&stop, Instant::now()));
+    }
+
+    #[test]
+    fn command_watchdog_without_deadline_does_not_spawn() {
+        let watchdog = CommandWatchdog::start_with(None, |_| {
+            panic!("a disabled command deadline must not spawn a thread")
+        })
+        .expect("disabled deadline is a valid no-op");
+        assert!(watchdog.guard.is_none());
     }
 }

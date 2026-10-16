@@ -1,0 +1,43 @@
+[package]
+name = "tardigrade-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace so the normal build and test suite never build this.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tardigrade = { path = ".." }
+
+[[bin]]
+name = "parse_call"
+path = "fuzz_targets/parse_call.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_restore"
+path = "fuzz_targets/snapshot_restore.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_paths"
+path = "fuzz_targets/fs_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netcap_wire"
+path = "fuzz_targets/netcap_wire.rs"
+test = false
+doc = false
+bench = false

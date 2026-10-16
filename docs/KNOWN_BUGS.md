@@ -5,58 +5,38 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
 ## Runtime
 
-- **Intl does not work, and several calls abort the process.** ICU data is
-  not loaded. `Number.prototype.toLocaleString`, `localeCompare` and the
-  `Intl` NumberFormat, Collator, PluralRules, ListFormat and
-  RelativeTimeFormat throw `Internal error. Icu error.`
-  `Date.prototype.toLocaleString`, `toLocaleDateString` and
-  `toLocaleTimeString`, `new Intl.DateTimeFormat().format()` and
-  `Intl.DateTimeFormat().resolvedOptions()` kill the process with the fatal error
-  `Fatal process out of memory: DateTimePatternGeneratorCache::CreateGenerator`
-  (SIGTRAP, exit 133), and iterating `new Intl.Segmenter().segment(...)`
-  kills it with SIGSEGV (exit 139). Any guest can therefore crash the
-  process. `Date.prototype.toString` prints an empty time zone name.
+- **Intl does not work.** ICU data is not loaded, so the prelude stubs
+  `Intl` and all `toLocale*`/`localeCompare` methods to throw a catchable
+  error; real locale formatting is unavailable until ICU data ships.
+  `Date.prototype.toString` prints an empty time zone name.
 - **Blocked stdout defeats `--timeout`.** The watchdog cannot interrupt a
   write that the operating system blocks. A guest that prints in a loop
   while nothing reads its stdout runs past `--timeout` for as long as the
   write stays blocked.
-- **`vm.net` is slow in real time.** The event loop sleeps up to 50 ms
-  between turns even when messages are queued, so each message hop costs up
-  to 50 ms: 20 request-and-reply round trips take about 2 seconds.
-- **An entry that is not valid UTF-8 is mishandled.** From a file it is
-  reported as "cannot open" (exit 2); from stdin tardigrade panics (exit 101).
-- **Guest arguments cannot start with `-`.** tardigrade parses its own options
-  anywhere on the command line, also after the entry, and `--` does not end
-  option parsing. See [OPTIONS.md](OPTIONS.md#description).
 
 ## Console mode (--serve)
 
-- **Guest output shares stdout with replies.** `console.log` and
-  `console.info` output appears on stdout between the JSON replies.
-- **No per-command time limit unless `--command-timeout` is given.** A
-  command that never finishes blocks the session forever, because
-  `--timeout` defaults to 0 in this mode; `--command-timeout` bounds each
-  command, and work a command leaves pending (an uncleared repeating
-  timer) keeps blocking later commands' settling with or without it. See
-  [OPTIONS.md](OPTIONS.md#--serve).
+- **Library serve sessions have no per-command limit by default.** The
+  CLI defaults `--serve` to a 30 s `--command-timeout`, but a library
+  caller who leaves `command_timeout_ms` at its default of 0 gets an
+  unbounded session, and work a command leaves pending (an uncleared
+  repeating timer) keeps blocking later commands' settling either way.
+  See [OPTIONS.md](OPTIONS.md#--serve).
 
 ## HTTP bridge (serve_bridge)
 
-`serve_bridge` is a demonstration and is not hardened for exposure beyond
-localhost:
+`serve_bridge` is a demonstration bound to localhost; do not expose it
+beyond that without a real HTTP server in front. Remaining limits:
 
-- request size is not limited: the bridge allocates whatever
-  `Content-Length` claims before reading the body (a huge value can abort
-  it), an unparsable value is read as 0, and header lines are unbounded;
-- sockets have no read or write timeouts, and connections are handled one
-  at a time, so one silent client stalls every other client;
-- anything the guest writes to stdout (for example `console.log` in
-  `handler`) is taken as the reply to the current request, and every later
-  response is one request late. Use `console.error` while debugging;
-- if the guest process exits or crashes, the request in flight is answered
-  with an empty 200 response, and the bridge panics on the next request
-  instead of answering 502 and restarting the guest;
-- the status code and content type returned by the guest are written into
-  the response unchecked: a content type containing CR or LF can inject
-  headers, and every status other than 200, 500 and 504 is sent with the reason
-  phrase `OK`.
+- connections are handled one at a time (each socket now has a 15 s
+  read/write timeout, so a silent client stalls the bridge for at most
+  that long rather than forever);
+- guest `console.log` output goes to the bridge's stderr (serve mode
+  diverts it there), so it cannot be mistaken for a reply; handlers that
+  print for debugging should still expect that noise on stderr.
+
+Fixed since the first version: request bodies are capped at 1 MiB before
+allocation (413 past it), header lines are capped, an unparsable
+`Content-Length` is a 400, guest status codes must be 100–599 and content
+types cannot contain CR/LF or other controls, and a dead guest is
+answered 502 and restarted instead of panicking the bridge.

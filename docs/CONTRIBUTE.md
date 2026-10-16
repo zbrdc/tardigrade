@@ -60,8 +60,24 @@ layers, so they skip instead of failing:
 
 `TARDIGRADE_REQUIRE_SANDBOX=1` turns every one of those skips into a
 failure. Set it where the kernel is known to support Landlock ABI 6; CI
-leaves it unset. Scripts that need to know in advance use `tardigrade
---sandbox-check`.
+leaves it unset for push/PR runs, and a manual workflow dispatch with
+`require_sandbox=true` sets it. Scripts that need to know in advance use
+`tardigrade --sandbox-check`.
+
+## Security checks
+
+- `cargo audit` runs in CI (the `audit` job) and locally; the one
+  current warning (`paste`, unmaintained) arrives transitively through
+  the `v8` crate (139) and clears only with the pinned-scope API
+  migration to rusty_v8 152.
+- Fuzz targets live in `fuzz/` (its own workspace, so the normal build
+  never sees them): `parse_call` (operator flags and address classes),
+  `snapshot_restore` (snapshot parser/restore), `fs_paths` (RAM-fs
+  paths and quotas), `netcap_wire` (sidecar wire). Run one with a
+  nightly toolchain:
+  `cargo +nightly fuzz run snapshot_restore -- -max_total_time=60`.
+- CI actions are pinned by commit SHA and kept current by Dependabot
+  (`.github/dependabot.yml`); do not add a tag- or branch-pinned action.
 
 The `tests/sandbox.rs` binary takes libtest-style arguments: substring
 filters (`--exact` for whole names), `--skip <name>` and `--list`; other

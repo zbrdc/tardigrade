@@ -59,6 +59,41 @@ pub(crate) struct PendingRejection {
     pub(crate) value: Option<v8::Global<v8::Value>>,
 }
 
+/// Cross-thread wake for the event loop: the stdin reader and network
+/// worker threads signal it when work lands, so the loop's park is a
+/// condvar wait instead of a poll. The generation counter makes the
+/// wait race-free: a signal that lands between the loop's pending-work
+/// check and its wait makes the wait return at once.
+pub(crate) struct LoopWake {
+    inner: (Mutex<u64>, Condvar),
+}
+
+impl LoopWake {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(LoopWake {
+            inner: (Mutex::new(0), Condvar::new()),
+        })
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        *self.inner.0.lock().unwrap()
+    }
+
+    pub(crate) fn signal(&self) {
+        *self.inner.0.lock().unwrap() += 1;
+        self.inner.1.notify_all();
+    }
+
+    /// Waits until the generation moves past `seen` or `dur` elapses.
+    pub(crate) fn wait(&self, seen: u64, dur: std::time::Duration) {
+        let guard = self.inner.0.lock().unwrap();
+        if *guard != seen {
+            return;
+        }
+        let _ = self.inner.1.wait_timeout(guard, dur).unwrap();
+    }
+}
+
 /// Why a run was terminated from outside guest code. CommandTimeout is
 /// serve-only: it is set by the per-command watchdog, recovered by
 /// serve_loop, and never delivered as a run-level stop by the run
@@ -208,6 +243,15 @@ pub(crate) struct World {
     pub(crate) next_port: u64,
     pub(crate) stdin_waiters: Vec<v8::Global<v8::PromiseResolver>>,
     pub(crate) stdin_eof: bool,
+    /// True in serve mode: stdout is the reply channel there, so guest
+    /// console output is diverted to stderr where it cannot be mistaken
+    /// for (or desynchronise) a reply line.
+    pub(crate) serve_mode: bool,
+    /// Guest console output charged so far, and its cap (u64::MAX when
+    /// disabled): a guest printing forever must not be able to fill a
+    /// disk or a pipe the host is draining at unbounded volume.
+    pub(crate) output_bytes: u64,
+    pub(crate) output_cap: u64,
     /// This run's subscription to the process-wide stdin hub, created on the
     /// first vm.stdin.read() and released when the run ends - or sooner,
     /// whenever no vm.stdin readers are pending any more (see
@@ -242,6 +286,27 @@ pub(crate) struct World {
     /// every remembered rejection.
     pub(crate) pending_rejections: HashMap<i32, Vec<PendingRejection>>,
     pub(crate) next_rejection_seq: u64,
+    /// Scoped network capabilities (netcap): granted names, limits, the
+    /// wire fd to the sidecar, the completion queue its threads push into,
+    /// and the pending resolvers the event loop resolves.
+    pub(crate) net_limits: crate::netcap::NetLimits,
+    pub(crate) net_names: Vec<String>,
+    pub(crate) net_max_response: u64,
+    pub(crate) net_total_bytes: u64,
+    pub(crate) net_bytes_used: u64,
+    pub(crate) net_fd: Option<std::os::fd::RawFd>,
+    pub(crate) net_wire: Option<Arc<Mutex<std::os::unix::net::UnixStream>>>,
+    pub(crate) net_done: crate::netcap::NetQueue,
+    pub(crate) net_pending: HashMap<u64, v8::Global<v8::PromiseResolver>>,
+    pub(crate) next_net_id: u64,
+    /// ES module cache for module-mode runs: fs path -> module, and
+    /// module identity hash -> fs path (so the import resolver knows
+    /// who is asking). Empty for classic-script runs.
+    pub(crate) modules: HashMap<String, v8::Global<v8::Module>>,
+    pub(crate) module_paths: HashMap<i32, String>,
+    /// Signalled by the stdin reader (through this run's subscription)
+    /// and by network worker completions; the event loop waits on it.
+    pub(crate) loop_wake: Arc<LoopWake>,
 }
 
 impl World {
@@ -256,6 +321,9 @@ impl World {
             next_port: 1,
             stdin_waiters: Vec::new(),
             stdin_eof: false,
+            serve_mode: false,
+            output_bytes: 0,
+            output_cap: u64::MAX,
             stdin_sub: None,
             random_state: None,
             clock,
@@ -267,6 +335,19 @@ impl World {
             ab_budget: Arc::new(AllocState::new(usize::MAX)),
             pending_rejections: HashMap::new(),
             next_rejection_seq: 0,
+            net_limits: Default::default(),
+            net_names: Vec::new(),
+            net_max_response: 0,
+            net_total_bytes: 0,
+            net_bytes_used: 0,
+            net_fd: None,
+            net_wire: None,
+            net_done: Arc::new(Mutex::new(VecDeque::new())),
+            net_pending: HashMap::new(),
+            next_net_id: 1,
+            modules: HashMap::new(),
+            module_paths: HashMap::new(),
+            loop_wake: LoopWake::new(),
         }
     }
 
@@ -371,7 +452,10 @@ mod tests {
     fn wait_for_returns_deadline_when_the_deadline_has_passed() {
         let term = Arc::new(Termination::new());
         let past = Instant::now();
-        assert!(matches!(wait_bounded(&term, Some(past)), Some(Wake::Deadline)));
+        assert!(matches!(
+            wait_bounded(&term, Some(past)),
+            Some(Wake::Deadline)
+        ));
     }
 
     #[test]

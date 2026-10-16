@@ -16,10 +16,13 @@
 //! states this).
 //!
 //! ArrayBuffer memory is capped separately by the counting allocator:
-//! this V8 build does not account ArrayBuffer backing stores as external
-//! memory, so the allocator enforces its own budget (live backing-store
-//! bytes against the same --memory figure) by refusing allocations that
-//! would cross it; V8 reports the refusal to the guest as a catchable
+//! the engine enforces no per-run ArrayBuffer budget of its own, so the
+//! allocator enforces its own (live backing-store bytes against the
+//! same --memory figure) by refusing allocations that would cross it.
+//! Since V8 15.2 a failed backing-store allocation consults the
+//! near-heap-limit callback before reporting the failure; the guard
+//! answers that consultation by raising the limit without terminating,
+//! so V8 still reports the refusal to the guest as a catchable
 //! RangeError it may survive. Buffers the host builds from Rust bytes
 //! (TextEncoder.encode, vm.fs.readBytes) are charged to the same budget
 //! through [uint8_array_from], so they cannot be retained past it either.
@@ -71,16 +74,28 @@ pub(crate) struct CapPlan {
 pub(crate) struct HeapGuard {
     handle: v8::IsolateHandle,
     term: Arc<Termination>,
+    /// The ArrayBuffer budget whose refusals must not become an OOM: V8
+    /// 152 consults the near-heap-limit callback when a backing-store
+    /// allocation fails, so a termination there would turn a budget
+    /// refusal into a 137 instead of the catchable RangeError the guest
+    /// can handle.
+    ab_budget: Arc<AllocState>,
     /// Where the callback raises V8's limit to, so the pending allocation
     /// succeeds and the termination is observed in JavaScript.
     limit_ceiling: usize,
 }
 
 impl HeapGuard {
-    pub(crate) fn new(handle: v8::IsolateHandle, term: Arc<Termination>, plan: &CapPlan) -> Self {
+    pub(crate) fn new(
+        handle: v8::IsolateHandle,
+        term: Arc<Termination>,
+        plan: &CapPlan,
+        ab_budget: Arc<AllocState>,
+    ) -> Self {
         HeapGuard {
             handle,
             term,
+            ab_budget,
             limit_ceiling: plan.v8_max_bytes.saturating_mul(3),
         }
     }
@@ -98,7 +113,24 @@ impl HeapGuard {
 /// (teardown GCs, any end-of-run work that still runs V8) a mark would be
 /// consumed by nobody and a termination would be swallowed by that work,
 /// so only the raise happens.
-fn limit_decision(term: &Termination, current: usize, ceiling: usize) -> (usize, bool) {
+fn limit_decision(
+    term: &Termination,
+    current: usize,
+    ceiling: usize,
+    ab_refused: bool,
+) -> (usize, bool) {
+    // V8 152 asks the callback for headroom when an ArrayBuffer backing
+    // store allocation failed. The pending allocation cannot be rescued
+    // by a higher heap limit - it failed on the run's ArrayBuffer
+    // budget - so raise without terminating and let the retry fail into
+    // the same catchable RangeError the pre-152 engine reported
+    // directly. The retry goes through the counting allocator again and
+    // re-marks the budget, so a later heap-only OOM is not mistaken for
+    // this case; at worst one callback round is spent raised instead of
+    // terminating, and the next round terminates as usual.
+    if ab_refused {
+        return (ceiling.max(current), false);
+    }
     let terminate = !term.is_finished();
     if terminate {
         term.mark(TermReason::Oom);
@@ -117,7 +149,12 @@ pub(crate) extern "C" fn on_near_heap_limit(
     _initial: usize,
 ) -> usize {
     let guard = unsafe { &*(data as *const HeapGuard) };
-    let (limit, terminate) = limit_decision(&guard.term, current, guard.limit_ceiling);
+    let (limit, terminate) = limit_decision(
+        &guard.term,
+        current,
+        guard.limit_ceiling,
+        guard.ab_budget.take_refused(),
+    );
     if terminate {
         guard.handle.terminate_execution();
     }
@@ -129,7 +166,6 @@ fn counting_vtable() -> &'static v8::RustAllocatorVtable<AllocState> {
         allocate,
         allocate_uninitialized,
         free,
-        reallocate,
         drop: drop_handle,
     }
 }
@@ -217,7 +253,9 @@ impl AsMut<[u8]> for Charged {
 
 impl Drop for Charged {
     fn drop(&mut self) {
-        self.budget.live.fetch_sub(self.bytes.len(), Ordering::SeqCst);
+        self.budget
+            .live
+            .fetch_sub(self.bytes.len(), Ordering::SeqCst);
     }
 }
 
@@ -226,7 +264,7 @@ impl Drop for Charged {
 /// RangeError) or V8 cannot build the view. The charge ends when V8 frees
 /// the backing store.
 pub(crate) fn uint8_array_from<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     bytes: Vec<u8>,
 ) -> Option<v8::Local<'s, v8::Uint8Array>> {
     let budget = world_mut(scope).ab_budget.clone();
@@ -234,7 +272,7 @@ pub(crate) fn uint8_array_from<'s>(
     // courtesy here, or a guest that churns through unreferenced buffers
     // would see refusals for memory only the collector can return.
     if !budget.try_charge(bytes.len()) {
-        scope.low_memory_notification();
+        scope.as_mut().low_memory_notification();
         if !budget.try_charge(bytes.len()) {
             return None;
         }
@@ -251,7 +289,7 @@ const ALIGN: usize = 16;
 
 fn layout(len: usize) -> std::alloc::Layout {
     // std alloc forbids zero-sized layouts; allocate one byte instead and
-    // apply the same rule on free and realloc.
+    // apply the same rule on free.
     std::alloc::Layout::from_size_align(len.max(1), ALIGN).unwrap()
 }
 
@@ -287,38 +325,6 @@ unsafe extern "C" fn free(st: &AllocState, data: *mut c_void, len: usize) {
         st.live.fetch_sub(len, Ordering::Relaxed);
         unsafe { std::alloc::dealloc(data as *mut u8, layout(len)) };
     }
-}
-
-unsafe extern "C" fn reallocate(
-    st: &AllocState,
-    data: *mut c_void,
-    old_len: usize,
-    new_len: usize,
-) -> *mut c_void {
-    if data.is_null() {
-        return unsafe { allocate_uninitialized(st, new_len) };
-    }
-    if old_len == 0 {
-        // A zero-length block is our one-byte allocation; grow into a
-        // fresh block and release the old one.
-        let ptr = unsafe { allocate_uninitialized(st, new_len) };
-        if !ptr.is_null() {
-            unsafe { std::alloc::dealloc(data as *mut u8, layout(0)) };
-        }
-        return ptr;
-    }
-    if new_len > old_len && !st.fits(new_len - old_len) {
-        st.refuse();
-        return std::ptr::null_mut();
-    }
-    let ptr = unsafe {
-        std::alloc::realloc(data as *mut u8, layout(old_len), layout(new_len).size())
-    };
-    if !ptr.is_null() {
-        st.live.fetch_sub(old_len, Ordering::Relaxed);
-        st.live.fetch_add(new_len, Ordering::Relaxed);
-    }
-    ptr as *mut c_void
 }
 
 unsafe extern "C" fn drop_handle(st: *const AllocState) {
@@ -361,22 +367,37 @@ mod tests {
     #[test]
     fn the_limit_callback_marks_and_terminates_while_the_run_is_live() {
         let term = Termination::new();
-        let (limit, terminate) = limit_decision(&term, 10 << 20, 100 << 20);
+        let (limit, terminate) = limit_decision(&term, 10 << 20, 100 << 20, false);
         assert_eq!(limit, 100 << 20);
         assert!(terminate);
         assert!(term.reason() == Some(TermReason::Oom));
     }
 
     #[test]
+    fn the_limit_callback_raises_without_terminating_on_a_budget_refusal() {
+        // V8 152 asks the callback for headroom when a backing-store
+        // allocation failed on the ArrayBuffer budget: raise so the
+        // retry can fail into the catchable RangeError, no OOM mark.
+        let term = Termination::new();
+        let (limit, terminate) = limit_decision(&term, 10 << 20, 100 << 20, true);
+        assert_eq!(limit, 100 << 20);
+        assert!(!terminate, "a budget refusal is not a heap OOM");
+        assert!(term.reason().is_none(), "no mark for a budget refusal");
+    }
+
+    #[test]
     fn the_limit_callback_only_raises_once_the_run_has_finished() {
         let term = Termination::new();
         term.finish();
-        let (limit, terminate) = limit_decision(&term, 10 << 20, 100 << 20);
+        let (limit, terminate) = limit_decision(&term, 10 << 20, 100 << 20, false);
         assert_eq!(limit, 100 << 20, "still raised, so the allocation succeeds");
         assert!(!terminate, "no termination after the run concluded");
         assert!(term.reason().is_none(), "no mark after the run concluded");
         // A current limit above the ceiling is never lowered.
-        assert_eq!(limit_decision(&term, 200 << 20, 100 << 20).0, 200 << 20);
+        assert_eq!(
+            limit_decision(&term, 200 << 20, 100 << 20, false).0,
+            200 << 20
+        );
     }
 
     #[test]
@@ -429,7 +450,10 @@ mod tests {
     fn dropping_charged_bytes_returns_them_to_the_budget() {
         let budget = Arc::new(AllocState::new(100));
         assert!(budget.try_charge(30));
-        let held = Charged { bytes: vec![0; 30], budget: budget.clone() };
+        let held = Charged {
+            bytes: vec![0; 30],
+            budget: budget.clone(),
+        };
         assert!(!budget.try_charge(71));
         drop(held);
         assert!(budget.try_charge(100), "the 30 bytes came back");

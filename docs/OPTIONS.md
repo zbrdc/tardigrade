@@ -11,7 +11,11 @@ The options, expanded:
     tardigrade [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>]
                [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual]
                [--epoch=<ms>] [--preload=<file>] [--dump=<file>]
-               [--serve] [--sandbox] <entry.js | -> [args...]
+               [--run-manifest=<file>]
+               [--serve] [--sandbox] [--allow-call=NAME=URL[,METHOD]]
+               [--net-max-response=<bytes>] [--net-total-bytes=<bytes>]
+               [--net-timeout=<ms>] [--net-allow-private]
+               <entry.js | -> [args...]
 
 ## Description
 
@@ -22,11 +26,13 @@ code. With `-` as the entry, the program is read from stdin, and the guest's
 
 Arguments after the entry are passed to the guest as `vm.args`. tardigrade
 recognizes its own options anywhere on the command line, also after the
-entry, and a bare `--` is dropped without ending option parsing. As a
-result a guest argument cannot start with `-`: `tardigrade app.js --timeout=5`
-sets the timeout, and `tardigrade app.js -x` fails with "unknown flag -x" (exit
-2). A lone `-` after the entry is an ordinary guest argument. See
-[KNOWN_BUGS.md](KNOWN_BUGS.md).
+entry, until a bare `--`: `--` ends option parsing, and everything after
+it is the entry or a guest argument even when it starts with `-` (so
+`tardigrade -- app.js -x` passes `-x` to the guest). Without `--`, a guest
+argument cannot start with `-`: `tardigrade app.js --timeout=5` sets the
+timeout, and `tardigrade app.js -x` fails with "unknown flag -x" (exit 2).
+A lone `-` is an ordinary guest argument, or the entry (read from stdin)
+in entry position.
 
 The guest API is described in [GUEST-API.md](GUEST-API.md), and a tutorial
 is in [MANUAL.md](MANUAL.md).
@@ -49,7 +55,8 @@ code, drain or redirect the output and also bound the process from outside
 ### --command-timeout=\<ms\>
 
 Console mode only: wall-clock limit for one command, in milliseconds.
-Default 0, which disables it (also in the library's `Config`). When it
+The CLI defaults to 30000 in `--serve` when the flag is not given;
+`--command-timeout=0` disables it. The library's `Config` default is 0. When it
 expires the command replies `{"$error":"command timed out"}`, V8's pending
 termination is cancelled, and the session continues with its state -
 variables, files, timers - intact. Unlike `--timeout`, which ends the whole
@@ -75,6 +82,32 @@ to 8.
 
 The cap has exact rules and known gaps, described in
 [KNOWN_RISKS.md](KNOWN_RISKS.md#memory).
+
+### --rss-cap=\<mb\>
+
+Linux only. Caps the whole process's resident set size (MiB): the
+watchdog samples `/proc/self/status` every 25 ms and stops the run as a
+heap-cap hit (exit 137) past the cap. This is the backstop for memory
+no in-process allocator can see — a WebAssembly memory a module
+defines internally, for example. It counts the whole process, so it
+fits one guest per process; leave headroom over the baseline RSS
+(`--memory` measures something else). Default 0 (disabled).
+
+### --module
+
+Parse the entry as an ES module instead of a classic script:
+`import`/`export` and top-level await work, and specifiers resolve
+inside the RAM filesystem (see [GUEST-API.md](GUEST-API.md)). An entry
+whose name ends in `.mjs` implies this flag.
+
+### --max-output=\<mb\>
+
+Cap on total guest console output (stdout plus stderr, in MiB).
+Default 64; 0 disables it. Past the cap a console call throws a
+catchable `RangeError` and writes nothing, so a printing loop cannot
+fill a disk or a pipe at unbounded volume. A single write to an
+already-full pipe can still block (see
+[KNOWN_RISKS.md](KNOWN_RISKS.md#time)).
 
 ### --fs-quota=\<mb\>
 
@@ -118,9 +151,9 @@ Real time still applies in these places:
   clock.
 - A pending `vm.stdin.read()` stays pending while the clock jumps, and
   resolves when its data arrives in real time. It also keeps the run
-  alive: once no timers or messages are left, the loop waits in real time
-  (polling every 2 ms) until stdin delivers data or reaches end of file, or
-  until `--timeout` expires.
+  alive: once no timers or messages are left, the loop parks in real time,
+  woken the moment stdin delivers data or reaches end of file, or when
+  `--timeout` expires.
 - A self-sustaining `vm.net` ping-pong spins at full CPU, without the
   pause between turns that real time takes.
 - Under `--serve` the virtual clock is one timeline for the whole session:
@@ -193,6 +226,36 @@ How the file is written:
   Landlock allows writing only that one file and no temporary file can be
   created. A failure during the write can leave it truncated.
 
+### --run-manifest=\<file\>
+
+The version-1 contract is described in
+[RUN_PROVENANCE.md](RUN_PROVENANCE.md).
+
+`--run-manifest=FILE` opts in to one version-1
+`phase: "prepared"` companion record for a CLI run or serve session. It is
+written and closed before sandbox application or guest evaluation. A serve
+record covers bootstrap only, not later commands or state. It does not replace
+or change the RAM-filesystem snapshot produced by `--dump`.
+
+`FILE` must be nonempty and must not be `-`. The destination must be a new
+file, created exclusively with mode 0600; existing files, symlinks,
+directories, and special files are never replaced. It must not alias the
+`--dump` inode, including equivalent path spellings. Preparation or output
+failure is a usage-style exit 2 before guest execution. The manifest may
+remain as a valid preparation record if sandboxing or the later run fails.
+Use a trusted output directory: the opt-in source/preload hashes reveal
+equality and may enable dictionary/guessing attacks against low-entropy
+inputs; they are not encryption or redaction.
+
+Examples use separate new manifest and snapshot destinations:
+
+    tardigrade --run-manifest=run.json --dump=fs-snapshot.json entry.js
+    tardigrade --serve --run-manifest=session.json app.mjs
+
+The flag follows existing option parsing: options are recognized until a bare
+`--`, after which arguments are positional. With the option absent, ordinary
+behavior and default-mode I/O are unchanged.
+
 ### --serve
 
 Console mode. tardigrade runs `entry.js` once (the entry is optional),
@@ -244,9 +307,8 @@ command. A line that is not valid UTF-8 ends the session with exit 0, and
 input the session did not read is kept for the next reader.
 
 Replies rendezvous with the caller's writer: a reply is on stdout before
-anything the guest prints after it, and output the command's own
-microtasks print still comes first. `console.log` output appears on
-stdout between replies (see [KNOWN_BUGS.md](KNOWN_BUGS.md)).
+anything the guest prints after it. Guest console output goes to stderr
+in this mode, so it never appears between replies.
 
 After every command the loop settles the timers, `vm.net` messages and
 microtasks the command left pending, under the same
@@ -284,6 +346,31 @@ input arrives. See [MANUAL.md](MANUAL.md#console-mode) for an example,
 and [KNOWN_BUGS.md](KNOWN_BUGS.md#console-mode---serve) for the current
 limits of this mode.
 
+### --allow-call=NAME=URL[,METHOD]
+
+Grants one scoped network capability (repeatable): the guest may call
+`vm.net.request(NAME, body)` and reach only that endpoint, by name; the
+URL never reaches the guest. METHOD is GET, POST or PUT (default POST).
+With no `--allow-call` the guest is fully offline and `vm.net.request`
+does not exist. The HTTP itself runs in a `tardigrade net-sidecar`
+subprocess spawned before any sandbox layers; the guest process keeps
+one socketpair fd to it and gains no socket syscall. Full design:
+[NETWORK_CAPABILITIES.md](NETWORK_CAPABILITIES.md).
+
+### --net-max-response=<bytes>, --net-total-bytes=<bytes>, --net-timeout=<ms>
+
+Per-response cap (default 1 MiB), per-run request+response byte budget
+(default 8 MiB), and per-request timeout (default 30000 ms) for
+`vm.net.request`. At most 8 requests may be in flight at once. These
+flags are an error without at least one `--allow-call`.
+
+### --net-allow-private
+
+Allows granted endpoints that resolve to private, loopback, link-local,
+CGNAT or otherwise non-public addresses. Without it the sidecar refuses
+them, and its resolver returns only addresses it may connect to, so a
+rebinding DNS answer cannot reach a private address either.
+
 ### --sandbox
 
 Applies kernel-level containment (Landlock and seccomp) to the whole
@@ -308,15 +395,17 @@ entry and an ordinary guest argument after it.
 | 2 | usage error, entry file that cannot be read, preload failure, or `--sandbox` not available |
 | 70 | the guest thread could not be started |
 | 74 | `--dump` could not be written and the program itself exited 0 |
-| 101 | tardigrade panicked (for example, an entry read from stdin that is not valid UTF-8) |
+| 101 | tardigrade panicked (a host bug; an entry that is not valid UTF-8 is exit 2 instead) |
 | 124 | `--timeout` expired |
 | 137 | the program exceeded the heap cap (`--memory`) |
 | 128 + *n* | the process was killed by signal *n*, as shells report it: 133 is SIGTRAP from a V8 fatal error, 134 SIGABRT from a failed host allocation, 139 SIGSEGV. See [KNOWN_RISKS.md](KNOWN_RISKS.md#process-aborts) and [KNOWN_BUGS.md](KNOWN_BUGS.md) |
 
 ## Output
 
-`console.log` and `console.info` write to stdout, `console.warn` and
-`console.error` to stderr. Arguments are converted with ToString and
+`console.log` and `console.info` write to stdout; `console.warn` and
+`console.error` write to stderr. In `--serve` all console output goes to
+stderr, because stdout is the reply channel there and guest prints must
+not be mistaken for replies. Arguments are converted with ToString and
 joined with spaces, so objects print as `[object Object]`; a Symbol, or an
 object without a `toString`, makes the call throw `TypeError`. Use
 `JSON.stringify` for structured output.

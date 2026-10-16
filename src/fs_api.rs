@@ -24,7 +24,7 @@ enum PathArg {
     LoneSurrogate,
 }
 
-fn arg_path(scope: &mut v8::HandleScope, v: &v8::Value) -> PathArg {
+fn arg_path(scope: &mut v8::PinScope<'_, '_>, v: &v8::Value) -> PathArg {
     let s = match v.to_string(scope) {
         Some(s) => s,
         None => return PathArg::Threw,
@@ -43,14 +43,23 @@ const SURROGATE_CHUNK: usize = 4096;
 /// Read through String::write, which reports the code units verbatim
 /// (the lossy Rust conversion would already have replaced them), in
 /// fixed-size chunks from `start`.
-fn has_lone_surrogate(s: &v8::String, scope: &mut v8::HandleScope) -> bool {
+fn has_lone_surrogate(s: &v8::String, scope: &mut v8::PinScope<'_, '_>) -> bool {
     let len = s.length();
     let mut scan = SurrogateScan::default();
     let mut buf = vec![0u16; SURROGATE_CHUNK.min(len)];
     let mut start = 0;
     while start < len {
         let take = SURROGATE_CHUNK.min(len - start);
-        let wrote = s.write(scope, &mut buf[..take], start, v8::WriteOptions::NO_NULL_TERMINATION);
+        // write_v2 fills the whole buffer slice and reports no count;
+        // the slice is sized to exactly the units remaining, so it is
+        // filled completely.
+        s.write_v2(
+            scope,
+            start as u32,
+            &mut buf[..take],
+            v8::WriteFlags::empty(),
+        );
+        let wrote = take;
         if scan.feed(&buf[..wrote]) {
             return true;
         }
@@ -111,9 +120,7 @@ macro_rules! path_arg {
         match arg_path($scope, &$args.get($i)) {
             PathArg::Text(p) => p,
             PathArg::Threw => return,
-            PathArg::LoneSurrogate => {
-                return throw($scope, "path contains lone surrogates")
-            }
+            PathArg::LoneSurrogate => return throw($scope, "path contains lone surrogates"),
         }
     };
 }
@@ -121,7 +128,7 @@ macro_rules! path_arg {
 /// Converts a non-path argument (write data, restore payload) to a Rust
 /// string; `None` means the conversion threw and the pending guest
 /// exception should propagate.
-fn arg_text(scope: &mut v8::HandleScope, v: &v8::Value) -> Option<String> {
+fn arg_text(scope: &mut v8::PinScope<'_, '_>, v: &v8::Value) -> Option<String> {
     let s = v.to_string(scope)?;
     Some(s.to_rust_string_lossy(scope))
 }
@@ -136,7 +143,7 @@ fn fits_v8_string(len: usize, limit: usize) -> bool {
 /// Makes a V8 string, or None when the content exceeds V8's maximum
 /// string length (~536 M characters); callers turn that into a guest
 /// Error instead of aborting the process.
-fn str_local<'s>(scope: &mut v8::HandleScope<'s>, s: &str) -> Option<v8::Local<'s, v8::String>> {
+fn str_local<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> Option<v8::Local<'s, v8::String>> {
     if !fits_v8_string(s.len(), v8::String::MAX_LENGTH) {
         return None;
     }
@@ -145,7 +152,7 @@ fn str_local<'s>(scope: &mut v8::HandleScope<'s>, s: &str) -> Option<v8::Local<'
 
 /// Builds a string array. Entries are paths, capped far below the V8
 /// string limit, so the empty-string fallback is unreachable in practice.
-fn str_array<'s>(scope: &mut v8::HandleScope<'s>, names: Vec<String>) -> v8::Local<'s, v8::Array> {
+fn str_array<'s>(scope: &mut v8::PinScope<'s, '_>, names: Vec<String>) -> v8::Local<'s, v8::Array> {
     let array = v8::Array::new(scope, names.len() as i32);
     for (i, name) in names.iter().enumerate() {
         let s = str_local(scope, name).unwrap_or_else(|| v8::String::empty(scope));
@@ -156,7 +163,7 @@ fn str_array<'s>(scope: &mut v8::HandleScope<'s>, names: Vec<String>) -> v8::Loc
 
 /// Reads a boolean option (`{recursive: true}` style) off an argument.
 fn opt_flag(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments,
     idx: i32,
     name: &str,
@@ -180,7 +187,7 @@ fn opt_flag(
 /// for buffers (a view left out of bounds by a resize reports zero,
 /// exactly as the guest sees it). None for values that are not writable
 /// data - those fail in arg_bytes with the type error.
-fn data_len(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> Option<usize> {
+fn data_len(scope: &mut v8::PinScope<'_, '_>, v: &v8::Local<v8::Value>) -> Option<usize> {
     if v.is_string() {
         return v.to_string(scope).map(|s| s.utf8_length(scope));
     }
@@ -206,7 +213,7 @@ fn data_len(scope: &mut v8::HandleScope, v: &v8::Local<v8::Value>) -> Option<usi
 /// resizable-buffer shrink behaves the way JS shows it: length zero, so
 /// the write stores an empty file.
 fn check_view(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     view: &v8::Local<v8::ArrayBufferView>,
 ) -> Result<(), String> {
     match view.buffer(scope) {
@@ -223,7 +230,7 @@ fn check_view(
 /// a large buffer writes only what it can see. SharedArrayBuffer contents
 /// are read as a snapshot; tardigrade guests are single-threaded, so no other
 /// thread can mutate them concurrently.
-fn arg_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Result<Vec<u8>, String> {
+fn arg_bytes(scope: &mut v8::PinScope<'_, '_>, v: v8::Local<v8::Value>) -> Result<Vec<u8>, String> {
     if v.is_string() {
         return Ok(to_rust_string(scope, &v).into_bytes());
     }
@@ -236,8 +243,8 @@ fn arg_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Result<Vec
         return Ok(buf);
     }
     if v.is_array_buffer() {
-        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(v)
-            .map_err(|_| BAD_WRITE_DATA.to_string())?;
+        let buffer =
+            v8::Local::<v8::ArrayBuffer>::try_from(v).map_err(|_| BAD_WRITE_DATA.to_string())?;
         if buffer.was_detached() {
             return Err("cannot write from a detached ArrayBuffer".to_string());
         }
@@ -259,7 +266,7 @@ fn arg_bytes(scope: &mut v8::HandleScope, v: v8::Local<v8::Value>) -> Result<Vec
 
 const BAD_WRITE_DATA: &str = "write data must be a string, ArrayBuffer, or typed array";
 
-fn stat_obj<'s>(scope: &mut v8::HandleScope<'s>, st: &Stat) -> v8::Local<'s, v8::Object> {
+fn stat_obj<'s>(scope: &mut v8::PinScope<'s, '_>, st: &Stat) -> v8::Local<'s, v8::Object> {
     let obj = v8::Object::new(scope);
     let ty = if st.is_dir { "dir" } else { "file" };
     let key = str_local(scope, "type").unwrap_or_else(|| v8::String::empty(scope));
@@ -390,7 +397,9 @@ guest_cb!(fs_snapshot, |_args, rv, scope| {
 });
 
 guest_cb!(fs_restore, |args, _rv, scope| {
-    let Some(json) = arg_text(scope, &args.get(0)) else { return };
+    let Some(json) = arg_text(scope, &args.get(0)) else {
+        return;
+    };
     if let Err(e) = world_mut(scope).fs.restore(&json) {
         throw(scope, &e);
     }
@@ -455,7 +464,10 @@ mod tests {
         assert!(fits_v8_string(1024, 1024));
         assert!(!fits_v8_string(1025, 1024));
         assert!(fits_v8_string(0, 0));
-        assert!(fits_v8_string(v8::String::MAX_LENGTH, v8::String::MAX_LENGTH));
+        assert!(fits_v8_string(
+            v8::String::MAX_LENGTH,
+            v8::String::MAX_LENGTH
+        ));
         assert!(!fits_v8_string(
             v8::String::MAX_LENGTH + 1,
             v8::String::MAX_LENGTH

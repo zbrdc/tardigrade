@@ -13,10 +13,8 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use crate::diag::to_rust_string;
-use crate::event_loop::{
-    event_loop, event_loop_until, forget_rejection_of, settle_due, stopped,
-};
 use crate::eval_src;
+use crate::event_loop::{event_loop, event_loop_until, forget_rejection_of, settle_due, stopped};
 use crate::stdin::{self, StdinSub};
 use crate::watchdog::CommandWatchdog;
 use crate::world::{world_mut, TermReason, Wake, COMMAND_TIMEOUT_CODE};
@@ -144,42 +142,42 @@ enum Step<'s> {
     Terminated,
 }
 
-fn eval_step<'s>(scope: &mut v8::HandleScope<'s>, src: &str) -> Step<'s> {
-    let mut tc = v8::TryCatch::new(scope);
-    let v = eval_src(&mut tc, src, "serve");
-    step_from(&mut tc, v)
+fn eval_step<'s>(scope: &mut v8::PinScope<'s, '_>, src: &str) -> Step<'s> {
+    v8::tc_scope!(let tc, scope);
+    let v = eval_src(tc, src, "serve");
+    step_from(tc, v)
 }
 
 /// Classifies a V8 outcome: None means an exception (or a termination) is
 /// pending in `tc`.
 fn step_from<'s>(
-    tc: &mut v8::TryCatch<'_, v8::HandleScope<'s>>,
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, 's, v8::HandleScope<'_, v8::Context>>>,
     v: Option<v8::Local<'s, v8::Value>>,
 ) -> Step<'s> {
     match v {
         Some(v) => Step::Value(v),
-        None if tc.is_execution_terminating() => Step::Terminated,
+        None if tc.as_mut().is_execution_terminating() => Step::Terminated,
         None => Step::Exception(tc.exception().unwrap_or_else(|| v8::undefined(tc).into())),
     }
 }
 
 /// Compiles `src` (a function expression) and applies it to `value`.
 fn call_with<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     src: &str,
     value: v8::Local<v8::Value>,
 ) -> Step<'s> {
-    let mut tc = v8::TryCatch::new(scope);
-    let f = match eval_src(&mut tc, src, "serve") {
+    v8::tc_scope!(let tc, scope);
+    let f = match eval_src(tc, src, "serve") {
         Some(f) => f,
-        None => return step_from(&mut tc, None),
+        None => return step_from(tc, None),
     };
     let Ok(f) = v8::Local::<v8::Function>::try_from(f) else {
-        return Step::Exception(v8::undefined(&mut tc).into());
+        return Step::Exception(v8::undefined(tc).into());
     };
-    let this = v8::undefined(&mut tc).into();
-    let called = f.call(&mut tc, this, &[value]);
-    step_from(&mut tc, called)
+    let this = v8::undefined(tc).into();
+    let called = f.call(tc, this, &[value]);
+    step_from(tc, called)
 }
 
 /// What a command produced.
@@ -213,9 +211,12 @@ fn command_deadline(timeout_ms: u64) -> Option<Instant> {
 /// the recovery (checked first, like everywhere); only our own reason is
 /// cleared; a run-level reason that won the flag meanwhile returns its
 /// session-ending code instead.
-fn recover_command_timeout(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Option<i32> {
+fn recover_command_timeout(
+    scope: &mut v8::PinScope<'_, '_>,
+    wd: &mut CommandWatchdog,
+) -> Option<i32> {
     wd.settle();
-    scope.cancel_terminate_execution();
+    scope.as_mut().cancel_terminate_execution();
     let exit = world_mut(scope).exit_code();
     if world_mut(scope).has_exit() {
         return Some(exit);
@@ -231,7 +232,7 @@ fn recover_command_timeout(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog
 
 /// The outcome of a fired command timeout: the session continues with the
 /// timeout reply unless a run-level reason won the race.
-fn timeout_outcome(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Outcome {
+fn timeout_outcome(scope: &mut v8::PinScope<'_, '_>, wd: &mut CommandWatchdog) -> Outcome {
     match recover_command_timeout(scope, wd) {
         Some(code) => Outcome::End(code),
         None => Outcome::ReplyTimedOut,
@@ -241,7 +242,7 @@ fn timeout_outcome(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Out
 /// A termination reached us mid-command: a guest vm.exit code wins over
 /// everything; a per-command timeout is recovered from; anything else
 /// (run timeout, heap cap) ends the session with its own code.
-fn terminated(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Outcome {
+fn terminated(scope: &mut v8::PinScope<'_, '_>, wd: &mut CommandWatchdog) -> Outcome {
     let exit = world_mut(scope).exit_code();
     if world_mut(scope).has_exit() {
         return Outcome::End(exit);
@@ -257,7 +258,7 @@ fn terminated(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Outcome 
 /// an outside termination) outranks it, the exception becomes an
 /// `$error` reply and the session continues.
 fn command_exception(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     exc: v8::Local<v8::Value>,
     wd: &mut CommandWatchdog,
 ) -> Outcome {
@@ -278,7 +279,7 @@ fn command_exception(
 /// itself can still fail (guest-replaced JSON globals): a constant line
 /// beats ending the session over an encoding problem.
 fn encode_error(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     exc: v8::Local<v8::Value>,
     wd: &mut CommandWatchdog,
 ) -> Outcome {
@@ -305,14 +306,14 @@ enum Settled {
 /// answer; with one, the deadline is waited out on the run's termination
 /// condvar.
 fn settle(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     p: v8::Local<v8::Promise>,
     deadline: Option<Instant>,
 ) -> Settled {
     if p.state() != v8::PromiseState::Pending {
         return Settled::Yes;
     }
-    let mut settled = |_s: &mut v8::HandleScope| p.state() != v8::PromiseState::Pending;
+    let mut settled = |_s: &mut v8::PinScope<'_, '_>| p.state() != v8::PromiseState::Pending;
     let code = event_loop_until(scope, &mut settled);
     if code != 0 {
         return Settled::Ended(code);
@@ -330,7 +331,7 @@ fn settle(
 /// termination condvar: the command watchdog's mark wakes us exactly at
 /// the deadline, and a run-level reason (the wall-clock timeout, the heap
 /// cap) wakes us the moment it lands, not at our own deadline.
-fn park_deadline(scope: &mut v8::HandleScope, deadline: Instant) -> Settled {
+fn park_deadline(scope: &mut v8::PinScope<'_, '_>, deadline: Instant) -> Settled {
     let term = world_mut(scope).term.clone();
     let woken = match term.wait_for(Some(deadline)) {
         Wake::Deadline => return Settled::Ended(COMMAND_TIMEOUT_CODE),
@@ -341,8 +342,8 @@ fn park_deadline(scope: &mut v8::HandleScope, deadline: Instant) -> Settled {
         // way the deadline governs the command.
         Some(TermReason::CommandTimeout) | None => Settled::Ended(COMMAND_TIMEOUT_CODE),
         Some(_) => {
-            if scope.is_execution_terminating() {
-                scope.cancel_terminate_execution();
+            if scope.as_mut().is_execution_terminating() {
+                scope.as_mut().cancel_terminate_execution();
             }
             Settled::Ended(world_mut(scope).take_terminated_exit())
         }
@@ -355,7 +356,7 @@ fn park_deadline(scope: &mut v8::HandleScope, deadline: Instant) -> Settled {
 /// replaced globals: the host consumes that rejection - clearing its
 /// unhandled record - and answers with the reason as `$error`.
 fn settled_reply(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     p: v8::Local<v8::Promise>,
     wd: &mut CommandWatchdog,
 ) -> Outcome {
@@ -370,7 +371,7 @@ fn settled_reply(
 
 /// The wrapper's result: the encoded line, or a promise of one.
 fn value_outcome(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     v: v8::Local<v8::Value>,
     wd: &mut CommandWatchdog,
     deadline: Option<Instant>,
@@ -389,7 +390,7 @@ fn value_outcome(
 /// Evaluates one command's expression and produces its outcome. A line
 /// past the engine's string limit is a reply, not a session end.
 fn evaluate(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     line: &str,
     wd: &mut CommandWatchdog,
     deadline: Option<Instant>,
@@ -425,7 +426,7 @@ fn encode_line(s: String) -> String {
 /// only work already due at the reply's virtual time settles (the clock
 /// is never jumped here), so a leftover repeating timer cannot spin
 /// virtual time - and the CPU - without bound between commands.
-fn settle_after_reply(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> Option<i32> {
+fn settle_after_reply(scope: &mut v8::PinScope<'_, '_>, wd: &mut CommandWatchdog) -> Option<i32> {
     let exit = world_mut(scope).exit_code();
     if world_mut(scope).has_exit() {
         return Some(exit);
@@ -454,23 +455,30 @@ fn settle_after_reply(scope: &mut v8::HandleScope, wd: &mut CommandWatchdog) -> 
 /// the next command. Only our own reason is taken; run-level state (a set
 /// reason, an exit code) is durable and still decides the session at the
 /// next turn.
-fn scrub_leftovers(scope: &mut v8::HandleScope, deadline: Option<Instant>) {
+fn scrub_leftovers(scope: &mut v8::PinScope<'_, '_>, deadline: Option<Instant>) {
     if deadline.is_none() {
         return; // no command watchdog ever ran: nothing to scrub
     }
     if world_mut(scope).term.reason() == Some(TermReason::CommandTimeout) {
         let _ = world_mut(scope).term.take_reason();
     }
-    scope.cancel_terminate_execution();
+    scope.as_mut().cancel_terminate_execution();
 }
 
 /// Runs one command end to end: evaluate, reply (rendezvous first, so a
 /// reply is on the caller's writer before anything the guest prints
 /// after it), then settle the command's leftover work under the same
 /// deadline. Some(code) ends the session.
-fn run_command(scope: &mut v8::HandleScope, srv: &Serve, line: &str) -> Option<i32> {
+fn run_command(scope: &mut v8::PinScope<'_, '_>, srv: &Serve, line: &str) -> Option<i32> {
     let deadline = command_deadline(srv.timeout_ms);
-    let mut wd = CommandWatchdog::start(srv.iso.clone(), world_mut(scope).term.clone(), deadline);
+    let mut wd =
+        match CommandWatchdog::start(srv.iso.clone(), world_mut(scope).term.clone(), deadline) {
+            Ok(wd) => wd,
+            Err(_) => {
+                eprintln!("tardigrade: cannot start command watchdog");
+                return Some(70);
+            }
+        };
     let outcome = evaluate(scope, line, &mut wd, deadline);
     let mut end = None;
     let mut settle_work = true;
@@ -503,7 +511,7 @@ fn run_command(scope: &mut v8::HandleScope, srv: &Serve, line: &str) -> Option<i
 /// EOF (or a stream error): the session ends like a finished program - a
 /// termination that landed as the last command's work wound down (the
 /// reason flag, not V8's possibly swallowed state) still ends it.
-fn session_end(scope: &mut v8::HandleScope) -> i32 {
+fn session_end(scope: &mut v8::PinScope<'_, '_>) -> i32 {
     let exit = world_mut(scope).exit_code();
     if world_mut(scope).has_exit() {
         return exit;
@@ -513,7 +521,12 @@ fn session_end(scope: &mut v8::HandleScope) -> i32 {
 
 /// Reads commands until EOF or a session-ending condition; `pending`
 /// ends up holding the bytes pulled from the hub but never consumed.
-fn session(scope: &mut v8::HandleScope, srv: &Serve, sub: &StdinSub, pending: &mut Vec<u8>) -> i32 {
+fn session(
+    scope: &mut v8::PinScope<'_, '_>,
+    srv: &Serve,
+    sub: &StdinSub,
+    pending: &mut Vec<u8>,
+) -> i32 {
     loop {
         let line = match next_command(sub, pending) {
             None | Some(Err(())) => break, // EOF; invalid UTF-8 like the old read error
@@ -536,7 +549,7 @@ fn session(scope: &mut v8::HandleScope, srv: &Serve, sub: &StdinSub, pending: &m
 /// A command that fails to compile or throws is a reply; only host-level
 /// failure ends the session (see README, Console protocol).
 pub(crate) fn serve_loop(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     iso: &v8::IsolateHandle,
     replies: &ReplySink,
     command_timeout_ms: u64,

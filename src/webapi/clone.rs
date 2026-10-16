@@ -30,7 +30,7 @@ struct CloneSerializer {
 impl v8::ValueSerializerImpl for CloneSerializer {
     fn throw_data_clone_error<'s>(
         &self,
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         message: v8::Local<'s, v8::String>,
     ) {
         let exc = v8::Exception::error(scope, message);
@@ -39,7 +39,7 @@ impl v8::ValueSerializerImpl for CloneSerializer {
 
     fn get_shared_array_buffer_id(
         &self,
-        _scope: &mut v8::HandleScope<'_>,
+        _scope: &mut v8::PinScope<'_, '_>,
         _shared_array_buffer: v8::Local<'_, v8::SharedArrayBuffer>,
     ) -> Option<u32> {
         // Without a shared-id registry a SAB cannot be cloned within the
@@ -52,7 +52,7 @@ impl v8::ValueSerializerImpl for CloneSerializer {
 
     fn get_wasm_module_transfer_id(
         &self,
-        scope: &mut v8::HandleScope<'_>,
+        scope: &mut v8::PinScope<'_, '_>,
         _module: v8::Local<'_, v8::WasmModuleObject>,
     ) -> Option<u32> {
         // There is no transfer registry to move a module within the run,
@@ -83,7 +83,7 @@ enum TransferWant {
 /// but an array is a TypeError (a sequence is required; iterables such
 /// as Sets are not accepted), and a non-empty array is refused by the
 /// caller.
-fn transfer_want(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> TransferWant {
+fn transfer_want(scope: &mut v8::PinScope<'_, '_>, opts: &v8::Local<v8::Value>) -> TransferWant {
     if opts.is_null_or_undefined() {
         return TransferWant::None;
     }
@@ -93,9 +93,9 @@ fn transfer_want(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> Tr
     let Ok(obj) = v8::Local::<v8::Object>::try_from(*opts) else {
         return TransferWant::Threw;
     };
-    let mut tc = v8::TryCatch::new(scope);
-    let key = v8_str(&mut tc, "transfer");
-    let Some(list) = obj.get(&mut tc, key.into()) else {
+    v8::tc_scope!(let tc, scope);
+    let key = v8_str(tc, "transfer");
+    let Some(list) = obj.get(tc, key.into()) else {
         tc.rethrow();
         return TransferWant::Threw;
     };
@@ -112,7 +112,7 @@ fn transfer_want(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> Tr
 
 /// Validates the options argument; false means the right error was
 /// thrown (or a getter's exception is pending) and the call is over.
-fn options_ok(scope: &mut v8::HandleScope, opts: &v8::Local<v8::Value>) -> bool {
+fn options_ok(scope: &mut v8::PinScope<'_, '_>, opts: &v8::Local<v8::Value>) -> bool {
     match transfer_want(scope, opts) {
         TransferWant::None => true,
         TransferWant::Refuse => {
@@ -150,42 +150,39 @@ guest_cb!(structured_clone, |args, rv, scope| {
             sab_refused: sab_refused.clone(),
         }),
     );
-    let mut tc = v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     // The wire-format header must precede the value (the v8 crate tests
     // pair write_header with read_header).
     use v8::ValueSerializerHelper as _;
     ser.write_header();
     if ser.write_value(context, value) != Some(true) {
-        return clone_write_failure(&mut tc, &sab_refused);
+        return clone_write_failure(tc, &sab_refused);
     }
     let data = ser.release();
-    let de = v8::ValueDeserializer::new(&mut tc, Box::new(CloneDeserializer), &data);
+    let de = v8::ValueDeserializer::new(tc, Box::new(CloneDeserializer), &data);
     // The header (wire-format version) precedes any value; read it first.
     use v8::ValueDeserializerHelper as _;
     // deserialize_failure below names its error DataCloneError only when
     // the run's ArrayBuffer budget refused a backing store while V8
     // rebuilt the value: the mark is cleared here and read on failure, so
     // an earlier refusal is never attributed to this clone.
-    let budget = world_mut(&mut tc).ab_budget.clone();
+    let budget = world_mut(tc).ab_budget.clone();
     budget.clear_refused();
     if de.read_header(context) != Some(true) {
-        return rethrow_or_throw(
-            &mut tc,
-            "structuredClone: could not decode the serialized value",
-        );
+        return rethrow_or_throw(tc, "structuredClone: could not decode the serialized value");
     }
     match de.read_value(context) {
         Some(v) => {
             if buffer_mismatch(value, v) {
                 return throw_named(
-                    &mut tc,
+                    tc,
                     "DataCloneError",
                     "value could not be cloned: buffer allocation failed",
                 );
             }
             rv.set(v)
         }
-        None => deserialize_failure(&mut tc, budget.take_refused()),
+        None => deserialize_failure(tc, budget.take_refused()),
     }
 });
 
@@ -196,7 +193,10 @@ guest_cb!(structured_clone, |args, rv, scope| {
 /// failure keeps its identity: a RangeError from V8's own recursion limit
 /// on deeply nested values stays a RangeError (the budget never refused),
 /// and a caught exception that is not an Error object keeps its shape.
-fn deserialize_failure(tc: &mut v8::TryCatch<v8::HandleScope>, budget_refused: bool) {
+fn deserialize_failure(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    budget_refused: bool,
+) {
     match (tc.exception(), budget_refused) {
         (Some(exc), true) if exc.is_native_error() => {
             throw_named_error(tc, exc, "DataCloneError");
@@ -231,7 +231,10 @@ fn buffer_mismatch(orig: v8::Local<v8::Value>, cloned: v8::Local<v8::Value>) -> 
 /// a failure with no exception at all gets a named one. In every case
 /// the exception is rethrown - a TryCatch that drops a caught exception
 /// swallows it.
-fn clone_write_failure(tc: &mut v8::TryCatch<v8::HandleScope>, sab_refused: &Cell<bool>) {
+fn clone_write_failure(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    sab_refused: &Cell<bool>,
+) {
     let exc = match (tc.exception(), sab_refused.get()) {
         (Some(exc), true) => exc,
         (Some(_), false) => {
@@ -250,7 +253,10 @@ fn clone_write_failure(tc: &mut v8::TryCatch<v8::HandleScope>, sab_refused: &Cel
 /// A caught exception (for example from a throwing getter the
 /// deserializer ran) must be rethrown, not replaced: dropping the
 /// TryCatch would swallow it.
-fn rethrow_or_throw(tc: &mut v8::TryCatch<v8::HandleScope>, msg: &str) {
+fn rethrow_or_throw(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    msg: &str,
+) {
     if tc.has_caught() {
         tc.rethrow();
     } else {

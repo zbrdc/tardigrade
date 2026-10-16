@@ -90,6 +90,20 @@ declare namespace vm {
 
     /** Stop listening on a port. */
     function close(port: number): void;
+
+    /**
+     * Send a request through a named operator capability. This member exists
+     * at runtime only when the run has an --allow-call grant; TypeScript
+     * cannot know which capabilities the operator granted.
+     *
+     * Both required arguments undergo JavaScript ToString coercion. Values
+     * whose conversion throws also throw here. The promise fulfills with the
+     * HTTP status and UTF-8 response text.
+     */
+    function request(
+      name: unknown,
+      body: unknown,
+    ): Promise<{ status: number; text: string }>;
   }
 
   namespace stdin {
@@ -200,6 +214,10 @@ declare namespace WebAssembly {
   class CompileError extends Error {}
   class LinkError extends Error {}
   class RuntimeError extends Error {}
+  class SuspendError extends Error {}
+  class Suspending {
+    constructor(func: (...args: any[]) => any);
+  }
   /** The built-in tag for JavaScript values crossing an exception
    *  boundary. */
   const JSTag: Tag;
@@ -213,4 +231,5 @@ declare namespace WebAssembly {
     imports?: Record<string, unknown>,
   ): Promise<Instance>;
   function validate(bytes: ArrayBuffer | ArrayBufferView): boolean;
+  function promising(func: (...args: any[]) => any): (...args: any[]) => Promise<any>;
 }

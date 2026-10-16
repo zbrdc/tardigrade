@@ -20,9 +20,23 @@ thread, the watchdog and the stdin reader all inherit the layers, and so
 does every later run in the same process. The library refuses to apply the
 layers once that host thread exists.
 
+With CLI `--run-manifest=FILE`, the prepared record is
+written, synced, and closed before sandbox application; it is not written
+from inside the sandbox and its descriptor is not retained. This adds no
+Landlock rule or descriptor exception: the existing network-sidecar fd
+exception is unchanged. Because the manifest contains opt-in content hashes
+that reveal equality and can enable dictionary/guessing attacks against
+low-entropy inputs, use a trusted output directory.
+
 Before installing the filters, tardigrade closes every inherited file descriptor
 numbered 3 or higher (anything passed in would be a channel out of the
-sandbox) and sets `PR_SET_NO_NEW_PRIVS`. The seccomp filters are installed
+sandbox) and sets `PR_SET_NO_NEW_PRIVS`. One exception: when network
+capabilities are granted, the socketpair fd to the `net-sidecar`
+subprocess — created by tardigrade itself before the layers are applied,
+never inherited from the caller — is preserved (`keep_fd` in
+`sandbox::apply`). The guest has no API to touch that fd directly; only
+the `vm.net.request` binding writes to it, and seccomp still denies
+every socket call in the guest process. The seccomp filters are installed
 with `TSYNC`, so they cover every thread.
 
 ## Landlock
