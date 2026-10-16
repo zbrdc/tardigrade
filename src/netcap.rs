@@ -405,7 +405,14 @@ fn perform(
         .max_response_bytes
         .saturating_mul(6)
         .saturating_add(FRAME_HEADROOM_BYTES);
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| format!("network: {e}"))?);
+    // The sandbox's seccomp deny list refuses every socket syscall in
+    // this process, so the reply cannot be read as a UnixStream: its Read
+    // maps to recvfrom(2), refused with EPERM. A File over the dup fd
+    // reads with plain read(2), which the sandbox allows; the dup shares
+    // the socket (and its SO_RCVTIMEO) with the wire stream.
+    let read_fd =
+        std::os::fd::OwnedFd::from(stream.try_clone().map_err(|e| format!("network: {e}"))?);
+    let mut reader = BufReader::new(std::fs::File::from(read_fd));
     let line = match read_frame_capped(&mut reader, line_cap) {
         Ok(Some(line)) => line,
         Ok(None) | Err(FrameError::Truncated) => {

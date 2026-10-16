@@ -3909,6 +3909,68 @@ mod sandbox_run {
         );
     }
 
+    /// vm.net under the sandbox: the seccomp layer denies every socket
+    /// syscall in this process, so the sidecar reply must come back over
+    /// the kept fd with a plain read(2). A UnixStream reader would issue
+    /// recvfrom(2), which the deny list refuses with EPERM; this test
+    /// guards that regression (the guest socket syscalls stay denied).
+    #[test]
+    fn sandbox_net_request_reaches_the_granted_local_endpoint() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Bounded accept: a guest that never connects must fail the
+        // assertions below, not hang the suite on join.
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        conn.set_nonblocking(false).unwrap();
+                        conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .unwrap();
+                        let mut buf = [0u8; 4096];
+                        let _ = conn.read(&mut buf);
+                        conn.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                        )
+                        .unwrap();
+                        return;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let grant = format!("--allow-call=local=http://127.0.0.1:{port}/x,POST");
+        let path = script(
+            "sb-net-request",
+            r#"(async () => {
+                const res = await vm.net.request("local", "ping");
+                console.log(res.status, res.text);
+            })().catch(e => console.log("ERR", String(e && e.message || e)));
+            "#,
+        );
+        let args = [
+            grant.as_str(),
+            "--net-allow-private",
+            path.to_str().unwrap(),
+        ];
+        let Some(r) = sandboxed(
+            "sandbox_net_request_reaches_the_granted_local_endpoint",
+            &args,
+            b"",
+        ) else {
+            return;
+        };
+        server.join().unwrap();
+        assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+        assert_eq!(r.stdout, "200 hello\n", "stdout: {}", r.stdout);
+    }
+
     /// Waits for the child to carry a seccomp filter, so a serve run that
     /// silently skipped the sandbox fails instead of passing on output alone.
     fn wait_for_seccomp(pid: u32) {
