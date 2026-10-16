@@ -118,9 +118,19 @@ is created by the engine, not by the JS constructor, and growing it
 through the module's own exports cannot be intercepted from the
 prelude; that path is what `--rss-cap=<mb>` exists for (the watchdog
 samples the process RSS and stops the run as a heap-cap hit past it).
-Against untrusted code, still treat the in-process caps as one layer
-and set an OS limit (for example `prlimit --as`, or a cgroup memory
-limit) around the process as well.
+On Linux, requesting a nonzero RSS cap requires a readable, valid
+`/proc/self/status` sample before guest entry. An unavailable or invalid
+startup sample refuses the run with exit 70; if a later sample fails, the
+run ends with exit 70 and `tardigrade: cannot sample process RSS` when that
+reason wins termination arbitration (a recorded guest `vm.exit` still
+precedes it). The cap is disabled by default and that path performs no proc
+read. The current `--sandbox` profile blocks the proc read, so `--sandbox`
+plus a nonzero RSS cap is deliberately refused with exit 70 rather than
+silently running without monitoring. This does not make RSS measurement
+available inside that sandbox or make it a hard process limit. Against
+untrusted code, still treat the in-process caps as one layer and set external
+OS bounds (for example `prlimit --as` and `--cpu`, a cgroup memory/CPU limit,
+or a supervisor wall-clock deadline) around the process as well.
 
 Host-side state is not counted against `--memory` either: the RAM
 filesystem (bounded by `--fs-quota`, unbounded with `--fs-quota=0`) and

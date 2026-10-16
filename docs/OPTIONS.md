@@ -86,12 +86,22 @@ The cap has exact rules and known gaps, described in
 ### --rss-cap=\<mb\>
 
 Linux only. Caps the whole process's resident set size (MiB): the
-watchdog samples `/proc/self/status` every 25 ms and stops the run as a
-heap-cap hit (exit 137) past the cap. This is the backstop for memory
-no in-process allocator can see — a WebAssembly memory a module
-defines internally, for example. It counts the whole process, so it
-fits one guest per process; leave headroom over the baseline RSS
-(`--memory` measures something else). Default 0 (disabled).
+watchdog checks `/proc/self/status` before guest entry and then samples it
+every 25 ms. A valid sample past the cap stops the run as a heap-cap hit
+(exit 137). If the requested sampler is unavailable or its data is invalid
+at startup, the run is refused before guest entry with exit 70; a later
+sampling failure that wins termination arbitration ends the run with exit 70
+and a diagnostic (a recorded guest `vm.exit` still takes precedence). Default
+0 (disabled), which does not read or validate proc RSS.
+
+The current `--sandbox` profile does not allow reading `/proc/self/status`,
+so combining it with a nonzero `--rss-cap` is refused with exit 70 rather
+than measuring RSS. No sandbox permission is added for this option. RSS is
+the backstop for memory no in-process allocator can see — a WebAssembly
+memory a module defines internally, for example — and counts the whole
+process, so it fits one guest per process; leave headroom over baseline RSS
+(`--memory` measures something else). It is not a substitute for external OS
+resource limits.
 
 ### --module
 

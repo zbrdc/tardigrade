@@ -97,12 +97,14 @@ impl LoopWake {
 /// Why a run was terminated from outside guest code. CommandTimeout is
 /// serve-only: it is set by the per-command watchdog, recovered by
 /// serve_loop, and never delivered as a run-level stop by the run
-/// watchdog.
+/// watchdog. RssUnavailable means a requested Linux RSS sample failed after
+/// watchdog admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TermReason {
     Timeout,
     Oom,
     CommandTimeout,
+    RssUnavailable,
 }
 
 /// Shared termination state: the watchdog thread and the heap callbacks
@@ -155,6 +157,7 @@ impl Termination {
             TermReason::Timeout => 1,
             TermReason::Oom => 2,
             TermReason::CommandTimeout => 3,
+            TermReason::RssUnavailable => 4,
         };
         // Store and notify under the lock the waiter checks its predicate
         // under: without it, a mark between the waiter's check and its wait
@@ -175,6 +178,7 @@ impl Termination {
             1 => Some(TermReason::Timeout),
             2 => Some(TermReason::Oom),
             3 => Some(TermReason::CommandTimeout),
+            4 => Some(TermReason::RssUnavailable),
             _ => None,
         }
     }
@@ -352,7 +356,8 @@ impl World {
     }
 
     /// Concludes a terminated run: a guest vm.exit() code wins, then the
-    /// heap cap (137, reported once on stderr), then the watchdog (124).
+    /// heap cap (137, reported once on stderr), then RSS unavailability
+    /// (70), then the watchdog (124).
     /// A command timeout maps to [COMMAND_TIMEOUT_CODE]: only serve_loop
     /// sees that value, and it recovers the session instead of ending it.
     /// Exactly one caller concludes the run; `take` makes a stray second
@@ -368,6 +373,10 @@ impl World {
                 137
             }
             Some(TermReason::CommandTimeout) => COMMAND_TIMEOUT_CODE,
+            Some(TermReason::RssUnavailable) => {
+                eprintln!("tardigrade: cannot sample process RSS");
+                70
+            }
             _ => 124,
         }
     }
@@ -562,5 +571,29 @@ mod tests {
         assert_eq!(w.take_terminated_exit(), COMMAND_TIMEOUT_CODE);
         assert_eq!(w.term.reason(), None, "taken, like every reason");
         assert!(!w.is_leaving(), "the leaving guard fell with it");
+    }
+
+    #[test]
+    fn unavailable_rss_maps_to_70_and_is_consumed_once() {
+        let mut w = World::new(0, RunClock::Real(Instant::now()));
+        assert!(w.term.mark(TermReason::RssUnavailable));
+        assert_eq!(w.term.reason.load(Ordering::SeqCst), 4);
+        assert_eq!(w.term.reason(), Some(TermReason::RssUnavailable));
+        assert_eq!(w.take_terminated_exit(), 70);
+        assert_eq!(w.term.reason(), None, "the reason is consumed");
+        assert_eq!(w.take_terminated_exit(), 124, "no second report");
+    }
+
+    #[test]
+    fn guest_exit_still_precedes_unavailable_rss() {
+        let mut w = World::new(0, RunClock::Real(Instant::now()));
+        assert!(w.term.mark(TermReason::RssUnavailable));
+        w.set_exit_code(23);
+        assert_eq!(w.take_terminated_exit(), 23);
+        assert_eq!(
+            w.term.reason(),
+            Some(TermReason::RssUnavailable),
+            "guest exit precedence does not consume the run-level reason"
+        );
     }
 }

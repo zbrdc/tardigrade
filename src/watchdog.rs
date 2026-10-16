@@ -40,27 +40,81 @@ const DELIVER_SLICE: Duration = Duration::from_millis(2);
 const RSS_SAMPLE: Duration = Duration::from_millis(25);
 
 /// Parses the `VmRSS:` line of /proc/self/status into bytes.
-fn parse_vmrss(status: &str) -> Option<u64> {
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    kb.checked_mul(1024)
+fn parse_vmrss(status: &str) -> std::io::Result<u64> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid VmRSS");
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .ok_or_else(invalid)?;
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some("VmRSS:") {
+        return Err(invalid());
+    }
+    let kb: u64 = fields
+        .next()
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    if fields.next() != Some("kB") || fields.next().is_some() {
+        return Err(invalid());
+    }
+    kb.checked_mul(1024).ok_or_else(invalid)
 }
 
 /// Current resident set size in bytes (Linux only; the RSS cap is a
 /// no-op elsewhere, like the other kernel-bound layers).
-fn current_rss_bytes() -> Option<u64> {
+fn current_rss_bytes() -> std::io::Result<u64> {
     #[cfg(target_os = "linux")]
     {
-        parse_vmrss(&std::fs::read_to_string("/proc/self/status").ok()?)
+        parse_vmrss(&std::fs::read_to_string("/proc/self/status")?)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        None
+        Ok(0)
     }
 }
 
-fn rss_exceeded(cap_bytes: u64) -> bool {
-    cap_bytes > 0 && current_rss_bytes().is_some_and(|rss| rss > cap_bytes)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RssSample {
+    Disabled,
+    WithinCap,
+    Exceeded,
+}
+
+/// Per-watchdog sampler seam: disabled caps and non-Linux builds never call
+/// the reader; a requested Linux sample must be valid.
+fn sample_rss_with(
+    cap_bytes: u64,
+    read: impl FnOnce() -> std::io::Result<u64>,
+) -> std::io::Result<RssSample> {
+    #[cfg(target_os = "linux")]
+    {
+        if cap_bytes == 0 {
+            return Ok(RssSample::Disabled);
+        }
+        let rss = read()?;
+        Ok(if rss > cap_bytes {
+            RssSample::Exceeded
+        } else {
+            RssSample::WithinCap
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cap_bytes, read);
+        Ok(RssSample::Disabled)
+    }
+}
+
+/// Apply one runtime sample to the existing first-wins termination state.
+/// Returning a reason means this caller won and must deliver it to V8.
+fn record_rss_sample(term: &Termination, sample: std::io::Result<RssSample>) -> Option<TermReason> {
+    let reason = match sample {
+        Ok(RssSample::Exceeded) => TermReason::Oom,
+        Err(_) => TermReason::RssUnavailable,
+        Ok(RssSample::Disabled | RssSample::WithinCap) => return None,
+    };
+    term.mark(reason).then_some(reason)
 }
 
 pub(crate) struct Watchdog {
@@ -82,6 +136,10 @@ impl Watchdog {
         term: Arc<Termination>,
         rss_cap_bytes: u64,
     ) -> std::io::Result<Self> {
+        // Admit a requested Linux sampler before any watchdog thread is
+        // spawned. In particular, never let an unavailable proc read look
+        // like a cap that has not been exceeded.
+        let _ = sample_rss_with(rss_cap_bytes, current_rss_bytes)?;
         let term2 = term.clone();
         #[cfg(test)]
         if FAIL_NEXT_RUN_SPAWN.swap(false, Ordering::SeqCst) {
@@ -111,14 +169,15 @@ impl Watchdog {
                     match term2.wait_for(wait_until) {
                         Wake::Finished => return,
                         Wake::Deadline => {
-                            if rss_exceeded(rss_cap_bytes)
-                                && term2.mark(TermReason::Oom) {
-                                    while !term2.is_finished() {
-                                        iso.terminate_execution();
-                                        std::thread::sleep(DELIVER_SLICE);
-                                    }
-                                    return;
+                            if let Some(_reason) =
+                                record_rss_sample(&term2, sample_rss_with(rss_cap_bytes, current_rss_bytes))
+                            {
+                                while !term2.is_finished() {
+                                    iso.terminate_execution();
+                                    std::thread::sleep(DELIVER_SLICE);
                                 }
+                                return;
+                            }
                             if deadline.is_none_or(|d| Instant::now() < d) {
                                 // A sample wake, not the deadline.
                                 continue;
@@ -340,9 +399,84 @@ mod tests {
     #[test]
     fn parse_vmrss_reads_kibibytes_as_bytes() {
         let status = "Name:\ttardigrade\nVmRSS:\t  12345 kB\nVmSize:\t 999999 kB\n";
-        assert_eq!(super::parse_vmrss(status), Some(12345 * 1024));
-        assert_eq!(super::parse_vmrss("no rss here"), None);
-        assert_eq!(super::parse_vmrss("VmRSS:\t??? kB"), None);
+        assert_eq!(super::parse_vmrss(status).unwrap(), 12345 * 1024);
+        assert_eq!(
+            super::parse_vmrss("no rss here").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            super::parse_vmrss("VmRSS:\t??? kB").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            super::parse_vmrss("VmRSS:\t123 elephants")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            super::parse_vmrss("VmRSS:\t18446744073709551615 kB")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn disabled_rss_cap_does_not_call_the_reader() {
+        assert_eq!(
+            sample_rss_with(0, || panic!("disabled cap must not read RSS")).unwrap(),
+            RssSample::Disabled
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn startup_rss_sampler_rejects_reader_and_parse_failures() {
+        let read_error = sample_rss_with(1, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "proc denied",
+            ))
+        });
+        assert_eq!(
+            read_error.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            sample_rss_with(1, || parse_vmrss("VmRSS: invalid kB"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn runtime_rss_sampling_failure_marks_unavailable_unless_a_reason_won() {
+        let term = Termination::new();
+        let sample = sample_rss_with(1, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "proc denied after admission",
+            ))
+        });
+        assert_eq!(
+            record_rss_sample(&term, sample),
+            Some(TermReason::RssUnavailable)
+        );
+        assert_eq!(term.reason(), Some(TermReason::RssUnavailable));
+
+        let competing = Termination::new();
+        assert!(competing.mark(TermReason::CommandTimeout));
+        let sample = sample_rss_with(1, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "proc denied after admission",
+            ))
+        });
+        assert_eq!(record_rss_sample(&competing, sample), None);
+        assert_eq!(competing.reason(), Some(TermReason::CommandTimeout));
     }
 
     #[test]
