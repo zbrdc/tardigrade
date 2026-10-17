@@ -7,8 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::var("CARGO_TARGET_TMPDIR").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(dir).join(name)
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
 }
 
 #[test]
