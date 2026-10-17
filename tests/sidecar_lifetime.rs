@@ -103,3 +103,84 @@ fn sidecar_dies_with_sigkilled_guest() {
     }
     drop(hold);
 }
+#[test]
+fn sidecar_dies_with_sigkilled_sandboxed_guest() {
+    // FU-37 regression: PDEATHSIG delivery is unreliable for sandboxed
+    // guests, so the sidecar must notice the closed wire instead. Same
+    // shape as the unsandboxed test, plus --sandbox.
+    use std::io::Read;
+    use std::sync::mpsc;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, _rx) = mpsc::channel();
+    let _hold = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = tx.send(());
+                    conn.set_nonblocking(false).unwrap();
+                    conn.set_read_timeout(Some(Duration::from_secs(15)))
+                        .unwrap();
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf);
+                    let _ = conn.read(&mut buf);
+                    return;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+
+    let app = scratch("sidecar_lifetime_sandboxed.js");
+    std::fs::write(
+        &app,
+        "vm.net.request(\"slow\", \"x\").then(\n  (r) => console.log(\"reply \" + JSON.stringify(r)),\n  (e) => console.error(\"err \" + String(e))\n);\n",
+    )
+    .unwrap();
+
+    let mut guest = Command::new(env!("CARGO_BIN_EXE_tardigrade"))
+        .arg(&app)
+        .arg(format!("--allow-call=slow=http://127.0.0.1:{port}/"))
+        .arg("--net-allow-private")
+        .arg("--net-timeout=30000")
+        .arg("--timeout=0")
+        .arg("--sandbox")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let spawn_deadline = Instant::now() + Duration::from_secs(5);
+    let sidecar = loop {
+        if let Some(&pid) = children_of(guest.id()).first() {
+            std::thread::sleep(Duration::from_millis(200));
+            break pid;
+        }
+        assert!(
+            Instant::now() < spawn_deadline,
+            "net-sidecar never appeared as a child of the sandboxed guest"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    guest.kill().unwrap();
+    let _ = guest.wait();
+
+    let gone_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let dead = unsafe { libc::kill(sidecar as libc::pid_t, 0) == -1 }
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if dead {
+            break;
+        }
+        assert!(
+            Instant::now() < gone_deadline,
+            "net-sidecar {sidecar} outlived a SIGKILLed sandboxed guest (FU-37 regression)"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

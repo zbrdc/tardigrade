@@ -734,6 +734,33 @@ guest_cb!(net_request, |args, rv, scope| {
 /// line-delimited requests on stdin, writes line-delimited responses on
 /// stdout, exits on EOF. Returns the process exit code.
 pub fn run_sidecar() -> i32 {
+    /// True when the wire (stdin, fd 0) has reached EOF: the guest is gone.
+    /// PDEATHSIG delivery proved unreliable for sandboxed guests (FU-37), so
+    /// the sidecar double-checks the wire while a request is in flight.
+    fn wire_at_eof() -> bool {
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll(2) on fd 0 with a zero timeout; no mutation beyond pfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc != 1 || pfd.revents & libc::POLLIN == 0 {
+            return false;
+        }
+        // SAFETY: recv with MSG_PEEK | MSG_DONTWAIT reads nothing away.
+        let mut byte = [0u8; 1];
+        let n = unsafe {
+            libc::recv(
+                0,
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        n == 0
+    }
+
     // Confine this process before it touches the policy or the network:
     // it is the one component with real sockets, so it gets its own
     // Landlock/seccomp profile (see sandbox::apply_sidecar_profile).
@@ -875,16 +902,43 @@ pub fn run_sidecar() -> i32 {
                 Ok(false) => {}
             }
         }
-        let request = agent
-            .request(method.as_str(), url)
-            .set("Content-Type", "application/json");
-        let response = if method == "GET" {
-            request.call()
-        } else {
-            request
-                .set("Content-Type", "application/json")
-                .send_string(body)
-        };
+        // FU-37: run the HTTP call on a worker thread while watching the
+        // wire. A dead guest closes the wire; an in-flight request must
+        // not outlive it waiting for a slow or silent endpoint.
+        let worker_agent = agent.clone();
+        let worker_url = url.clone();
+        let worker_method = method.clone();
+        let worker_body = body.to_string();
+        let worker = std::thread::spawn(move || {
+            let request = worker_agent
+                .request(worker_method.as_str(), &worker_url)
+                .set("Content-Type", "application/json");
+            // Boxed: clippy result_large_err - ureq::Error is 272 bytes.
+            if worker_method == "GET" {
+                request.call().map_err(Box::new)
+            } else {
+                request
+                    .set("Content-Type", "application/json")
+                    .send_string(&worker_body)
+                    .map_err(Box::new)
+            }
+        });
+        let mut wire_eof = false;
+        while !worker.is_finished() {
+            if wire_at_eof() {
+                wire_eof = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if wire_eof {
+            eprintln!("net-sidecar: wire closed during a request; exiting");
+            std::process::exit(0);
+        }
+        let response: Result<ureq::Response, ureq::Error> = worker
+            .join()
+            .unwrap_or_else(|_| std::process::exit(2))
+            .map_err(|boxed| *boxed);
         match response {
             Ok(resp) => reply_with_body(&mut out, id, resp, &mut budget),
             Err(ureq::Error::Status(_code, resp)) => {
