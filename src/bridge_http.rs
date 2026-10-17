@@ -72,9 +72,13 @@ pub fn read_request(stream: &mut TcpStream) -> ReadOutcome {
         return ReadOutcome::Bad;
     };
     let mut parts = request_line.split_whitespace();
-    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+    let (Some(method), Some(path), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
         return ReadOutcome::Bad;
     };
+    if !version.starts_with("HTTP/") {
+        return ReadOutcome::Bad;
+    }
     let method = method.to_string();
     let path = path.to_string();
 

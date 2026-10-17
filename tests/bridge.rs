@@ -156,3 +156,67 @@ fn a_dead_worker_answers_502_and_is_replaced() {
     assert_eq!(get(port, "/fast", "x"), (200, "ok".to_string()));
     stop(child);
 }
+
+/// Sends raw bytes and returns the reply's status, if any.
+fn raw(port: u16, bytes: &[u8]) -> Option<u16> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let _ = stream.write_all(bytes);
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    text.split_whitespace().nth(1).and_then(|s| s.parse().ok())
+}
+
+#[test]
+fn hostile_requests_get_defined_answers_and_leave_the_bridge_healthy() {
+    let (child, port) = start_bridge(&["--workers=1", "--addr=127.0.0.1:0"]);
+    // Garbage request line.
+    assert_eq!(raw(port, b"not http at all\r\n\r\n").unwrap(), 400);
+    // A single header line past the 8 KiB cap.
+    let mut flood = b"POST / HTTP/1.1\r\nX-Flood: ".to_vec();
+    flood.extend(std::iter::repeat_n(b'a', 9 * 1024));
+    flood.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(raw(port, &flood).unwrap(), 400);
+    // More headers than the cap allows.
+    let mut many = b"POST / HTTP/1.1\r\n".to_vec();
+    for i in 0..200 {
+        many.extend_from_slice(format!("X-N{i}: v\r\n").as_bytes());
+    }
+    many.extend_from_slice(b"\r\n");
+    assert_eq!(raw(port, &many).unwrap(), 400);
+    // A client that vanishes mid-request must not disturb anyone.
+    {
+        let mut ghost = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let _ = ghost.write_all(b"POST /slow HTTP/1.1\r\nContent-Length: 10\r\n\r\nsho");
+        drop(ghost);
+    }
+    // The bridge answers normally after all of it.
+    assert_eq!(get(port, "/fast", "x"), (200, "ok".to_string()));
+    stop(child);
+}
+
+#[test]
+fn an_overload_burst_returns_a_defined_mixture_and_recovers() {
+    let (child, port) = start_bridge(&["--workers=1", "--queue-depth=0", "--addr=127.0.0.1:0"]);
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        handles.push(std::thread::spawn(move || get(port, "/slow", "x").0));
+    }
+    let mut ok = 0;
+    let mut refused = 0;
+    for h in handles {
+        match h.join().unwrap() {
+            200 => ok += 1,
+            503 => refused += 1,
+            other => panic!("undefined answer {other} under overload"),
+        }
+    }
+    assert!(ok >= 1, "at least the served request must succeed");
+    assert!(refused >= 1, "overload must produce defined 503s");
+    // Recovery: the pool still works after the burst.
+    assert_eq!(get(port, "/fast", "x"), (200, "ok".to_string()));
+    stop(child);
+}

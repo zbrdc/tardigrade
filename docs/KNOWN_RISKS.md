@@ -148,6 +148,11 @@ example:
 or the equivalent cgroup `memory.max`/`cpu.max`. The in-process caps
 above cannot substitute for this: they do not cover WebAssembly memory,
 resizable buffers, or the abort shapes under [Process aborts](#process-aborts).
+The bundled supervisor implements exactly this boundary with process-group
+reaping (docs/SUPERVISOR_CONTRACT.md):
+
+    tardigrade-supervise --deadline=65000 -- \
+      tardigrade --sandbox --memory=64 --rss-cap=512 guest.js
 
 ### Other limits
 
