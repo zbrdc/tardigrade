@@ -48,7 +48,7 @@ owner decision of 2026-10-17.
 | FU-11 | Inventory PASS; execution open | Cached TypeScript 5.9.3 exists, but that is not proof the pinned npx fallback resolves offline or its test runs. Verify only with no-fetch prerequisites and a whole-test outer deadline. |
 | FU-12 | Artifact blocked | Guest TypeScript/Wasm still lacks a supplied matching `TSC_RUST_WASM` artifact. Its pinned build/hash requirements are recorded; do not fetch/build it or claim a pass without approval. |
 | FU-13 | Open | Fresh offline dependency-advisory and bounded fuzz validation where installed tools/databases permit it. Separate actual results from unavailable tooling; normal `make ci` does not run the fuzz workspace. |
-| FU-14 | Decision; evaluation blocked offline | V8 internal sandbox is not enabled in the current prebuilt engine. Assessing a matching sandbox-enabled build requires building or obtaining one, which is outside the offline boundary; the decision stays open and unscheduled, not silently dropped. Pointer compression is not that sandbox. The landed P0-P3 containment (per-process isolation, supervisor group reaping, fail-closed RSS, bundle runtime identity) is the enforced boundary meanwhile. |
+ + fu14 + 
 | FU-15 | Needs current evidence | Reconcile the older NUMA/tty seccomp audit with current filters, documentation and tests. Close with current source/probe evidence if already fixed; otherwise create an owned-child-only regression task. |
 | FU-16 | Needs current evidence | Revalidate prebuilt V8 archive integrity and cached `gn_out` trust against the locked crate/CI. Older observations are leads, not a new confirmed vulnerability. No corrupted-archive execution or cache mutation in this inventory step. |
 | FU-17 | Open | Audit documentation drift after the V8 upgrade: old version/advisory references and incomplete test-target tables. Change only verified stale statements, not normative security claims. |
@@ -58,8 +58,8 @@ owner decision of 2026-10-17.
 
 | ID | State | Outstanding item and decision/acceptance requirement |
 |---|---|---|
-| FU-19 | Decision | Reliable build identity: define injected versus derived identity, dirty/source-archive behavior and unknown/null handling. A package version is not a build identity or attestation. |
-| FU-20 | Decision | Secret capability-policy identity: define privacy, key ownership/rotation and comparison semantics. Do not add an unkeyed hash that enables credential guessing. |
+ + fu19.replace(chr(39), chr(92)+chr(39)) + 
+ + fu20.replace(chr(39), chr(92)+chr(39)) + 
 | FU-21 | Decision | Embedding-library manifest interface. Keep it separate from the completed binary-only flag; do not add public Config fields incidentally. |
 | FU-22 | Decision | Optional arguments/stdin/serve-command capture with explicit secret handling, bounds and retention. Current omission is intentional. |
 | FU-23 | Decision | Observe and hash the module graph from bytes actually consumed; define dynamic imports, ordering and failure cases. Do not hash an arbitrary directory and call it execution provenance. |

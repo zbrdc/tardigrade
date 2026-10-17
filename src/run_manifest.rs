@@ -33,7 +33,7 @@ pub(crate) fn describe(cfg: &tardigrade::Config, inputs: Inputs<'_>) -> serde_js
         "runtime": {
             "tardigrade": {
                 "package_version": env!("CARGO_PKG_VERSION"),
-                "build_identity": null,
+                "build_identity": tardigrade::BUILD_ID,
             },
             "v8": {
                 "engine_version": v8::V8::get_version(),

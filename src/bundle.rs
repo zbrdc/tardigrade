@@ -33,6 +33,13 @@ pub fn engine_version() -> String {
     v8::V8::get_version().to_string()
 }
 
+/// The build identity this runtime carries (FU-19): Some(id) when
+/// TARDIGRADE_BUILD_ID was set at compile time, None otherwise. A bundle
+/// may pin on it the same way it pins on the engine version.
+pub fn build_id() -> Option<&'static str> {
+    crate::BUILD_ID
+}
+
 fn sha256(bytes: &[u8]) -> String {
     let digest = digest(&SHA256, bytes);
     digest

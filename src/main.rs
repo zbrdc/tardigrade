@@ -220,10 +220,15 @@ fn main() {
         // Machine-readable identity for supervisors and wrappers (mossbed
         // pins on this): one JSON line, package version plus the exact
         // engine string a bundle must match.
+        let build_id = match tardigrade::BUILD_ID {
+            Some(id) => format!("\"{id}\""),
+            None => "null".to_string(),
+        };
         println!(
-            "{{\"tardigrade\": \"{}\",\"v8\": \"{}\"}}",
+            "{{\"tardigrade\": \"{}\",\"v8\": \"{}\",\"build_id\": {}}}",
             env!("CARGO_PKG_VERSION"),
-            tardigrade::bundle::engine_version()
+            tardigrade::bundle::engine_version(),
+            build_id,
         );
         return;
     }

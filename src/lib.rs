@@ -16,6 +16,13 @@
 mod api;
 pub mod bridge_http;
 pub mod bundle;
+
+/// Compile-time build identity: set via TARDIGRADE_BUILD_ID during a
+/// reproducible build (FU-19). None means the identity is unknown — the
+/// binary was built without an injected identity, and callers must not
+/// treat two such binaries as the same build.
+pub const BUILD_ID: Option<&str> = option_env!("TARDIGRADE_BUILD_ID");
+
 mod clock;
 mod console;
 mod diag;
