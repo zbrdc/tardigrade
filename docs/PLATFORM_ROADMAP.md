@@ -37,7 +37,7 @@ process without touching the deployment identity.
 
 | Priority | Deliverable | Acceptance gate |
 |---|---|---|
-| P0 | FU-04 external supervisor contract | Hung, crashed or OOM-killed guests are reaped; sidecars cannot survive worker termination |
+| P0 | FU-04 external supervisor contract (landed 2026-10-17, docs/SUPERVISOR_CONTRACT.md) | Hung, crashed or OOM-killed guests are reaped; sidecars cannot survive worker termination |
 | P1 | FU-07/FU-08 serving contract | Requests have explicit deadlines, response framing, cancellation and predictable state lifetime |
 | P2 | FU-35 bounded concurrency | Parallel requests run with admission limits and per-worker isolation; overload returns a defined response |
 | P3 | FU-36 deployment artifact | Snapshot, provenance, capability policy, runtime version and resource budgets are validated before execution |
