@@ -4,6 +4,10 @@ Reason: track remaining defects, evidence gaps and explicitly optional extension
 after the combined runtime landing at `8b78f87`. This is a work queue, not a
 claim that every design limitation can or should be removed.
 
+Platform direction and priority order (supervisor and serving before
+concurrency and deployment) are recorded in docs/PLATFORM_ROADMAP.md,
+owner decision of 2026-10-17.
+
 ## Authority and completion rules
 
 - Parent owns priorities, APIs, accounting, lifecycle and security contracts.
@@ -27,13 +31,13 @@ claim that every design limitation can or should be removed.
 | ID | State | Outstanding item and acceptance requirement |
 |---|---|---|
 | FU-01 | Investigation PASS; fix open | Both blocked stdout and stderr reproduced with bounded owned children. Keep the in-process limitation open; no global fd changes, unbounded queues or detached blocked writers. Freeze CLI/library/serve semantics before code. |
-| FU-02 | Investigation PASS; implementation open | Hard process deadline/failure containment still needs a verified deployment boundary. Sidecar reaping, bridge pipe waits and fatal-path dumps are not guaranteed. No unsafe crash probes on shared infrastructure. |
+| FU-02 | Investigation PASS; implementation open; Roadmap P0 gate | Hard process deadline/failure containment still needs a verified deployment boundary. Sidecar reaping, bridge pipe waits and fatal-path dumps are not guaranteed. P0 acceptance gate (with FU-04): hung, crashed or OOM-killed guests are reaped; sidecars cannot survive worker termination. No unsafe crash probes on shared infrastructure. |
 | FU-03 | Landed on main; envelope open | Fail-closed Linux monitoring landed as `eb78add` (rebase of privately reviewed `de11a66`, tree `2d8a40f`). Requested monitoring fails closed with 70 if sampling is unavailable; no permissions were added or in-cage measurement claimed. Integrated gates passed on the rebased tree: fmt, full offline test suite, release clippy `-D warnings` and `make check`. Broader Wasm/host/snapshot memory envelopes remain open. |
-| FU-04 | Parent: external boundary first | Start with an existing external-supervisor contract for one offline one-shot CLI guest, not a new library guarantee or default. Network sidecars, serve lifetime, descendants, output policy, status and OS bounds require explicit verification before broader support. |
+| FU-04 | Roadmap P0: external supervisor contract | Start with an existing external-supervisor contract for one offline one-shot CLI guest, not a new library guarantee or default. Acceptance gate: hung, crashed or OOM-killed guests are reaped; sidecars cannot survive worker termination. Network sidecars, serve lifetime, descendants, output policy, status and OS bounds require explicit verification before broader support. Worker/process/request identity separation per docs/PLATFORM_ROADMAP.md. |
 | FU-05 | Needs current evidence | Oversized preload diagnostics: an older runner probe reported allocation abort rather than clean quota refusal. Revalidate safely against this baseline with bounded synthetic data before any parser/accounting change. |
 | FU-06 | Corrected evidence PASS; inconclusive | The invalid static `InitializeICU()` remedy was withdrawn. The offline native diagnostic trapped in allocator initialization before any Intl result; it proves no native capability or restoration. Hold the diagnostic outside integration. No stub removal, guessed data, binding or repeated fatal probe. |
-| FU-07 | Decision | Library serve sessions default to no per-command timeout. Decide whether to retain that embedding contract or introduce an explicit compatible/major-version migration. Pending timers and I/O intentionally survive command timeout. |
-| FU-08 | Decision | `serve_bridge` remains a localhost demonstration with serial connections and bounded socket waits. Decide whether a production bridge is wanted; do not silently expand its exposure or build a new HTTP server. |
+| FU-07 | Roadmap P1: serving contract open | Library serve sessions default to no per-command timeout. The P1 contract must make request deadlines, response framing, cancellation and state lifetime explicit before implementation. Decide retain-versus-migrate for the embedding default; pending timers and I/O intentionally survive command timeout. |
+| FU-08 | Decision recorded 2026-10-17: productionize after P1 | `serve_bridge` remains a localhost demonstration until the FU-07 contract is frozen. Direction: production bridge yes, self-hosted single-tenant first; one in-flight request per guest process; concurrency via multiple sandboxed processes (FU-35), not multiple isolates in one process. Do not silently expand exposure or build a new HTTP server before the contract. |
 
 ## Validation and maintenance
 
@@ -71,6 +75,14 @@ claim that every design limitation can or should be removed.
 | FU-28 | Decision | Streaming responses, cancellation, backpressure and cumulative budgets. |
 | FU-29 | Decision | Per-capability rate limits with defined clocks and grant ownership. |
 | FU-30 | Decision | GET query templates and content-type selection. Current defaults remain opaque bodies and operator-controlled content type. |
+
+## Platform roadmap items (docs/PLATFORM_ROADMAP.md)
+
+| ID | State | Item and acceptance requirement |
+|---|---|---|
+| FU-34 | Open; required before P2 claims | Sidecar lifecycle security tests: redirects, DNS rebinding, private-network access, credential forwarding, oversized responses, cancellation, sidecar survival after guest termination. Capability budgets apply across the complete request lifecycle, not just individual wire frames. |
+| FU-35 | Blocked by P1 contract | Bounded concurrency: multiple independently sandboxed processes, one in-flight request per process, admission limits and a defined overload response. Starts only after the FU-07/FU-08 serving contract is frozen. |
+| FU-36 | After P2 | Deployment artifact: snapshot, provenance manifest, capability policy, runtime identity and resource budgets validated before execution; mismatch refuses the run. Consumes the FU-19..FU-25 decision outputs; no new format without a frozen contract. |
 
 ## Delivery and deliberate limits
 
