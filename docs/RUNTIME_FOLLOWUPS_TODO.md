@@ -91,6 +91,7 @@ owner decision of 2026-10-17.
 | FU-31 | Open | Cross-platform validation is separate from the exercised Linux x86_64/kernel path. Do not claim equivalent OS containment elsewhere. |
 | FU-32 | Gate | After accepted changes: integrated native CI, mandatory installed-tool TypeScript, all 16 mandatory sandbox probes, scope/blob/mode audit and reviewed TODO update. Disclose all skips and ignored tests. |
 | FU-33 | Operator decision | Version/changelog/release/push. Current combined commit marks the four new Rust Config fields as a compatibility break; no tag or publication has occurred. |
+| FU-37 | DEFECT (reproduced 2026-10-17): sidecar outlives a SIGKILLed guest under --sandbox | Without --sandbox the armed PR_SET_PDEATHSIG works (sidecar dies under 1.5 s). With --sandbox the sidecar stays alive (state=S, request in flight) past 15 s, despite strace confirming the child armed PR_SET_PDEATHSIG, SIGKILL = 0 in pre_exec and nothing in apply_sidecar_profile resetting it. Suspect a kernel interaction between the seccomp/landlock profile and pdeathsig delivery, or the creating-thread semantics. Until fixed, supervisors must group-kill (tardigrade-supervise, mossbed kill_guest); a crashed parent leaves orphans bounded by net-timeout, not instant death. |
 
 Deliberate boundaries: no Node/browser compatibility promise, hardware VM,
 unrestricted fetch/raw sockets/inbound guest networking, automatic session
