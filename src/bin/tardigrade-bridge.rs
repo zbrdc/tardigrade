@@ -16,6 +16,7 @@ use tardigrade::bridge_http::{map_reply, read_request, respond, ReadOutcome, SOC
 struct Worker {
     proc: Child,
     out: BufReader<std::process::ChildStdout>,
+    spawned_at: std::time::Instant,
 }
 
 impl Worker {
@@ -46,6 +47,7 @@ impl Worker {
             // One persistent reader: a fresh BufReader per call could
             // buffer past the reply line and silently discard the rest.
             out: BufReader::new(stdout),
+            spawned_at: std::time::Instant::now(),
         })
     }
 
@@ -81,6 +83,9 @@ struct Pool {
     command_timeout_ms: u64,
     guest_args: Vec<String>,
     app: String,
+    /// Workers older than this are replaced after finishing a request;
+    /// zero disables recycling (docs/BRIDGE_CONTRACT.md).
+    max_worker_age: std::time::Duration,
 }
 
 impl Pool {
@@ -111,6 +116,14 @@ impl Pool {
     }
 
     fn release(&self, worker: Worker) {
+        // Recycle on release, never mid-request: an aged worker finishes
+        // its in-flight request first, then is group-killed and replaced.
+        if self.max_worker_age > std::time::Duration::ZERO
+            && worker.spawned_at.elapsed() >= self.max_worker_age
+        {
+            self.replace(worker);
+            return;
+        }
         let mut idle = self.idle.lock().unwrap();
         idle.push(worker);
         drop(idle);
@@ -185,6 +198,7 @@ fn main() {
     let mut workers = 2usize;
     let mut queue_depth = 0usize;
     let mut command_timeout_ms = 30_000u64;
+    let mut max_worker_age_secs = 0u64;
     let mut rest: Vec<String> = Vec::new();
     let mut argv = std::env::args().skip(1).peekable();
     while let Some(arg) = argv.next() {
@@ -209,6 +223,12 @@ fn main() {
                     .parse()
                     .unwrap_or_else(|_| usage());
             }
+            _ if arg.starts_with("--max-worker-age=") => {
+                max_worker_age_secs = arg
+                    .trim_start_matches("--max-worker-age=")
+                    .parse()
+                    .unwrap_or_else(|_| usage());
+            }
             _ => usage(),
         }
     }
@@ -227,6 +247,7 @@ fn main() {
         command_timeout_ms,
         guest_args: rest,
         app,
+        max_worker_age: std::time::Duration::from_secs(max_worker_age_secs),
     });
     for _ in 0..workers {
         let w = Worker::spawn(&tardigrade, command_timeout_ms, &pool.guest_args, &pool.app)

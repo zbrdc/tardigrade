@@ -8,7 +8,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const APP: &str = r#"
+globalThis.hits = 0;
 globalThis.handler = async (req) => {
+  globalThis.hits += 1;
+  if (req.path === "/state") {
+    return { status: 200, type: "application/json", body: JSON.stringify({ hits: globalThis.hits }) };
+  }
   if (req.path === "/slow") {
     await new Promise((r) => setTimeout(r, 700));
     return { status: 200, body: "slow:" + req.body };
@@ -218,5 +223,25 @@ fn an_overload_burst_returns_a_defined_mixture_and_recovers() {
     assert!(refused >= 1, "overload must produce defined 503s");
     // Recovery: the pool still works after the burst.
     assert_eq!(get(port, "/fast", "x"), (200, "ok".to_string()));
+    stop(child);
+}
+
+#[test]
+fn aged_workers_are_recycled_after_their_request() {
+    // docs/BRIDGE_CONTRACT.md: --max-worker-age replaces a worker after it
+    // finishes a request, never mid-request; state resets with the worker.
+    let (child, port) = start_bridge(&["--workers=1", "--max-worker-age=1", "--addr=127.0.0.1:0"]);
+    let hits = |body: &str| {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["hits"]
+            .as_u64()
+            .unwrap()
+    };
+    let (_, first) = get(port, "/state", "");
+    assert_eq!(hits(&first), 1);
+    std::thread::sleep(std::time::Duration::from_millis(1300));
+    let (s, second) = get(port, "/state", "");
+    assert_eq!((s, hits(&second)), (200, 2), "still the aged worker");
+    let (s, third) = get(port, "/state", "");
+    assert_eq!((s, hits(&third)), (200, 1), "a fresh recycled worker");
     stop(child);
 }

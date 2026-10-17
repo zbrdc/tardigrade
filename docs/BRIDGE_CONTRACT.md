@@ -14,6 +14,15 @@ defines `globalThis.handler = (req) => ({status, body, type?})` with
 GUEST_FLAGS are passed to every worker before the app path (for example
 `--allow-call=...` grants). The bridge process is trusted host code.
 
+## Worker recycling
+
+`--max-worker-age=<seconds>` (default 0, disabled) replaces a worker that
+is older than the bound **after** it finishes its in-flight request -
+never mid-request - with a fresh process group. Recycling loses that
+worker's session state exactly like a failure restart; for long-running
+deployments it bounds per-worker drift (V8 heaps grow lazily) at the
+cost of one cold start per age window.
+
 ## Pool and concurrency
 
 - N workers (1..=64), each a `tardigrade --serve --command-timeout=MS`
@@ -50,5 +59,5 @@ GUEST_FLAGS are passed to every worker before the app path (for example
 - No TLS, no HTTP/2, no keep-alive, no sticky sessions, no metrics: the
   trusted front (or a later milestone) owns those. Single-tenant,
   self-hosted deployments remain the product boundary.
-- No idle-worker recycling or max-request lifetime in v1; both are
-  compatible later additions behind the same contract.
+- No max-request lifetime yet; --max-worker-age covers time-based
+  recycling and a request-count bound remains a compatible addition.
