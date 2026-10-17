@@ -2400,6 +2400,37 @@ fn serve_accepts_a_trailing_line_comment() {
 }
 
 #[test]
+fn serve_accepts_a_command_line_at_the_cap() {
+    // docs/SERVING_CONTRACT.md: a line of exactly 8 MiB (newline
+    // included) is still an ordinary command.
+    let mut big = String::with_capacity(8 * 1024 * 1024 + 1);
+    big.push_str("40 + 2 //");
+    while big.len() < 8 * 1024 * 1024 - 1 {
+        big.push('a');
+    }
+    big.push('\n');
+    let r = serve("serve-line-cap-at", &big);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "42\n");
+}
+
+#[test]
+fn serve_ends_the_session_on_an_oversized_command_line() {
+    // docs/SERVING_CONTRACT.md: past the cap the session ends like other
+    // malformed input - no execution, no reply, exit 0 - instead of
+    // buffering unbounded host memory.
+    let mut giant = String::with_capacity(8 * 1024 * 1024 + 2);
+    giant.push_str("1 + 1 //");
+    while giant.len() < 8 * 1024 * 1024 + 1 {
+        giant.push('a');
+    }
+    giant.push('\n');
+    let r = serve("serve-line-cap-over", &giant);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "", "an oversized command must not run");
+}
+
+#[test]
 fn serve_prints_null_for_undefined_results() {
     let r = serve("serve-null", "undefined\n(() => 1)\nstate.missing\n");
     assert_eq!(r.stdout, "null\nnull\nnull\n");

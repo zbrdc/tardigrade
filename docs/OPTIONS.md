@@ -340,7 +340,8 @@ left by a command stays queued until a later command's await moves the
 clock past it - a handler that schedules with `setTimeout` and does not
 await will not see it run under virtual time.
 
-Only host-level failure ends the session: input that is not valid UTF-8,
+Only host-level failure ends the session: input that is not valid UTF-8 or
+a command line over 8 MiB ([SERVING_CONTRACT.md](SERVING_CONTRACT.md)),
 `vm.exit` (its code), the whole-run `--timeout` (124), the heap cap
 (137), an unhandled rejection still unhandled at a microtask checkpoint
 (1), an uncaught exception from leftover work during the settling (1),

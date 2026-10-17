@@ -37,6 +37,7 @@ tardigrade is a command-line tool and a Rust library, written on the `v8` crate
 - [docs/GUEST-API.md](docs/GUEST-API.md): the JavaScript API inside a run, including `vm.fs` and the snapshot format
 - [docs/LIBRARY.md](docs/LIBRARY.md): embedding tardigrade in a Rust program
 - [docs/SUPERVISOR_CONTRACT.md](docs/SUPERVISOR_CONTRACT.md): running one one-shot guest under an external deadline and process-group reaper
+- [docs/SERVING_CONTRACT.md](docs/SERVING_CONTRACT.md): request deadlines, framing, cancellation and state lifetime for serving guests over `--serve`
 - [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md): TypeScript apps in the agent loop, and vm.d.ts
 - [docs/SANDBOX.md](docs/SANDBOX.md): what `--sandbox` enforces, and what it does not
 - [docs/KNOWN_RISKS.md](docs/KNOWN_RISKS.md): guarantees and limits of the caps and the isolation

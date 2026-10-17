@@ -21,7 +21,9 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
   caller who leaves `command_timeout_ms` at its default of 0 gets an
   unbounded session, and work a command leaves pending (an uncleared
   repeating timer) keeps blocking later commands' settling either way.
-  See [OPTIONS.md](OPTIONS.md#--serve).
+  Retaining that default is a recorded decision in
+  [SERVING_CONTRACT.md](SERVING_CONTRACT.md); serving layers must set an
+  explicit deadline. See [OPTIONS.md](OPTIONS.md#--serve).
 
 ## HTTP bridge (serve_bridge)
 

@@ -89,6 +89,11 @@ fn send_reply(replies: &ReplySink, line: String) -> bool {
 /// Splits one command line (without its newline, one trailing CR
 /// stripped) off `pending`. Err means invalid UTF-8, which ends the
 /// session just like the old BufRead::lines read error did.
+/// A command line past this cap ends the session like other malformed
+/// input (docs/SERVING_CONTRACT.md). 8 MiB leaves room for the bridge's
+/// 1 MiB body cap JSON-escaped worst-case plus framing.
+const MAX_COMMAND_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 fn split_line(pending: &mut Vec<u8>) -> Result<Option<String>, ()> {
     let Some(nl) = pending.iter().position(|b| *b == b'\n') else {
         return Ok(None);
@@ -131,6 +136,11 @@ fn next_command(sub: &StdinSub, pending: &mut Vec<u8>) -> Option<Result<String, 
             return final_command(pending);
         };
         pending.extend_from_slice(&chunk);
+        // Complete lines were already drained above, so pending holds one
+        // unfinished line here; over the cap it can never become valid.
+        if pending.len() > MAX_COMMAND_LINE_BYTES {
+            return Some(Err(()));
+        }
     }
 }
 
