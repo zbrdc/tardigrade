@@ -14,6 +14,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -332,6 +333,12 @@ pub fn spawn_sidecar(exe: &std::path::Path, plan: &NetPlan) -> Result<NetSession
         .stderr(std::process::Stdio::inherit());
     // Intentionally detached: no handle is kept. The sidecar exits when the
     // socket closes (at process exit), so there is nothing to reap here.
+    let parent_pid = std::process::id();
+    // SAFETY: pre_exec runs between fork and exec; the closure itself is
+    // documented async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || sidecar_dies_with_parent(parent_pid));
+    }
     cmd.spawn()
         .map_err(|e| format!("cannot spawn net-sidecar: {e}"))?;
     // The sidecar reads the policy as the first line on the wire, before
@@ -458,6 +465,26 @@ fn perform(
         return Err("overflow".to_string());
     }
     Ok((status, text))
+}
+
+// The sidecar must never outlive the guest process. Without this signal a
+// SIGKILLed guest leaves the sidecar alive until its in-flight request
+// times out (docs/SUPERVISOR_CONTRACT.md, evidence 2026-10-17); with it,
+// the kernel ends the sidecar at the guest's death.
+// SAFETY: runs in the forked child before exec; only async-signal-safe
+// libc calls are used (prctl, getppid).
+unsafe fn sidecar_dies_with_parent(expected_parent: u32) -> std::io::Result<()> {
+    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Close the fork race: a parent that died between fork and prctl would
+    // never deliver the signal. Refuse to run as an orphan instead.
+    if libc::getppid() as u32 != expected_parent {
+        return Err(std::io::Error::other(
+            "parent died before the sidecar could arm its death signal",
+        ));
+    }
+    Ok(())
 }
 
 fn write_all_wire(stream: &UnixStream, bytes: &[u8]) -> Result<(), String> {
