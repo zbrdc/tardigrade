@@ -14,6 +14,7 @@
 //! never make a syscall of their own.
 
 mod api;
+pub mod bridge_http;
 mod clock;
 mod console;
 mod diag;

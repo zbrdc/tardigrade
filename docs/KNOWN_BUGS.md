@@ -27,8 +27,10 @@ limits of the design are described in [KNOWN_RISKS.md](KNOWN_RISKS.md).
 
 ## HTTP bridge (serve_bridge)
 
-`serve_bridge` is a demonstration bound to localhost; do not expose it
-beyond that without a real HTTP server in front. Remaining limits:
+`serve_bridge` is a demonstration bound to localhost; the concurrent
+production bridge is `tardigrade-bridge` (docs/BRIDGE_CONTRACT.md),
+which is equally single-tenant and expects a trusted front for any
+non-localhost exposure. Remaining limits:
 
 - connections are handled one at a time (each socket now has a 15 s
   read/write timeout, so a silent client stalls the bridge for at most

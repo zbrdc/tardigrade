@@ -39,7 +39,7 @@ process without touching the deployment identity.
 |---|---|---|
 | P0 | FU-04 external supervisor contract (landed 2026-10-17, docs/SUPERVISOR_CONTRACT.md) | Hung, crashed or OOM-killed guests are reaped; sidecars cannot survive worker termination |
 | P1 | FU-07/FU-08 serving contract (landed 2026-10-17, docs/SERVING_CONTRACT.md) | Requests have explicit deadlines, response framing, cancellation and predictable state lifetime |
-| P2 | FU-35 bounded concurrency | Parallel requests run with admission limits and per-worker isolation; overload returns a defined response |
+| P2 | FU-35 bounded concurrency (landed 2026-10-17, docs/BRIDGE_CONTRACT.md, `tardigrade-bridge`) | Parallel requests run with admission limits and per-worker isolation; overload returns a defined response |
 | P3 | FU-36 deployment artifact | Snapshot, provenance, capability policy, runtime version and resource budgets are validated before execution |
 | P4 | Security hardening (FU-14 and open envelopes) | V8 sandbox evaluation, Wasm memory accounting, aggregate memory envelopes and hostile multi-tenant tests |
 
