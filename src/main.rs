@@ -187,7 +187,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
     }
     if c.entry.is_empty() && !c.serve && c.bundle.is_none() {
         return Err(
-            "usage: tardigrade [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--run-manifest=<file>] [--bundle=<file>] [--serve] [--sandbox] [--allow-call=NAME=URL[,METHOD]] [--net-max-response=<bytes>] [--net-total-bytes=<bytes>] [--net-timeout=<ms>] [--net-allow-private] <entry.js or -> [args...]\n       tardigrade --sandbox-check"
+            "usage: tardigrade [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--run-manifest=<file>] [--bundle=<file>] [--serve] [--sandbox] [--allow-call=NAME=URL[,METHOD]] [--net-max-response=<bytes>] [--net-total-bytes=<bytes>] [--net-timeout=<ms>] [--net-allow-private] <entry.js or -> [args...]\n       tardigrade --sandbox-check\n       tardigrade --identity"
                 .to_string(),
         );
     }
@@ -214,6 +214,17 @@ fn main() {
             eprintln!("tardigrade: --sandbox is not available here (needs Linux x86_64 with Landlock ABI 6)");
             std::process::exit(2);
         }
+        return;
+    }
+    if argv == ["--identity"] {
+        // Machine-readable identity for supervisors and wrappers (mossbed
+        // pins on this): one JSON line, package version plus the exact
+        // engine string a bundle must match.
+        println!(
+            "{{\"tardigrade\": \"{}\",\"v8\": \"{}\"}}",
+            env!("CARGO_PKG_VERSION"),
+            tardigrade::bundle::engine_version()
+        );
         return;
     }
     let c = match parse(&argv) {

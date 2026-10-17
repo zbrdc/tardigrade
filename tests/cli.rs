@@ -358,6 +358,17 @@ fn a_bundle_for_a_foreign_runtime_is_refused() {
     assert_eq!(r.code, 2, "stderr: {}", r.stderr);
     assert!(r.stderr.contains("prepared for V8"), "stderr: {}", r.stderr);
 }
+#[test]
+fn identity_prints_machine_readable_version_and_engine() {
+    let r = tardigrade(&["--identity"], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let v: serde_json::Value = serde_json::from_str(r.stdout.trim()).unwrap();
+    assert_eq!(
+        v["tardigrade"],
+        serde_json::json!(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(!v["v8"].as_str().unwrap().is_empty());
+}
 
 #[test]
 fn non_utf8_entry_is_exit_2_not_a_panic() {
