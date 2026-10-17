@@ -46,13 +46,16 @@ process without touching the deployment identity.
 P2 starts only after the P1 contract is frozen: implementing pooling first
 risks locking in the wrong state and failure semantics.
 
-## Sidecar lifecycle security tests (FU-34, required)
+## Sidecar lifecycle security tests (FU-34, landed 2026-10-17)
 
 The network sidecar is a critical security boundary, not an implementation
-detail. Tests must cover redirects, DNS rebinding, private-network access,
-credential forwarding, oversized responses, cancellation, and sidecar
-survival after guest termination. Capability budgets apply across the
-complete request lifecycle, not just individual wire frames.
+detail. Landed: redirects (returned, never followed), private-address
+refusal before any connection, credential non-leakage, oversized
+responses, lifecycle-wide byte budgets, cancellation-era settling, and
+sidecar death with the guest (tests/sidecar_security.rs,
+tests/sidecar_lifetime.rs, tests/sidecar_frames.rs, tests/sidecar_budgets.rs).
+Offline-honest limit: real mixed-record DNS rebinding is not reproducible;
+the enforced property is the fail-closed resolver.
 
 ## Deployment artifact contents (P3 sketch)
 

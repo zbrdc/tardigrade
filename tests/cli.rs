@@ -218,6 +218,72 @@ fn net_request_private_endpoint_is_refused_without_the_allow_flag() {
 }
 
 #[test]
+fn a_pending_net_request_settles_across_command_boundaries() {
+    // docs/SERVING_CONTRACT.md: work a command leaves pending stays part
+    // of the session and settles exactly once; the late rejection is not
+    // an extra reply and never desynchronises the line protocol.
+    use std::io::Read;
+    use std::sync::mpsc;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let _server = std::thread::spawn(move || {
+        // Hold the connection open without answering: the sidecar's
+        // per-request timeout is what rejects it. Report the connection so
+        // the test never blocks on a join if no request is ever made.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = tx.send(());
+                    conn.set_nonblocking(false).unwrap();
+                    conn.set_read_timeout(Some(std::time::Duration::from_secs(15)))
+                        .unwrap();
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf);
+                    let _ = conn.read(&mut buf); // ends when the sidecar gives up
+                    return;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+    let grant = format!("--allow-call=slow=http://127.0.0.1:{port}/,POST");
+    // Serve commands are single expressions; the comma operator starts the
+    // request, stores the promise and still replies "go" without awaiting.
+    let commands = concat!(
+        "(globalThis.p = vm.net.request('slow', 'x')",
+        ".then((v) => 'ok', (e) => String(e && e.message || e)), 'go')\n",
+        "1\n",
+        "p\n"
+    );
+    let r = serve_with(
+        &[grant.as_str(), "--net-allow-private", "--net-timeout=500"],
+        "serve-net-late-settle",
+        commands,
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        "the request must reach the server"
+    );
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "stdout: {}", r.stdout);
+    assert_eq!(lines[0], "\"go\"", "first reply: {}", lines[0]);
+    assert_eq!(lines[1], "1", "unrelated command: {}", lines[1]);
+    // The sidecar's error taxonomy is coarse by design: a timed-out
+    // request settles as a "network" transport error, exactly once.
+    assert!(
+        lines[2].contains("network"),
+        "the late rejection must settle exactly once: {}",
+        lines[2]
+    );
+}
+
+#[test]
 fn double_dash_ends_option_parsing_for_guest_args() {
     let path = script("dashdash-args", "console.log(JSON.stringify(vm.args));");
     let entry = path.to_str().unwrap();
