@@ -266,6 +266,17 @@ The flag follows existing option parsing: options are recognized until a bare
 `--`, after which arguments are positional. With the option absent, ordinary
 behavior and default-mode I/O are unchanged.
 
+### --bundle=\<file\>
+
+Runs a deployment artifact (docs/DEPLOYMENT_ARTIFACT.md): one JSON file with
+the guest entry, an optional preload snapshot, resource budgets, the
+capability policy and the runtime identity it was prepared for. The bundle is
+fully validated - hashes, engine identity, budget sanity, capability shape -
+before the sidecar, the sandbox or any guest code exists; any mismatch is a
+usage-style exit 2 with no guest output. Bundle budgets and policy override
+the matching flag defaults; `--sandbox`, `--dump` and `--run-manifest` still
+compose with it. No entry path is needed: the bundle carries its own.
+
 ### --serve
 
 Console mode. tardigrade runs `entry.js` once (the entry is optional),

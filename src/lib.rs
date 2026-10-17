@@ -15,6 +15,7 @@
 
 mod api;
 pub mod bridge_http;
+pub mod bundle;
 mod clock;
 mod console;
 mod diag;

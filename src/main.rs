@@ -27,6 +27,7 @@ struct Cli {
     epoch_ms: u64,
     epoch_set: bool,
     allow_calls: Vec<String>,
+    bundle: Option<std::path::PathBuf>,
     net_max_response: Option<u64>,
     net_total_bytes: Option<u64>,
     net_timeout_ms: Option<u64>,
@@ -78,6 +79,7 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
         epoch_ms: 0,
         epoch_set: false,
         allow_calls: Vec::new(),
+        bundle: None,
         net_max_response: None,
         net_total_bytes: None,
         net_timeout_ms: None,
@@ -152,6 +154,11 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.args.push(a.clone());
         } else if let Some(v) = a.strip_prefix("--allow-call=") {
             c.allow_calls.push(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--bundle=") {
+            if v.is_empty() || v == "-" {
+                return Err("--bundle requires a non-empty file path other than -".into());
+            }
+            c.bundle = Some(v.into());
         } else if let Some(v) = a.strip_prefix("--net-max-response=") {
             c.net_max_response = Some(
                 v.parse()
@@ -178,9 +185,9 @@ fn parse(argv: &[String]) -> Result<Cli, String> {
             c.args.push(a.clone());
         }
     }
-    if c.entry.is_empty() && !c.serve {
+    if c.entry.is_empty() && !c.serve && c.bundle.is_none() {
         return Err(
-            "usage: tardigrade [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--run-manifest=<file>] [--serve] [--sandbox] [--allow-call=NAME=URL[,METHOD]] [--net-max-response=<bytes>] [--net-total-bytes=<bytes>] [--net-timeout=<ms>] [--net-allow-private] <entry.js or -> [args...]\n       tardigrade --sandbox-check"
+            "usage: tardigrade [--timeout=<ms>] [--command-timeout=<ms>] [--memory=<mb>] [--fs-quota=<mb>] [--seed=<u64>] [--clock=virtual] [--epoch=<ms>] [--preload=<file>] [--dump=<file>] [--run-manifest=<file>] [--bundle=<file>] [--serve] [--sandbox] [--allow-call=NAME=URL[,METHOD]] [--net-max-response=<bytes>] [--net-total-bytes=<bytes>] [--net-timeout=<ms>] [--net-allow-private] <entry.js or -> [args...]\n       tardigrade --sandbox-check"
                 .to_string(),
         );
     }
@@ -217,7 +224,59 @@ fn main() {
         }
     };
 
-    let (source, stdin_consumed) = read_entry(&c);
+    // The bundle is validated before anything else exists: no sidecar, no
+    // sandbox, no guest. Its budgets and policies override the matching
+    // flag defaults (docs/DEPLOYMENT_ARTIFACT.md).
+    let bundle = match c.bundle.as_ref() {
+        Some(path) => {
+            let loaded = std::fs::read(path)
+                .map_err(|e| format!("cannot open bundle {path:?}: {e}"))
+                .and_then(|bytes| tardigrade::bundle::load(&bytes));
+            match loaded {
+                Ok(b) => Some(b),
+                Err(msg) => {
+                    eprintln!("tardigrade: {msg}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        None => None,
+    };
+    let mut c = c;
+    if let Some(b) = &bundle {
+        if let Some(ms) = b.timeout_ms {
+            c.timeout_ms = ms;
+            c.timeout_set = true;
+        }
+        if let Some(mb) = b.heap_mb {
+            c.heap_mb = mb as usize;
+        }
+        if let Some(ms) = b.command_timeout_ms {
+            c.command_timeout_ms = ms;
+            c.command_timeout_set = true;
+        }
+        c.net_allow_private = c.net_allow_private || b.net_allow_private;
+        if let Some(v) = b.net_max_response_bytes {
+            c.net_max_response = Some(v);
+        }
+        if let Some(v) = b.net_total_bytes {
+            c.net_total_bytes = Some(v);
+        }
+        if let Some(v) = b.net_timeout_ms {
+            c.net_timeout_ms = Some(v);
+        }
+        for call in &b.net_calls {
+            c.allow_calls
+                .push(format!("{}={},{}", call.name, call.url, call.method));
+        }
+        c.module = c.module || b.module;
+        c.entry = b.entry_path.clone();
+    }
+
+    let (source, stdin_consumed) = match &bundle {
+        Some(b) => (b.entry_source.clone(), false),
+        None => read_entry(&c),
+    };
 
     let net_plan = match build_net_plan(&c) {
         Ok(plan) => plan,
@@ -250,11 +309,14 @@ fn main() {
         );
     }
 
-    let preload_data = if c.sandbox || c.run_manifest.is_some() {
-        read_preload(&c)
-    } else {
-        None
-    };
+    let bundle_preload = bundle.as_ref().and_then(|b| b.preload.clone());
+    let preload_data = bundle_preload.or_else(|| {
+        if c.sandbox || c.run_manifest.is_some() {
+            read_preload(&c)
+        } else {
+            None
+        }
+    });
 
     let cfg = tardigrade::Config {
         timeout_ms: if c.serve && !c.timeout_set {

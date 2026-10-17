@@ -295,6 +295,70 @@ fn double_dash_ends_option_parsing_for_guest_args() {
     assert_eq!(r.code, 2, "stderr: {}", r.stderr);
 }
 
+fn write_bundle(name: &str, entry: &str, engine: &str) -> std::path::PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let bundle = serde_json::json!({
+        "format": "tardigrade.deploy-bundle",
+        "version": 1,
+        "runtime": {"v8": engine},
+        "entry": {
+            "path": "app.js",
+            "source": entry,
+            "sha256": tardigrade_sha256(entry.as_bytes()),
+        },
+        "budgets": {"heap_mb": 32, "timeout_ms": 5000},
+    });
+    std::fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    path
+}
+
+// The tests cannot reach the crate-private sha helper; ring is a direct
+// dependency, so the digest is computed the same documented way.
+fn tardigrade_sha256(bytes: &[u8]) -> String {
+    use ring::digest::{digest, SHA256};
+    digest(&SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn a_validated_bundle_runs_its_entry() {
+    let bundle = write_bundle(
+        "ok-bundle.json",
+        "console.log('from-bundle');",
+        &tardigrade::bundle::engine_version(),
+    );
+    let r = tardigrade(&[&format!("--bundle={}", bundle.to_str().unwrap())], b"");
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "from-bundle\n");
+}
+
+#[test]
+fn a_tampered_bundle_is_refused_before_any_guest() {
+    let path = write_bundle(
+        "tampered-bundle.json",
+        "console.log('x');",
+        &tardigrade::bundle::engine_version(),
+    );
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["entry"]["source"] = "console.log('swapped');".into();
+    std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+    let r = tardigrade(&[&format!("--bundle={}", path.to_str().unwrap())], b"");
+    assert_eq!(r.code, 2, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("mismatch"), "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "", "no guest output may exist after refusal");
+}
+
+#[test]
+fn a_bundle_for_a_foreign_runtime_is_refused() {
+    let path = write_bundle("foreign-bundle.json", "console.log('x');", "0.0.0-other");
+    let r = tardigrade(&[&format!("--bundle={}", path.to_str().unwrap())], b"");
+    assert_eq!(r.code, 2, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("prepared for V8"), "stderr: {}", r.stderr);
+}
+
 #[test]
 fn non_utf8_entry_is_exit_2_not_a_panic() {
     let r = tardigrade(&["-"], b"\xff\xfe console.log(1)");
