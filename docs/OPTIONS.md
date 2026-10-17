@@ -277,6 +277,12 @@ usage-style exit 2 with no guest output. Bundle budgets and policy override
 the matching flag defaults; `--sandbox`, `--dump` and `--run-manifest` still
 compose with it. No entry path is needed: the bundle carries its own.
 
+### --identity
+
+Prints one JSON line with the package version and the exact V8 engine
+string and exits 0: a machine-readable identity for supervisors and
+wrappers to pin on. As the sole argument, like `--sandbox-check`.
+
 ### --serve
 
 Console mode. tardigrade runs `entry.js` once (the entry is optional),
